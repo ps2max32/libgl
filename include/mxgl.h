@@ -46,6 +46,17 @@ void mxgl_DeleteAllLists(void);
 /* 1 once textures have gone (the lists name them): make the lists again */
 int mxgl_ListsDirty(void);
 
+/* a convex polygon of n vertices at v (x, y, z at v[0..2], s, t at
+   v[st..st+1]; stride floats from one vertex to the next), in the current
+   colour: glBegin(GL_POLYGON) .. glEnd in one call, from the game's own
+   vertex array (Quake's glpoly_t) */
+void mxgl_DrawPolygon(const float *v, int n, int stride, int st);
+
+/* the game's palette (256 RGB): textures whose texels are all of it are
+   kept as its indices (8 bits, exact; half the GS memory of 16-bit and
+   faster to draw), their mipmap levels as the nearest of its colours */
+void mxgl_Palette(const unsigned char *rgb);
+
 /* the next glTexImage2D keeps the texture as its brightness (the largest
    of R, G, B), for the blends with the destination colour (lightmaps:
    blendFunc DST_COLOR ZERO, ZERO SRC_COLOR, ZERO ONE_MINUS_SRC_COLOR), which

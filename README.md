@@ -32,8 +32,31 @@ lower field half a line lower, so all 1080 lines are drawn. The window is 1920 x
 
 - The passes own FRAME, ZBUF, XYOFFSET and SCISSOR: draws without Z writes use GS
   context 2 (ZMSK), so state goes to both contexts; `glScissor` is not kept.
-- A frame is played until the next replaces it (three records, `REC_BYTES`; three
-  arenas). Its texture uploads are done again in every pass: the textures of a scene
-  should fit in GS memory (about 1.8 MiB; Quake 2 uses `gl_picmip 1`). A frame after one
-  that refilled GS memory uploads all it uses.
+- A frame is played until the next replaces it (four records, three arenas more).
+  Texture uploads go into the frame's once record, sent over PATH3 while the frames
+  before are shown, not repeated in each pass; a frame that refills GS memory keeps
+  them in its passes (in order), and the frame after uploads all it uses.
+- The GS draws each frame three times a field: its fill is the limit (a pass has the
+  beam time of one strip, about 5.5 ms). 8-bit textures (`mxgl_Palette`) and
+  trilinear filtering's cost decide it.
 - `mxgl_screenshot` saves both fields (1920 x 1080).
+
+## Speed (both modes)
+
+- Draws with the same state and matrix are gathered into one VU1 batch (Quake: about
+  1000 GL draws a frame become 40 to 60 batches); the state and matrix are only made
+  again when a GL call changed them (serials).
+- The batches are triangle strips (ADC on the vertices that end no triangle): a
+  polygon (`GL_POLYGON`, `mxgl_DrawPolygon`) is a strip of its n vertices, a
+  `GL_TRIANGLE_STRIP` goes as it is, a fan with its centre again every second
+  triangle; back-facing triangles get ADC.
+- The vertices are written straight into the frame's arena through the uncached
+  accelerated segment (UCAB), each stream in its own part.
+- The immediate mode's arrays are one interleaved array (three power-of-two arrays put
+  their first vertices in the same cache sets of the EE's 8 KiB data cache).
+- `mxgl_DrawPolygon(v, n, stride, st)` draws a game's own polygon (Quake's `glpoly_t`)
+  in one call; a per-frame cache keeps its verdict (culled, or inside all planes) for
+  the next pass over the same vertices (the lightmap pass).
+- `mxgl_Palette(rgb)`: textures whose texels are all of the game's palette are kept as
+  8-bit indices with one CLUT (exact colours, half the GS memory, faster texturing);
+  their mipmap levels take the nearest palette colour.
