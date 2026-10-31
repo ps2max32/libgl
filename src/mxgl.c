@@ -296,6 +296,11 @@ static void draw_stats(void) {
   u32 now = mx_count();
   ee_us = (now - t_last) / (MX_EE_HZ / 1000000);
   t_last = now;
+  /* the longest frame of the second, and the frames longer than a field */
+  static u32 ee_max, n_long;
+  if (ee_us > ee_max)
+    ee_max = ee_us;
+  n_long += ee_us > 1000000 / mx_gs.hz + 500;
   int log_now = 0;
   if (mx_gs.vsync - v_last >= mx_gs.hz) {
     fps10 = (mx_gs.frames - f_last) * 10 * mx_gs.hz / (mx_gs.vsync - v_last);
@@ -341,6 +346,8 @@ static void draw_stats(void) {
   if (log_now) {
     u32 c = MX_EE_HZ / 10000;
     mx_printf("stats: %s | %s\n", a, b);
+    mx_printf("stats: longest frame %u us, %u frames over a field\n", ee_max, n_long);
+    ee_max = n_long = 0;
     mx_printf("stats: xf %u.%u tri %u.%u (incl flush %u.%u) ms, verts %u, wait ring %u ms buf %u ms "
               "(since last)\n",
               st_last.xf_cycles / c / 10, st_last.xf_cycles / c % 10, st_last.tri_cycles / c / 10,
@@ -356,10 +363,10 @@ static void draw_stats(void) {
               st_last.calls, st_last.draws, st_last.c_mvp / 295, st_last.c_lod / 295,
               st_last.c_set / 295, st_last.clipped, st_last.c_clip / 295, st_last.refused);
 #ifdef MXGL_HIRES
-    mx_printf("stats: hires: fields %u, passes %u, late %u, records shown %u, largest %u KB of %u; "
+    mx_printf("stats: hires: fields %u, passes %u, late %u, records shown %u, held %u, largest %u KB of %u; "
               "longest pass per strip %u %u %u us\n",
               mx_hires_stats.fields, mx_hires_stats.passes, mx_hires_stats.late,
-              mx_hires_stats.shown, mx_hires_stats.rec_max / 1024, REC_BYTES / MX_HIRES_SLOTS / 1024,
+              mx_hires_stats.shown, mx_hires_stats.held, mx_hires_stats.rec_max / 1024, REC_BYTES / MX_HIRES_SLOTS / 1024,
               mx_hires_stats.pass_us[0], mx_hires_stats.pass_us[1], mx_hires_stats.pass_us[2]);
     mx_hires_stats.pass_us[0] = mx_hires_stats.pass_us[1] = mx_hires_stats.pass_us[2] = 0;
 #endif
@@ -845,6 +852,24 @@ static float (*o_pos)[4]; /* x, y, z, 1: no triangle ends here (ADC) */
 static float (*o_st)[2];
 static u32 *o_col; /* R, G, B, A bytes: stored as one word (UCAB takes whole words) */
 static u32 o_n, o_cap;     /* vertices in the batch, and room for them */
+/* A vertex's position (x, y, z at x, 4-byte aligned; w's bits) and texture
+   coordinates into the batch in 64-bit stores: on UCAB a store costs about
+   the same whatever its width (PS2: the seven words of a vertex 45 cycles
+   as words, 28 as 128, 64 and 32 bits). Not 128: that needs the value in a
+   GPR's upper half, which an interrupt does not keep. */
+static inline __attribute__((always_inline)) void o_put_pos(u32 n, const void *x, u32 w) {
+  u64 a;
+  u32 z;
+  memcpy(&a, x, 8);
+  memcpy(&z, (const u8 *)x + 8, 4);
+  u64 *d = (u64 *)o_pos[n];
+  d[0] = a, d[1] = (u64)z | (u64)w << 32;
+}
+static inline __attribute__((always_inline)) void o_put_st(u32 n, const void *t) {
+  u64 a;
+  memcpy(&a, t, 8);
+  *(u64 *)o_st[n] = a;
+}
 /* s_at: the parts' used bytes */
 static u32 o_prim;
 static float o_uni[VU_MXGLV_UNI_QW][4] MX_ALIGNED(16);
@@ -898,9 +923,8 @@ static void flush_out(void) {
 }
 
 static void out_vertex(const struct cv *v, int adc) {
-  float *d = o_pos[o_n];
-  d[0] = v->x[0], d[1] = v->x[1], d[2] = v->x[2], d[3] = adc ? 1.0f : 0.0f;
-  o_st[o_n][0] = v->st[0], o_st[o_n][1] = v->st[1];
+  o_put_pos(o_n, v->x, adc ? 0x3F800000u : 0);
+  o_put_st(o_n, v->st);
   u32 c = 0;
   for (int i = 0; i < 4; i++)
     c |= (u32)(s32)__builtin_fminf(__builtin_fmaxf(v->c[i], 0.0f), 255.0f) << (8 * i);
@@ -978,7 +1002,7 @@ static void clip_poly(struct cv *buf0, int n, u32 planes) {
       continue;
     int m = 0;
     for (int i = 0; i < n; i++) {
-      const struct cv *p = &in[i], *q = &in[(i + 1) % n];
+      const struct cv *p = &in[i], *q = &in[i + 1 == n ? 0 : i + 1];
       float dp = plane_d(p->p, k), dq = plane_d(q->p, k);
       if (dp >= 0 && m < CLIP_MAX)
         out[m++] = *p;
@@ -1231,11 +1255,14 @@ static inline __attribute__((always_inline)) struct vsrc vsrc_get(void) {
    bytes); room is there (batch_room) */
 static inline __attribute__((always_inline)) void put_vertex(const struct vsrc *s, u32 v, int adc) {
   const float *x = (const float *)(s->vb + v * s->vs);
-  float *d = o_pos[o_n];
-  d[0] = x[0], d[1] = x[1], d[2] = s->has_z ? x[2] : 0, d[3] = adc ? 1.0f : 0.0f;
+  if (s->has_z) {
+    o_put_pos(o_n, x, adc ? 0x3F800000u : 0);
+  } else {
+    float *d = o_pos[o_n];
+    d[0] = x[0], d[1] = x[1], d[2] = 0, d[3] = adc ? 1.0f : 0.0f;
+  }
   if (s->tb) {
-    const float *t = (const float *)(s->tb + v * s->ts);
-    o_st[o_n][0] = t[0], o_st[o_n][1] = t[1];
+    o_put_st(o_n, s->tb + v * s->ts);
   } else {
     o_st[o_n][0] = o_st[o_n][1] = 0;
   }
@@ -1277,9 +1304,8 @@ static inline int fastv_get(struct fastv *f) {
 static inline __attribute__((always_inline)) void fast_put(const struct fastv *f, u32 v, int adc) {
   const u8 *r = f->vb + v * (u32)f->vs;
   const u32 *x = (const u32 *)r, *t = (const u32 *)(r + f->toff);
-  u32 *d = (u32 *)o_pos[o_n], *e = (u32 *)o_st[o_n];
-  d[0] = x[0], d[1] = x[1], d[2] = x[2], d[3] = adc ? 0x3F800000u : 0;
-  e[0] = t[0], e[1] = t[1];
+  o_put_pos(o_n, x, adc ? 0x3F800000u : 0);
+  o_put_st(o_n, t);
   o_col[o_n] = f->coff >= 0 ? *(const u32 *)(r + f->coff) : f->col;
   o_n++;
 }
@@ -1353,6 +1379,7 @@ static void update_matrix(void) {
 /* the GS state of a draw (set_state, unless nothing it depends on has
    changed), and the batch it goes into; 0: it cannot be drawn */
 static u32 k_gen, k_vgen, k_tser, k_mser, k_gser, k_sser, k_prim;
+static s32 k_lod;
 static int k_ok, k_valid;
 static float k_cs[4];
 static u32 o_mser;
@@ -1362,12 +1389,20 @@ static int prepare_state(const u32 *idx, int nidx, int nverts) {
      register was written since; then K too */
   struct tex *bt = gl.bound && gl.bound < MAX_TEX ? &texs[gl.bound] : NULL;
   u32 bgen = bt ? bt->gen + (u32)bt->dirty * 0x80000000u : 0;
-  if (!(k_valid && k_gser == gs_serial && k_sser == st_serial && k_tser == tex_serial &&
-        k_mser == mat_serial && k_vgen == vram_gen && k_gen == bgen)) {
+  int same = k_valid && k_gser == gs_serial && k_sser == st_serial && k_tser == tex_serial &&
+             k_vgen == vram_gen && k_gen == bgen;
+  if (!(same && k_mser == mat_serial)) {
     u32 tl0 = mx_count();
     s32 k = lod_k(idx, nidx, nverts);
     u32 ts0 = mx_count();
     st_cur.c_lod += ts0 - tl0;
+    /* only the matrix changed (a model's): the state is the same unless
+       its LOD is not */
+    if (same && k == k_lod) {
+      k_mser = mat_serial;
+      goto have;
+    }
+    k_lod = k;
     k_ok = set_state(&k_prim, k_cs, k) == 0;
     if (!k_ok) {
       static int told;
@@ -1382,6 +1417,7 @@ static int prepare_state(const u32 *idx, int nidx, int nverts) {
     k_vgen = vram_gen, k_tser = tex_serial, k_mser = mat_serial, k_gser = gs_serial;
     k_sser = st_serial;
   }
+have:
   if (!k_ok) {
     st_cur.refused++;
     return 0;
@@ -2158,6 +2194,14 @@ static void draw_polys(void) {
     for (int i = 0; i < np; i++) {
       const u8 *vb = (const u8 *)pq[i].v;
       int n = pq[i].n;
+      /* the next polygon's vertices into the cache meanwhile (each is a
+         block of its own: a miss a polygon) */
+      if (i + 1 < np) {
+        const u8 *nb = (const u8 *)pq[i + 1].v;
+        u32 nbytes = (u32)(pq[i + 1].n * vs);
+        for (u32 o = 0; o < nbytes + 63; o += 64)
+          __asm__ volatile("pref 0, 0(%0)" ::"r"(nb + o));
+      }
       u32 oand, oor = 0;
       st_cur.calls++;
       st_cur.verts += (u32)n;
@@ -2342,10 +2386,8 @@ void mxgl_DrawGlCmds(const int *cmds, const float *pos, int stride, const unsign
 #define GV(i) ((u32)e[3 * (i) + 2])
 #define PUT(i, adc)                                                                               \
   do {                                                                                            \
-    const u32 *x_ = (const u32 *)((const u8 *)pos + GV(i) * (u32)stride);                         \
-    u32 *d_ = (u32 *)o_pos[o_n], *t_ = (u32 *)o_st[o_n];                                         \
-    d_[0] = x_[0], d_[1] = x_[1], d_[2] = x_[2], d_[3] = (adc) ? 0x3F800000u : 0;                 \
-    t_[0] = (u32)e[3 * (i)], t_[1] = (u32)e[3 * (i) + 1];                                         \
+    o_put_pos(o_n, (const u8 *)pos + GV(i) * (u32)stride, (adc) ? 0x3F800000u : 0);             \
+    o_put_st(o_n, &e[3 * (i)]);                                                                   \
     o_col[o_n] = col[GV(i)];                                                                      \
     o_n++;                                                                                        \
   } while (0)
