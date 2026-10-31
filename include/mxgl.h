@@ -52,6 +52,18 @@ int mxgl_ListsDirty(void);
    vertex array (Quake's glpoly_t) */
 void mxgl_DrawPolygon(const float *v, int n, int stride, int st);
 
+/* n primitives from the current arrays (glVertexPointer, ...): primitive i
+   is mode[i] (GL_TRIANGLE_STRIP, GL_TRIANGLE_FAN, GL_TRIANGLES) of count[i]
+   vertices from first[i] (glMultiDrawArrays with a mode each): a model's
+   strips and fans in one call */
+void mxgl_MultiDraw(const unsigned int *mode, const int *first, const int *count, int n); /* GLenum */
+
+/* strips and fans from a command list (Quake 2's models): a count (< 0: a
+   fan), then count times s, t (floats) and a vertex index; 0 ends it. The
+   vertices: positions (x, y, z at pos, stride bytes apart) and colours
+   (bytes R, G, B, A in col), nv of them, each transformed once */
+void mxgl_DrawGlCmds(const int *cmds, const float *pos, int stride, const unsigned int *col, int nv);
+
 /* the game's palette (256 RGB): textures whose texels are all of it are
    kept as its indices (8 bits, exact; half the GS memory of 16-bit and
    faster to draw), their mipmap levels as the nearest of its colours */
