@@ -6,22 +6,35 @@
 /* the largest texture side the games should make (they scale larger ones
    down: GL_MAX_TEXTURE_SIZE) */
 #define MXGL_MAX_TEXTURE 128
-/* the window the game sees: the GS draws 640 x 448; with MXGL_HIRES
-   1920 x 1080 interlaced (1920 x 540 a field) */
-#ifdef MXGL_HIRES
-#define MXGL_WIDTH 1920
-#define MXGL_HEIGHT 1080
-#else
-#define MXGL_WIDTH 640
-#define MXGL_HEIGHT 448
-#endif
-
-/* GS, VU1 and the frame pipeline */
+/* GS, VU1 and the frame pipeline, in the console's TV mode (MXGL_SD) */
 void mxgl_init(void);
-/* the window the game sees, w x h (MXGL_WIDTH x MXGL_HEIGHT by default),
-   after mxgl_init: its coordinates (viewport, scissor, 2D) are mapped onto
-   the whole picture, which is drawn at its own resolution; a smaller window
-   makes the game's 2D (in pixels of its window) larger */
+/* the picture, after mxgl_init:
+   - MXGL_SD: NTSC or PAL, the console's own (its BIOS's region)
+   - MXGL_NTSC: 640 x 448, 60 Hz; MXGL_PAL: 640 x 512, 50 Hz; interlaced,
+     16-bit colour, 24-bit Z, two buffers
+   - MXGL_1080I: 1920 x 1080 interlaced (1920 x 540 a field) by maxsdk's
+     hires passes, 16-bit colour and Z; it takes 2 MiB of memory more while
+     it is on (the records and two more arenas)
+   Between frames (a frame begun is ended first). GS memory is filled
+   again (the textures are copied in as they are drawn), the display lists
+   are dirty (mxgl_ListsDirty), and the window is the whole screen
+   (mxgl_screen). Returns 0, or -1 if the mode could not be set (1080i:
+   memory, see mxgl_reserve_1080i); SD is set then. */
+enum { MXGL_SD, MXGL_NTSC, MXGL_PAL, MXGL_1080I };
+int mxgl_set_mode(int mode);
+/* 1080i's 2 MiB taken now and kept (in SD too), after mxgl_init and
+   before the game's own allocations: taken later, at mxgl_set_mode, it
+   may split the heap, or there may be no block that large (it frees the
+   display lists' pool then). Returns 0, or -1 (no memory). */
+int mxgl_reserve_1080i(void);
+/* the mode set: MXGL_NTSC, MXGL_PAL or MXGL_1080I */
+int mxgl_mode(void);
+/* the screen's size: 640 x 448, 640 x 512, 1920 x 1080 */
+void mxgl_screen(int *w, int *h);
+/* the window the game sees, w x h (the screen after mxgl_set_mode): its
+   coordinates (viewport, scissor, 2D) are mapped onto the whole picture,
+   which is drawn at its own resolution; a smaller window makes the game's
+   2D (in pixels of its window) larger */
 void mxgl_window(int w, int h);
 /* the end of a frame (the game's swap buffers): sends it */
 void mxgl_end_frame(void);

@@ -17,22 +17,33 @@ What the GS cannot do is left out or done another way:
   upload, or `GL_LUMINANCE` texels. Colour in lightmaps is lost; a game can tint the
   surface's own pass (Quake 3 uses the vertex light's hue).
 - No lines, points, stencil, clip planes, polygon offset, colour mask, `glReadPixels`.
-- The window is 640 x 448 (`MXGL_WIDTH`, `MXGL_HEIGHT`); textures up to 128 x 128
-  (`GL_MAX_TEXTURE_SIZE`); a 16-bit colour buffer (dithered) and a 24-bit Z buffer.
-  `mxgl_window(w, h)` gives the game a window of another size, mapped onto the whole
+- Textures up to 128 x 128 (`GL_MAX_TEXTURE_SIZE`). A MIN_FILTER without MIPMAP draws
+  level 0 only (GLQuake's lightmaps: a level below mixes the surfaces packed next to each
+  other).
+- `mxgl_window(w, h)` gives the game a window of another size, mapped onto the whole
   picture (its 2D larger; the 3D still at the picture's resolution).
 
-## 1080i (`MXGL_HIRES=1`)
+## Modes
 
-With `MXGL_HIRES=1` (make variable; the app adds `$(MXGL_DEFS)` to its CFLAGS) the
-picture is 1920 x 1080 interlaced, on maxsdk's hires passes (`<mx/hires.h>`, branch
-`hires` of maxsdk): one 1920 x 540 CT16S buffer, drawn in three strips just ahead of the
-beam, every field, from the frame's recorded stream; Z (16 bits) in the next strip; the
-lower field half a line lower, so all 1080 lines are drawn. The window is 1920 x 1080.
+`mxgl_init` starts in the console's TV mode: NTSC (640 x 448, 60 Hz) or PAL (640 x 512,
+50 Hz) by the BIOS's region (`mx_video_default`), interlaced, a 16-bit colour buffer
+(dithered) each of two frames and a 24-bit Z buffer. `mxgl_set_mode` changes it between
+frames (`MXGL_SD`, `MXGL_NTSC`, `MXGL_PAL`, `MXGL_1080I`): the pipeline starts again,
+GS memory is filled again, the display lists are dirty, the window is the screen
+(`mxgl_screen`).
+
+### 1080i
+
+`MXGL_1080I` is 1920 x 1080 interlaced, on maxsdk's hires passes (`<mx/hires.h>`): one
+1920 x 540 CT16S buffer, drawn in three strips just ahead of the beam, every field, from
+the frame's recorded stream; Z (16 bits) in the next strip; the lower field half a line
+lower, so all 1080 lines are drawn. It takes 2 MiB of memory while it is on (the records
+and two more arenas); `mxgl_set_mode` returns -1 if there is not that much
+(`mxgl_reserve_1080i` takes it at the start and keeps it).
 
 - The passes own FRAME, ZBUF, XYOFFSET and SCISSOR: draws without Z writes use GS
   context 2 (ZMSK), so state goes to both contexts; `glScissor` is not kept.
-- A frame is played until the next replaces it (four records, three arenas more).
+- A frame is played until the next replaces it (four records, two arenas more).
   Texture uploads go into the frame's once record, sent over PATH3 while the frames
   before are shown, not repeated in each pass; a frame that refills GS memory keeps
   them in its passes (in order), and the frame after uploads all it uses.
