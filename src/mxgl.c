@@ -61,7 +61,7 @@ extern const u8 mxglv_vu[], mxglv_vu_end[];
 #define FB_H 540
 #define ZMAX 4095.0f            /* GS Z (16 bits) / 16: ftoi4 */
 #define NARENA MX_HIRES_SLOTS   /* an arena per record */
-#define HUD_SCALE 3
+#define HUD_SCALE 1
 #else
 #define FB_W 640
 #define FB_H 448
@@ -78,8 +78,12 @@ static int GL_W = MXGL_WIDTH, GL_H = MXGL_HEIGHT;
 
 #define RING_BYTES (64 * 1024) /* the stream's slots (chain mode) */
 static u8 ring[RING_BYTES] MX_ALIGNED(64);
+#ifdef MXGL_HIRES
+#define ARENA_BYTES (768 * 1024) /* a record is played for a while: larger frames fit */
+#else
 #define ARENA_BYTES (512 * 1024)
-#define REC_BYTES (MX_HIRES_SLOTS * 512 * 1024) /* hires: the records */
+#endif
+#define REC_BYTES (MX_HIRES_SLOTS * 640 * 1024) /* hires: the records */
 static u8 *arena[NARENA];
 static u32 arena_pos;
 static int in_frame, buf, frame_par;
@@ -123,6 +127,8 @@ struct tex {
   int clamp_s, clamp_t;
   int lin_mag, lin_min;  /* filters: 1 linear */
   int mip;               /* MIN_FILTER: 0 no levels, 1 nearest level, 2 both levels */
+  int dirty;             /* changed (glTexSubImage2D) while in GS memory: upload it again */
+  u32 vram_blocks;       /* the room it has there */
 };
 static struct tex texs[MAX_TEX];
 static u32 vram_lo, vram_pos, vram_gen = 1;
@@ -441,13 +447,23 @@ static void tex_upload(struct tex *t) {
   /* the packed layout keeps its alignments if the base is aligned to the
      whole (a page at most) */
   u32 align = blocks >= 32 ? 32 : pow2_ceil(blocks);
-  u32 at = (vram_pos + align - 1) & ~(align - 1);
-  if (at + blocks > VRAM_END) {
-    vram_gen++;
-    st_cur.wraps++;
-    at = (vram_lo + align - 1) & ~(align - 1);
+  u32 at;
+  if (t->dirty && t->gen == vram_gen && blocks <= t->vram_blocks) {
+    /* changed: again where it is (the draws before have read it: the
+       upload's FLUSH), not to new room, which would fill GS memory with
+       old copies (a lightmap changed every frame) */
+    at = t->mt.tbp[0];
+  } else {
+    at = (vram_pos + align - 1) & ~(align - 1);
+    if (at + blocks > VRAM_END) {
+      vram_gen++;
+      st_cur.wraps++;
+      at = (vram_lo + align - 1) & ~(align - 1);
+    }
+    vram_pos = at + blocks;
+    t->vram_blocks = blocks;
   }
-  vram_pos = at + blocks;
+  t->dirty = 0;
   mx_tex_init(&t->mt, at, t->psm, t->lw, t->lh, nl, MX_TEX_PACKED);
   t->gen = vram_gen;
   st_cur.uploads++;
@@ -532,7 +548,7 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   u64 val[10];
   int n = 0;
   if (t) {
-    if (t->gen != vram_gen) {
+    if (t->gen != vram_gen || t->dirty) {
       tex_upload(t);
       if (t->gen != vram_gen)
         return -1;
@@ -1916,7 +1932,7 @@ void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsi
   t->levels = 1;
   convert(t, 0, x, y, w, h, px);
   mx_dcache_writeback(t->data, t->bytes);
-  t->gen = 0;
+  t->dirty = 1;
 }
 
 void APIENTRY glTexParameterf(GLenum target, GLenum p, GLfloat v) {
@@ -2044,6 +2060,21 @@ void mxgl_init(void) {
   shader = MX_VU_SHADER(MXGLV, mxglv_vu, mxglv_vu_end);
   for (int i = 0; i < NARENA; i++)
     arena[i] = memalign(64, ARENA_BYTES);
+  {
+    /* the largest block left (a probe the compiler keeps) */
+    u32 lo = 0, hi = 32u << 20;
+    while (hi - lo > 65536) {
+      u32 mid = (lo + hi) / 2;
+      void *volatile p = malloc(mid);
+      if (p)
+        lo = mid;
+      else
+        hi = mid;
+      free(p);
+    }
+    mx_printf("mxgl: arenas %u x %u KB%s, %u KB free after\n", NARENA, ARENA_BYTES / 1024,
+              arena[NARENA - 1] ? "" : " (NOT ALL)", lo / 1024);
+  }
   /* the HUD's font (256 x 8) in the first page after the buffers */
   mx_gs.w = FB_W, mx_gs.h = FB_H; /* the HUD's coordinates */
   mx_hud_init(mx_gs.tbp, FB_H);
