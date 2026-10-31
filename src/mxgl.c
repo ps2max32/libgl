@@ -78,8 +78,10 @@ static int GL_W = MXGL_WIDTH, GL_H = MXGL_HEIGHT;
 
 #define RING_BYTES (64 * 1024) /* the stream's slots (chain mode) */
 static u8 ring[RING_BYTES] MX_ALIGNED(64);
-#ifdef MXGL_HIRES
-#define ARENA_BYTES (512 * 1024) /* the batches' vertices of a frame (Quake: up to ~230 KB) */
+/* the batches' vertices of a frame (Quake: up to ~230 KB); a game may set
+   another size (MXGL_ARENA_BYTES: Descent 3 takes 256 KB) */
+#ifdef MXGL_ARENA_BYTES
+#define ARENA_BYTES (MXGL_ARENA_BYTES)
 #else
 #define ARENA_BYTES (512 * 1024)
 #endif
@@ -2881,7 +2883,7 @@ static void convert(struct tex *t, u32 lv, int x0, int y0, int w, int h, const u
         u32 a = (s[3] + 1u) >> 1;
         ((u32 *)dst)[at] = (u32)s[0] | (u32)s[1] << 8 | (u32)s[2] << 16 | a << 24;
       } else {
-        ((u16 *)dst)[at] = (u16)(s[0] >> 3 | (s[1] >> 3) << 5 | (s[2] >> 3) << 10 | 0x8000);
+        ((u16 *)dst)[at] = (u16)(s[0] >> 3 | (s[1] >> 3) << 5 | (s[2] >> 3) << 10 | (s[3] >= 128 ? 0x8000 : 0));
       }
     }
 }
@@ -2995,14 +2997,18 @@ static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsi
     w = 8;
   if (h < 8)
     h = 8;
-  /* alpha in the texels? */
-  int alpha = 0;
+  /* alpha in the texels? Only 0 and 255 (a colour key: Descent 3's 1555)
+     fits 16 bits (the alpha bit, TEXA); other alpha takes 32 */
+  int alpha = 0, alpha8 = 0;
   const u8 *s = px;
   if (s && ifmt != GL_RGB && ifmt != GL_RGB8 && ifmt != GL_RGB5 && ifmt != 3)
     for (int i = 0; i < w * h; i++)
       if (s[i * 4 + 3] != 255) {
         alpha = 1;
-        break;
+        if (s[i * 4 + 3] != 0) {
+          alpha8 = 1;
+          break;
+        }
       }
   defer_free(t->data);
   t->w = (u32)w, t->h = (u32)h;
@@ -3019,7 +3025,7 @@ static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsi
   }
   t->bright = tex_brightness;
   t->pal = pal;
-  t->psm = tex_brightness || pal ? MX_GS_PSM_T8 : alpha ? MX_GS_PSM_CT32 : MX_GS_PSM_CT16;
+  t->psm = tex_brightness || pal ? MX_GS_PSM_T8 : alpha8 ? MX_GS_PSM_CT32 : MX_GS_PSM_CT16;
   tex_brightness = 0;
   t->max_levels = mx_tex_max_levels(t->lw, t->lh, 8);
   t->levels = 1;

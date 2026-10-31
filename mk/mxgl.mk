@@ -14,9 +14,11 @@ MXGL_INC  := $(MXGL_DIR)/include
 HLSL_DIRS += $(MXGL_DIR)/src
 MXGL_OBJS  = $(OUT)/mxgl/mxgl.o
 # MXGL_HIRES=1: 1080i by maxsdk's hires passes (mxgl.c); the app's sources
-# need MXGL_DEFS too (MXGL_WIDTH, MXGL_HEIGHT)
+# need MXGL_DEFS too (MXGL_WIDTH, MXGL_HEIGHT); MXGL_ARENA_BYTES: the size of
+# each of the two frame arenas (512 KB by default)
 MXGL_HIRES ?= 0
-MXGL_DEFS  := $(if $(filter 1,$(MXGL_HIRES)),-DMXGL_HIRES)
+MXGL_DEFS  := $(if $(filter 1,$(MXGL_HIRES)),-DMXGL_HIRES) \
+              $(if $(MXGL_ARENA_BYTES),-DMXGL_ARENA_BYTES=$(MXGL_ARENA_BYTES))
 # VU0 macro mode for the vector code (v4f), fast float math, float
 # literals (the FPU has no doubles), builtins (not -ffreestanding: sqrtf is
 # sqrt.s, small memcpy inline); picolibc's headers (malloc.h, math.h)
