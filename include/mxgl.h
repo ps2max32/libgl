@@ -6,12 +6,23 @@
 /* the largest texture side the games should make (they scale larger ones
    down: GL_MAX_TEXTURE_SIZE) */
 #define MXGL_MAX_TEXTURE 128
-/* the window the game sees: the GS draws 640 x 448 */
+/* the window the game sees: the GS draws 640 x 448; with MXGL_HIRES
+   1920 x 1080 interlaced (1920 x 540 a field) */
+#ifdef MXGL_HIRES
+#define MXGL_WIDTH 1920
+#define MXGL_HEIGHT 1080
+#else
 #define MXGL_WIDTH 640
 #define MXGL_HEIGHT 448
+#endif
 
 /* GS, VU1 and the frame pipeline */
 void mxgl_init(void);
+/* the window the game sees, w x h (MXGL_WIDTH x MXGL_HEIGHT by default),
+   after mxgl_init: its coordinates (viewport, scissor, 2D) are mapped onto
+   the whole picture, which is drawn at its own resolution; a smaller window
+   makes the game's 2D (in pixels of its window) larger */
+void mxgl_window(int w, int h);
 /* the end of a frame (the game's swap buffers): sends it */
 void mxgl_end_frame(void);
 /* after mxgl_end_frame, once the game is done with the frame's data:

@@ -13,10 +13,14 @@ MXGL_DIR  := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 MXGL_INC  := $(MXGL_DIR)/include
 HLSL_DIRS += $(MXGL_DIR)/src
 MXGL_OBJS  = $(OUT)/mxgl/mxgl.o
+# MXGL_HIRES=1: 1080i by maxsdk's hires passes (mxgl.c); the app's sources
+# need MXGL_DEFS too (MXGL_WIDTH, MXGL_HEIGHT)
+MXGL_HIRES ?= 0
+MXGL_DEFS  := $(if $(filter 1,$(MXGL_HIRES)),-DMXGL_HIRES)
 # VU0 macro mode for the vector code (v4f), fast float math, float
 # literals (the FPU has no doubles), builtins (not -ffreestanding: sqrtf is
 # sqrt.s, small memcpy inline); picolibc's headers (malloc.h, math.h)
-MXGL_CFLAGS = -mvu0 -ffast-math -fapprox-func -cl-single-precision-constant -MMD -I$(MXGL_INC) \
+MXGL_CFLAGS = $(MXGL_DEFS) -mvu0 -ffast-math -fapprox-func -cl-single-precision-constant -MMD -I$(MXGL_INC) \
               -nostdlibinc -isystem $(or $(PICOLIBC),$(PS2MAX)/build/libs/picolibc/install)/include
 
 $(OUT)/mxgl/mxgl.o: $(MXGL_DIR)/src/mxgl.c $(MXGL_INC)/mxgl.h $(OUT)/hlsl/mxglv.h

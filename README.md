@@ -19,3 +19,21 @@ What the GS cannot do is left out or done another way:
 - No lines, points, stencil, clip planes, polygon offset, colour mask, `glReadPixels`.
 - The window is 640 x 448 (`MXGL_WIDTH`, `MXGL_HEIGHT`); textures up to 128 x 128
   (`GL_MAX_TEXTURE_SIZE`); a 16-bit colour buffer (dithered) and a 24-bit Z buffer.
+  `mxgl_window(w, h)` gives the game a window of another size, mapped onto the whole
+  picture (its 2D larger; the 3D still at the picture's resolution).
+
+## 1080i (`MXGL_HIRES=1`)
+
+With `MXGL_HIRES=1` (make variable; the app adds `$(MXGL_DEFS)` to its CFLAGS) the
+picture is 1920 x 1080 interlaced, on maxsdk's hires passes (`<mx/hires.h>`, branch
+`hires` of maxsdk): one 1920 x 540 CT16S buffer, drawn in three strips just ahead of the
+beam, every field, from the frame's recorded stream; Z (16 bits) in the next strip; the
+lower field half a line lower, so all 1080 lines are drawn. The window is 1920 x 1080.
+
+- The passes own FRAME, ZBUF, XYOFFSET and SCISSOR: draws without Z writes use GS
+  context 2 (ZMSK), so state goes to both contexts; `glScissor` is not kept.
+- A frame is played until the next replaces it (three records, `REC_BYTES`; three
+  arenas). Its texture uploads are done again in every pass: the textures of a scene
+  should fit in GS memory (about 1.8 MiB; Quake 2 uses `gl_picmip 1`). A frame after one
+  that refilled GS memory uploads all it uses.
+- `mxgl_screenshot` saves both fields (1920 x 1080).

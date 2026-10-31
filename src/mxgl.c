@@ -25,6 +25,14 @@
    - The screen is 640 x 448, NTSC interlaced FIELD mode: two 16-bit
      colour buffers (CT16S, dithered) and one 24-bit Z buffer, which leaves
      about 1.8 MiB of GS memory for textures.
+   - MXGL_HIRES: 1920 x 1080 interlaced (1080i) by maxsdk's hires passes
+     (<mx/hires.h>): one 1920 x 540 CT16S buffer drawn in three strips just
+     ahead of the beam, every field, from the frame's stream recorded; Z
+     (16 bits) in the next strip; each field's lines half a line apart, so
+     the game's 1080 lines are all drawn. The passes own FRAME, ZBUF,
+     XYOFFSET and SCISSOR: a draw without Z writes uses GS context 2 (ZMSK
+     set), so the state registers are written in both contexts, and the GL
+     scissor is not kept. About 1.8 MiB of GS memory is left for textures.
 
    Not done: lines and points, stencil, clip planes, polygon offset, colour
    mask, glReadPixels, the other blends with the destination colour (the
@@ -47,10 +55,22 @@
 
 extern const u8 mxglv_vu[], mxglv_vu_end[];
 
+#ifdef MXGL_HIRES
+#include <mx/hires.h>
+#define FB_W 1920
+#define FB_H 540
+#define ZMAX 4095.0f            /* GS Z (16 bits) / 16: ftoi4 */
+#define NARENA MX_HIRES_SLOTS   /* an arena per record */
+#define HUD_SCALE 3
+#else
 #define FB_W 640
 #define FB_H 448
-#define GL_H MXGL_HEIGHT         /* the window height the game sees */
 #define ZMAX 1048575.0f         /* GS Z (24 bits) / 16: ftoi4 */
+#define NARENA 2
+#define HUD_SCALE 1
+#endif
+/* the window the game sees (mxgl_window), mapped onto the whole buffer */
+static int GL_W = MXGL_WIDTH, GL_H = MXGL_HEIGHT;
 #define GB_LO (2048.0f - 1900.0f) /* the guard band, GS pixels */
 #define GB_HI (2048.0f + 1900.0f)
 
@@ -59,7 +79,8 @@ extern const u8 mxglv_vu[], mxglv_vu_end[];
 #define RING_BYTES (64 * 1024) /* the stream's slots (chain mode) */
 static u8 ring[RING_BYTES] MX_ALIGNED(64);
 #define ARENA_BYTES (512 * 1024)
-static u8 *arena[2];
+#define REC_BYTES (MX_HIRES_SLOTS * 512 * 1024) /* hires: the records */
+static u8 *arena[NARENA];
 static u32 arena_pos;
 static int in_frame, buf, frame_par;
 static struct mx_shader shader;
@@ -180,21 +201,39 @@ static void clut_send(void);
 static void frame_start(void) {
   if (in_frame)
     return;
+#ifdef MXGL_HIRES
+  /* the passes set the target and clear the strips; the arena is the
+     record's (kept while the record is played) */
+  mx_frame_begin_n();
+  frame_par = (int)mx_hires_slot();
+  mx_hires_clear((u32)(gl.clear[0] * 255), (u32)(gl.clear[1] * 255), (u32)(gl.clear[2] * 255));
+  /* the frame before overwrote textures (GS memory refilled): this one
+     uploads all it uses, as its passes are played again after the refill */
+  if (st_last.wraps) {
+    vram_gen++;
+    vram_pos = vram_lo;
+  }
+  u64 *e = mx_frame_direct(5);
+  e = mx_e_ad_tag(e, 4, 1);
+#else
   buf = (int)(mx_frame_begin_n() & 1);
   mx_frame_target(&rt[buf], 0);
+  frame_par ^= 1;
   /* TEST off for the clear, PRMODECONT, COLCLAMP, dithering into 16 bits */
   u64 *e = mx_frame_direct(6 + 5);
   e = mx_e_ad_tag(e, 5, 0);
   e = mx_e_ad(e, MX_GS_REG_TEST_1, mx_gs_test(0, 0, 0, 0, 0, 0, 1, 1));
+#endif
   e = mx_e_ad(e, MX_GS_REG_PRMODECONT, 1);
   e = mx_e_ad(e, MX_GS_REG_COLCLAMP, 1);
   e = mx_e_ad(e, MX_GS_REG_DIMX, 0x6071243571603524ull);
   e = mx_e_ad(e, MX_GS_REG_DTHE, 1);
+#ifndef MXGL_HIRES
   e = mx_rt_e_clear(e, &rt[buf], 0, (u32)(gl.clear[0] * 255), (u32)(gl.clear[1] * 255),
                     (u32)(gl.clear[2] * 255), 1);
+#endif
   mx_frame_commit(e);
   in_frame = 1;
-  frame_par ^= 1;
   arena_pos = 0;
   gs.valid = 0, gs_serial++;
   mx_frame_shader_setup(&shader);
@@ -225,7 +264,11 @@ static void draw_stats(void) {
   u64 *c = mx_frame_reserve(5);
   c = mx_e_cnt(c, 3, mx_vif_flush(), mx_vif_direct(3));
   c = mx_e_ad_tag(c, 2, 1);
+#ifdef MXGL_HIRES
+  c = mx_e_ad(c, MX_GS_REG_ALPHA_1, mx_gs_alpha(0, 1, 0, 1, 0)); /* the box: over */
+#else
   c = mx_e_ad(c, MX_GS_REG_SCISSOR_1, mx_gs_scissor(0, FB_W - 1, 0, FB_H - 1));
+#endif
   c = mx_e_ad(c, MX_GS_REG_TEST_1, mx_gs_test(0, 0, 0, 0, 0, 0, 1, 1));
   mx_frame_commit(c);
   gs.valid = 0, gs_serial++;
@@ -266,10 +309,15 @@ static void draw_stats(void) {
     ring0 = mx_frame_stats.wait_ring, buf0 = mx_frame_stats.wait_buffer;
     mx_printf("stats: lists: bounds %u us, state %u us, call %u us\n", st_last.c_bounds / 295,
               st_last.c_state / 295, st_last.c_call / 295);
+#ifdef MXGL_HIRES
+    mx_printf("stats: hires: fields %u, passes %u, late %u, records shown %u, largest %u KB of %u\n",
+              mx_hires_stats.fields, mx_hires_stats.passes, mx_hires_stats.late,
+              mx_hires_stats.shown, mx_hires_stats.rec_max / 1024, REC_BYTES / MX_HIRES_SLOTS / 1024);
+#endif
   }
-  mx_hud_box(4, 2, 360, 20, 0x60000000);
-  mx_hud_text(8, 4, a, 0x80ff80, 1);
-  mx_hud_text(8, 13, b, 0x80ff80, 1);
+  mx_hud_box(4 * HUD_SCALE, 2, 360 * HUD_SCALE, 20 * HUD_SCALE, 0x60000000);
+  mx_hud_text(8 * HUD_SCALE, 4, a, 0x80ff80, HUD_SCALE);
+  mx_hud_text(8 * HUD_SCALE, 4 + 9 * HUD_SCALE, b, 0x80ff80, HUD_SCALE);
 }
 
 void mxgl_end_frame(void) {
@@ -288,6 +336,16 @@ static void write_regs(const u32 *reg, const u64 *val, int n) {
   gs_serial++;
   if (!n)
     return;
+#ifdef MXGL_HIRES
+  /* the same in context 2 (the draws without Z writes) */
+  u32 reg2[24];
+  u64 val2[24];
+  for (int i = 0; i < n; i++) {
+    reg2[2 * i] = reg[i], val2[2 * i] = val[i];
+    reg2[2 * i + 1] = reg[i] + 1, val2[2 * i + 1] = val[i];
+  }
+  reg = reg2, val = val2, n *= 2;
+#endif
   u64 *c = mx_frame_reserve((u32)n + 2);
   c = mx_e_cnt(c, (u32)n + 1, mx_vif_flush(), mx_vif_direct((u32)n + 1));
   c = mx_e_ad_tag(c, (u32)n, 1);
@@ -530,28 +588,39 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   if (!gs.valid || test != gs.test)
     reg[n] = MX_GS_REG_TEST_1, val[n++] = gs.test = test;
 
+  int zmsk = !(gl.dtest && gl.dmask);
+#ifndef MXGL_HIRES
   const struct mx_rt *target = &rt[buf];
-  u64 zbuf = mx_gs_zbuf(target->zbp, target->zpsm, !(gl.dtest && gl.dmask));
+  u64 zbuf = mx_gs_zbuf(target->zbp, target->zpsm, (u32)zmsk);
   if (!gs.valid || zbuf != gs.zbuf)
     reg[n] = MX_GS_REG_ZBUF_1, val[n++] = gs.zbuf = zbuf;
+#endif
 
   int x0 = 0, x1 = FB_W - 1, y0 = 0, y1 = FB_H - 1;
   if (gl.scissor) {
-    x0 = gl.sc[0], x1 = gl.sc[0] + gl.sc[2] - 1;
+    x0 = gl.sc[0] * FB_W / GL_W, x1 = (gl.sc[0] + gl.sc[2]) * FB_W / GL_W - 1;
     y0 = (GL_H - (gl.sc[1] + gl.sc[3])) * FB_H / GL_H, y1 = (GL_H - gl.sc[1]) * FB_H / GL_H - 1;
     x0 = x0 < 0 ? 0 : x0, y0 = y0 < 0 ? 0 : y0;
     x1 = x1 > FB_W - 1 ? FB_W - 1 : x1, y1 = y1 > FB_H - 1 ? FB_H - 1 : y1;
     if (x1 < x0 || y1 < y0)
       return -1;
   }
+#ifndef MXGL_HIRES
   u64 sc = mx_gs_scissor((u32)x0, (u32)x1, (u32)y0, (u32)y1);
   if (!gs.valid || sc != gs.scissor)
     reg[n] = MX_GS_REG_SCISSOR_1, val[n++] = gs.scissor = sc;
+#endif
 
   write_regs(reg, val, n);
   gs.valid = 1;
 
+#ifdef MXGL_HIRES
+  /* context 2: no Z writes */
+  *prim = (u32)mx_gs_prim(MX_GS_PRIM_TRIANGLE, 1, t != NULL, 0, abe, 0, 0, zmsk, 0);
+#else
+  (void)zmsk;
   *prim = (u32)mx_gs_prim(MX_GS_PRIM_TRIANGLE, 1, t != NULL, 0, abe, 0, 0, 0, 0);
+#endif
   if (t) {
     /* 0x80 is 1.0 when modulated: up to 2x with a colour shift */
     cscale[0] = cscale[1] = cscale[2] = gl.cshift ? 1.0f : 0.5f;
@@ -567,9 +636,9 @@ static void make_mvp(float *m) {
   float vpm[16];
   memset(vpm, 0, 64);
   float vx = (float)gl.vp[0], vy = (float)gl.vp[1], vw = (float)gl.vp[2], vh = (float)gl.vp[3];
-  float r = (float)FB_H / (float)GL_H;
-  vpm[0] = vw / 2;
-  vpm[12] = 2048.0f - FB_W / 2 + vx + vw / 2;
+  float r = (float)FB_H / (float)GL_H, rx = (float)FB_W / (float)GL_W;
+  vpm[0] = vw / 2 * rx;
+  vpm[12] = 2048.0f - FB_W / 2 + (vx + vw / 2) * rx;
   vpm[5] = -vh / 2 * r;
   vpm[13] = 2048.0f - FB_H / 2 + (GL_H - vy - vh / 2) * r;
   vpm[10] = -ZMAX * (gl.df - gl.dn) / 2;
@@ -778,7 +847,7 @@ static inline float fast_log2(float x) {
    (the mean of x and y) */
 static float proj_lpp(void) {
   const float *pr = gl.pr[gl.pr_top];
-  float a = pr[0] * (float)gl.vp[2] * 0.5f * pr[5] * (float)gl.vp[3] * 0.5f * FB_H / GL_H;
+  float a = pr[0] * (float)gl.vp[2] * 0.5f * FB_W / GL_W * pr[5] * (float)gl.vp[3] * 0.5f * FB_H / GL_H;
   return 0.5f * fast_log2(a < 0 ? -a : a);
 }
 
@@ -1104,8 +1173,12 @@ static void dl_record(const u32 *idx, int nidx, int nverts) {
 
 /* Starts list id (1 .. DL_MAX - 1); returns 0 if it cannot. */
 int mxgl_NewList(int id) {
+  static int warned;
   if (!dl_pool) /* taken by the first list (a game without lists does not pay) */
     dl_pool = memalign(64, DL_POOL_BYTES);
+  if (!dl_pool && !warned++)
+    mx_printf("mxgl: no memory for the display lists (%u KB): drawn without\n",
+              DL_POOL_BYTES / 1024);
   if (id <= 0 || id >= DL_MAX || !dl_pool || dl_compiling)
     return 0;
   dlists[id].first = NULL;
@@ -1169,7 +1242,7 @@ void mxgl_CallList(int id) {
     memcpy(key, nk, sizeof key);
     make_mvp(m);
     const float *pr = gl.pr[gl.pr_top];
-    float sx = pr[0] * (float)gl.vp[2] * 0.5f, sy = pr[5] * (float)gl.vp[3] * 0.5f * FB_H / GL_H;
+    float sx = pr[0] * (float)gl.vp[2] * 0.5f * FB_W / GL_W, sy = pr[5] * (float)gl.vp[3] * 0.5f * FB_H / GL_H;
     float a = sx * sy;
     lpp = 0.5f * fast_log2(a < 0 ? -a : a);
     zn = ZMAX * (1 - gl.dn);
@@ -1538,11 +1611,35 @@ void APIENTRY glClear(GLbitfield mask) {
     return; /* mx_frame_begin cleared colour and Z */
   if (!(mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)))
     return;
+#ifdef MXGL_HIRES
+  /* a sprite over the scissor area (or all) in the passes' window: Z 0
+     with context 1, without (ZMSK) with context 2; colour, or the
+     destination's colour again (blend Cd) when only Z is cleared */
+  int x0 = 0, x1 = FB_W, y0 = 0, y1 = FB_H;
+  if (gl.scissor) {
+    x0 = gl.sc[0] * FB_W / GL_W, x1 = (gl.sc[0] + gl.sc[2]) * FB_W / GL_W;
+    y0 = (GL_H - (gl.sc[1] + gl.sc[3])) * FB_H / GL_H, y1 = (GL_H - gl.sc[1]) * FB_H / GL_H;
+  }
+  int z = (mask & GL_DEPTH_BUFFER_BIT) != 0, col = (mask & GL_COLOR_BUFFER_BIT) != 0;
+  u64 *c = mx_frame_reserve(2 + 8);
+  c = mx_e_cnt(c, 8, mx_vif_flush(), mx_vif_direct(8));
+  c = mx_e_ad_tag(c, 7, 1);
+  c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_TEST_1, !z), mx_gs_test(0, 0, 0, 0, 0, 0, 1, 1));
+  c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_ALPHA_1, !z), mx_gs_alpha(1, 1, 2, 1, 0));
+  c = mx_e_ad(c, MX_GS_REG_PRIM, mx_gs_prim(MX_GS_PRIM_SPRITE, 0, 0, 0, !col, 0, 0, !z, 0));
+  c = mx_e_ad(c, MX_GS_REG_RGBAQ,
+              mx_gs_rgbaq((u32)(gl.clear[0] * 255), (u32)(gl.clear[1] * 255),
+                          (u32)(gl.clear[2] * 255), 0x80, 1));
+  c = mx_e_ad(c, MX_GS_REG_XYZ2, mx_gs_xyz(mx_gs_px((u32)x0), mx_gs_py((u32)y0), 0));
+  c = mx_e_ad(c, MX_GS_REG_XYZ2, mx_gs_xyz(mx_gs_px((u32)x1), mx_gs_py((u32)y1), 0));
+  c = mx_e_ad(c, MX_GS_REG_PRMODECONT, 1);
+  mx_frame_commit(c);
+#else
   /* a sprite over the scissor area (or all): Z 0, colour if asked */
   const struct mx_rt *t = &rt[buf];
   int x0 = 0, x1 = FB_W, y0 = 0, y1 = FB_H;
   if (gl.scissor) {
-    x0 = gl.sc[0], x1 = gl.sc[0] + gl.sc[2];
+    x0 = gl.sc[0] * FB_W / GL_W, x1 = (gl.sc[0] + gl.sc[2]) * FB_W / GL_W;
     y0 = (GL_H - (gl.sc[1] + gl.sc[3])) * FB_H / GL_H, y1 = (GL_H - gl.sc[1]) * FB_H / GL_H;
   }
   u64 *c = mx_frame_reserve(2 + 9);
@@ -1564,6 +1661,7 @@ void APIENTRY glClear(GLbitfield mask) {
   c = mx_e_ad_tag(c, 1, 1);
   c = mx_e_ad(c, MX_GS_REG_FRAME_1, mx_gs_frame(t->fbp, t->fbw, t->psm, 0));
   mx_frame_commit(c);
+#endif
   gs.valid = 0, gs_serial++;
 }
 
@@ -1584,19 +1682,26 @@ void APIENTRY glGenTextures(GLsizei n, GLuint *t) {
 
 /* data still read by frames in flight is freed two frames later */
 #define DEFER_MAX 256
-static void *deferred[3][DEFER_MAX];
-static int ndeferred[3];
+/* hires: a record is played until a later one replaces it, which may be
+   three frames later */
+#ifdef MXGL_HIRES
+#define NDEFER 4
+#else
+#define NDEFER 3
+#endif
+static void *deferred[NDEFER][DEFER_MAX];
+static int ndeferred[NDEFER];
 static u32 defer_frame;
 static void defer_free(void *p) {
   if (!p)
     return;
-  int k = (int)(mx_gs.frames % 3);
+  int k = (int)(mx_gs.frames % NDEFER);
   if (ndeferred[k] < DEFER_MAX)
     deferred[k][ndeferred[k]++] = p;
   /* else: leaked */
 }
 static void defer_collect(void) {
-  int k = (int)((mx_gs.frames + 1) % 3); /* filled two frames ago */
+  int k = (int)((mx_gs.frames + 1) % NDEFER); /* filled NDEFER - 1 frames ago */
   if (defer_frame == mx_gs.frames)
     return;
   defer_frame = mx_gs.frames;
@@ -1912,6 +2017,16 @@ void mxgl_init(void) {
   if (done)
     return;
   done = 1;
+#ifdef MXGL_HIRES
+  /* the records of the frame stream (each played every field until the
+     next replaces it) */
+  void *rec = memalign(64, REC_BYTES);
+  mx_vu_reset(2);
+  if (!rec || mx_hires_init(&mx_video_1080i, FB_W, FB_H, MX_GS_PSM_CT16S, rec, REC_BYTES,
+                            (void *)0x70002000, 0x2000) < 0)
+    mx_printf("mxgl: no 1080i hires (memory %p)\n", rec);
+  (void)ring, (void)rt, (void)disp, (void)buf;
+#else
   mx_gs_init_video(&mx_video_ntsc);
   u32 zbp = mx_vram_alloc(mx_rt_pages(FB_W, FB_H, MX_GS_PSM_Z24));
   for (int j = 0; j < 2; j++) {
@@ -1923,11 +2038,12 @@ void mxgl_init(void) {
   mx_vu_reset(2);
   /* chain mode: the stream calls the display lists' chains */
   mx_frame_init_chain(ring, sizeof ring, (void *)0x70002000, 0x2000);
-  shader = MX_VU_SHADER(MXGLV, mxglv_vu, mxglv_vu_end);
   /* frames as fast as they are made (the screen tears): the real rate */
   mx_frame_vsync(0);
-  arena[0] = memalign(64, ARENA_BYTES);
-  arena[1] = memalign(64, ARENA_BYTES);
+#endif
+  shader = MX_VU_SHADER(MXGLV, mxglv_vu, mxglv_vu_end);
+  for (int i = 0; i < NARENA; i++)
+    arena[i] = memalign(64, ARENA_BYTES);
   /* the HUD's font (256 x 8) in the first page after the buffers */
   mx_gs.w = FB_W, mx_gs.h = FB_H; /* the HUD's coordinates */
   mx_hud_init(mx_gs.tbp, FB_H);
@@ -1941,13 +2057,18 @@ void mxgl_init(void) {
   for (int i = 0; i < 4; i++)
     mat_ident(gl.pr[i]);
   gl.mode = GL_MODELVIEW;
-  gl.vp[2] = FB_W, gl.vp[3] = GL_H;
+  gl.vp[2] = GL_W, gl.vp[3] = GL_H;
   gl.df = 1;
   gl.sf = GL_ONE, gl.dfac = GL_ZERO;
   gl.dfunc = GL_LESS, gl.dmask = 1, gl.cullface = GL_BACK, gl.afunc = GL_ALWAYS;
   gl.texenv = GL_MODULATE;
   gl.color[0] = gl.color[1] = gl.color[2] = gl.color[3] = 1;
 
+}
+
+void mxgl_window(int w, int h) {
+  GL_W = w, GL_H = h;
+  gl.vp[2] = w, gl.vp[3] = h;
 }
 
 void mxgl_frame_done(void) {
@@ -1959,6 +2080,10 @@ void mxgl_frame_done(void) {
 }
 
 int mxgl_screenshot(const char *path) {
+#ifdef MXGL_HIRES
+  /* both fields: 1920 x 1080 */
+  return mx_hires_save_tga(path);
+#endif
   /* the last frame on the screen, then the pipeline stopped (as the
      tutorials' tut_screenshot); its CT16S buffer as a 24-bit TGA */
   u32 t0 = mx_count();
