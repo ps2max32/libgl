@@ -1,7 +1,7 @@
-# maxsdk_gl
+# libgl
 
 An OpenGL 1.1 subset on the PS2's GS, on `libs/maxsdk`'s frame pipeline: what the GL
-renderers of the Quake engines use (`apps/maxsdk_quake1`, `maxsdk_quake2`, `maxsdk_quake3`).
+renderers of the Quake engines use (`apps/quake1`, `quake2`, `quake3`).
 
 | | |
 |---|---|

@@ -1,7 +1,7 @@
-# maxsdk_gl in an app's Makefile: include it before mk/maxsdk.mk (it adds
+# libgl in an app's Makefile: include it before mk/maxsdk.mk (it adds
 # its HLSL program to HLSL_DIRS), with OUT set:
 #
-#   MXGL ?= $(PS2MAX)/libs/maxsdk_gl
+#   MXGL ?= $(PS2MAX)/libs/libgl
 #   include $(MXGL)/mk/mxgl.mk
 #   include $(MAXSDK)/mk/maxsdk.mk
 #   ... -I$(MXGL_INC) in the app's CFLAGS; $(MXGL_OBJS) in the link
