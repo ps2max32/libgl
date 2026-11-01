@@ -6,27 +6,30 @@
 /* the largest texture side the games should make (they scale larger ones
    down: GL_MAX_TEXTURE_SIZE) */
 #define MXGL_MAX_TEXTURE 128
-/* GS, VU1 and the frame pipeline, in the console's TV mode (MXGL_SD) */
+/* core memory besides the textures: two arenas, 1080i's 2 MiB, the display
+   lists' pool */
+#define MXGL_CORE_BYTES (6u << 20)
+/* GS, VU1 and the frame pipeline, in the console's TV mode (MXGL_SD).
+   What the DMAC or VU0 reads (the arenas, textures, display lists, 1080i's
+   records) is core memory (mx_core_alloc): with maxsdk's virtual memory
+   on (<mx/vm.h>) give it a core heap of MXGL_CORE_BYTES plus the
+   textures' (about 2 to 6 MiB for the Quakes). The game's own arrays may
+   be virtual memory. */
 void mxgl_init(void);
 /* the picture, after mxgl_init:
    - MXGL_SD: NTSC or PAL, the console's own (its BIOS's region)
    - MXGL_NTSC: 640 x 448, 60 Hz; MXGL_PAL: 640 x 512, 50 Hz; interlaced,
      16-bit colour, 24-bit Z, two buffers
    - MXGL_1080I: 1920 x 1080 interlaced (1920 x 540 a field) by maxsdk's
-     hires passes, 16-bit colour and Z; it takes 2 MiB of memory more while
-     it is on (the records and two more arenas)
+     hires passes, 16-bit colour and Z; it takes 2 MiB of core memory more
+     while it is on (the records and two more arenas)
    Between frames (a frame begun is ended first). GS memory is filled
    again (the textures are copied in as they are drawn), the display lists
    are dirty (mxgl_ListsDirty), and the window is the whole screen
    (mxgl_screen). Returns 0, or -1 if the mode could not be set (1080i:
-   memory, see mxgl_reserve_1080i); SD is set then. */
+   memory); SD is set then. */
 enum { MXGL_SD, MXGL_NTSC, MXGL_PAL, MXGL_1080I };
 int mxgl_set_mode(int mode);
-/* 1080i's 2 MiB taken now and kept (in SD too), after mxgl_init and
-   before the game's own allocations: taken later, at mxgl_set_mode, it
-   may split the heap, or there may be no block that large (it frees the
-   display lists' pool then). Returns 0, or -1 (no memory). */
-int mxgl_reserve_1080i(void);
 /* the mode set: MXGL_NTSC, MXGL_PAL or MXGL_1080I */
 int mxgl_mode(void);
 /* the screen's size: 640 x 448, 640 x 512, 1920 x 1080 */
@@ -44,8 +47,13 @@ void mxgl_frame_done(void);
 /* the frame shown last as a 24-bit TGA file ("host:..."); stops the
    pipeline (for tests: the program ends after it) */
 int mxgl_screenshot(const char *path);
-/* the counters on the screen (frames a second, EE and GL time, draws ...),
-   and once a second in the log */
+/* the counters on the screen, top left (1, the default) or not (0), and
+   once a second in the log: frames shown a second; triangles, vertices and
+   draws a frame; RAM as a bar (grey: the program, blue: the core heap in
+   use, dark blue: free, green: VM pages or malloc, orange: pinned), with the
+   VM in use, swap a second and the core heap; GS memory as a bar (grey: the
+   screen, green: textures, red while they refill, yellow: uploaded a
+   frame), with the texture room used, uploads and refills a frame */
 extern int mxgl_show_stats;
 
 /* display lists: the draws between NewList and EndList are recorded, not

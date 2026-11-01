@@ -51,6 +51,7 @@
 #include <mx/hud.h>
 #include <mx/sif.h>
 #include <mx/tex.h>
+#include <mx/vm.h>
 
 #include <GL/gl.h>
 #include "mxglv.h"
@@ -140,8 +141,14 @@ struct tex {
   int mip;               /* MIN_FILTER: 0 no levels, 1 nearest level, 2 both levels */
   int dirty;             /* changed (glTexSubImage2D) while in GS memory: upload it again */
   u32 vram_blocks;       /* the room it has there */
+  int twin;              /* its brightness copy: twins[twin - 1], or 0 */
 };
 static struct tex texs[MAX_TEX];
+/* brightness copies of colour textures, made when a draw multiplies with
+   the destination (tex_twin) */
+#define MAX_TWIN 64
+static struct tex twins[MAX_TWIN];
+static void tex_drop_twin(struct tex *t);
 static u32 vram_lo, vram_pos, vram_gen = 1;
 #define VRAM_END 16384u /* 64-word blocks in 4 MiB */
 
@@ -292,78 +299,164 @@ static void frame_start(void) {
   clut_send();
 }
 
-/* the counters, top left: frames a second (over the last second), EE time
-   from frame to frame, draws, triangles, textures copied into GS memory,
-   times GS memory was refilled, arena and GS memory used */
+/* The counters, top left, in three lines: frames shown a second;
+   triangles, vertices and draws a frame; RAM (32 MiB) as a bar of its
+   parts, with the VM in use and swap a second; GS memory (4 MiB) as a bar,
+   with the texture room used, uploads and refills a frame. The values are
+   made once a second (averages over it), and logged with more. */
+/* text: 0x80 is full (the font's texels times the colour / 128) */
+#define HUD_LABEL 0x506050
+#define HUD_TEXT 0x808080
+#define HUD_OK 0x508050
+#define HUD_WARN 0x808040
+#define HUD_BAD 0x805050
+#define HUD_BAR_X 38
+#define HUD_BAR_W 100
+#define HUD_TEXT_X 146
+/* bar parts (boxes: 0xff is full) */
+#define BAR_EMPTY 0x202020
+#define BAR_PROG 0x606060  /* the program, stacks; GS: the screen and Z */
+#define BAR_CORE 0x4070ff  /* the core heap in use */
+#define BAR_CORE_FREE 0x203878
+#define BAR_VM 0x40c040    /* VM pages (malloc without VM); GS: textures */
+#define BAR_PIN 0xff9020   /* pinned VM pages */
+#define BAR_UP 0xffff60    /* GS: uploaded a frame */
+#define BAR_REFILL 0xd03030 /* GS: textures while they refill */
+#define BAR_PARTS 5
+
+struct hud_bar {
+  u32 total, amt[BAR_PARTS], rgb[BAR_PARTS];
+};
+static void hud_bar(u32 y, const struct hud_bar *b) {
+  u32 x = HUD_BAR_X * HUD_SCALE, w = HUD_BAR_W * HUD_SCALE;
+  mx_hud_box(x, y, w, 5, 0x80000000u | BAR_EMPTY);
+  /* the ends of the parts from their sums: no gaps between them */
+  u32 sum = 0, at = 0;
+  for (int i = 0; i < BAR_PARTS; i++) {
+    sum += b->amt[i];
+    u32 end = (u32)((u64)(sum < b->total ? sum : b->total) * w / b->total);
+    if (end > at)
+      mx_hud_box(x + at, y, end - at, 5, 0x80000000u | b->rgb[i]);
+    at = end;
+  }
+}
+
+static char *hud_mb(char *p, u32 bytes) { return mx_hud_u1(p, bytes, 1u << 20); }
+
+/* a line: up to four pieces of text, each in its colour */
+#define HUD_PIECES 4
+struct hud_line {
+  char s[HUD_PIECES][40];
+  u32 rgb[HUD_PIECES];
+};
+static u32 hud_line(u32 x, u32 y, const struct hud_line *l, int draw) {
+  for (int i = 0; i < HUD_PIECES; i++) {
+    if (!l->s[i][0])
+      continue;
+    if (draw)
+      mx_hud_text(x, y, l->s[i], l->rgb[i], HUD_SCALE);
+    x += mx_hud_width(l->s[i], HUD_SCALE) + 12 * HUD_SCALE;
+  }
+  return x;
+}
+
 static void draw_stats(void) {
   flush_out();
-  static u32 v_last, f_last, fps10, t_last, ee_us;
-  u32 now = mx_count();
-  ee_us = (now - t_last) / (MX_EE_HZ / 1000000);
-  t_last = now;
-  /* the longest frame of the second, and the frames longer than a field */
-  static u32 ee_max, n_long;
+  /* the second: frames shown (hires: made), and the sums of the counters */
+  static u32 v_last, f_last, n_frames, tris, verts, draws, up_kb, wraps;
+  static u32 swap_in, swap_out, ee_last, ee_max, n_long;
+  static struct hud_line line[3];
+  static struct hud_bar ram, vram;
+  u32 shown = hires ? mx_gs.frames : mx_gs.shown;
+  u32 now = mx_count(), ee_us = (now - ee_last) / (MX_EE_HZ / 1000000);
+  ee_last = now;
   if (ee_us > ee_max)
     ee_max = ee_us;
   n_long += ee_us > 1000000 / mx_gs.hz + 500;
-  int log_now = 0;
-  if (mx_gs.frames < f_last) /* the mode changed: counted again from 0 */
-    f_last = mx_gs.frames, v_last = mx_gs.vsync;
-  if (mx_gs.vsync - v_last >= mx_gs.hz) {
-    fps10 = (mx_gs.frames - f_last) * 10 * mx_gs.hz / (mx_gs.vsync - v_last);
-    v_last = mx_gs.vsync, f_last = mx_gs.frames;
-    log_now = 1;
-  }
-  /* full screen, no tests */
-  u64 *c = mx_frame_reserve(5);
-  c = mx_e_cnt(c, 3, mx_vif_flush(), mx_vif_direct(3));
-  c = mx_e_ad_tag(c, 2, 1);
-  if (hires)
-    c = mx_e_ad(c, MX_GS_REG_ALPHA_1, mx_gs_alpha(0, 1, 0, 1, 0)); /* the box: over */
-  else
-    c = mx_e_ad(c, MX_GS_REG_SCISSOR_1, mx_gs_scissor(0, fb_w - 1, 0, fb_h - 1));
-  c = mx_e_ad(c, MX_GS_REG_TEST_1, mx_gs_test(0, 0, 0, 0, 0, 0, 1, 1));
-  mx_frame_commit(c);
-  gs.valid = 0, gs_serial++;
-  char a[96], b[96];
-  char *p = mx_hud_cat(a, "FPS ");
-  p = mx_hud_u1(p, fps10, 10);
-  p = mx_hud_cat(p, "  EE ");
-  p = mx_hud_u1(p, ee_us / 100, 10);
-  p = mx_hud_cat(p, " MS  GL ");
-  p = mx_hud_u1(p, st_last.gl_cycles / (MX_EE_HZ / 10000), 10);
-  p = mx_hud_cat(p, " MS  DRAWS ");
-  p = mx_hud_u(p, st_last.draws);
-  p = mx_hud_cat(p, "  TRIS ");
-  p = mx_hud_u(p, st_last.tris);
-  p = mx_hud_cat(p, "  LISTS ");
-  mx_hud_u(p, st_last.lists);
-  p = mx_hud_cat(b, "TEX ");
-  p = mx_hud_u(p, st_last.uploads);
-  p = mx_hud_cat(p, "/");
-  p = mx_hud_u(p, st_last.upload_kb);
-  p = mx_hud_cat(p, "KB  REFILL ");
-  p = mx_hud_u(p, st_last.wraps);
-  p = mx_hud_cat(p, "  ARENA ");
-  p = mx_hud_u(p, arena_pos / 1024);
-  p = mx_hud_cat(p, "KB  VRAM ");
-  mx_hud_u(p, (vram_pos - vram_lo) / 4);
-  static u32 ring0, buf0;
-  if (log_now) {
+  n_frames++;
+  tris += st_last.tris, verts += st_last.verts, draws += st_last.draws;
+  up_kb += st_last.upload_kb, wraps += st_last.wraps;
+  if (shown < f_last) /* the mode changed: counted again from 0 */
+    f_last = shown, v_last = mx_gs.vsync;
+  u32 dv = mx_gs.vsync - v_last;
+  if (dv >= mx_gs.hz) {
+    memset(line, 0, sizeof line);
+    /* frames: FPS green at the refresh rate, red below 20 */
+    u32 fps10 = (shown - f_last) * 10 * mx_gs.hz / dv;
+    struct hud_line *l = &line[0];
+    mx_hud_cat(mx_hud_u1(l->s[0], fps10, 10), " FPS");
+    l->rgb[0] = fps10 * 100 >= mx_gs.hz * 950 ? HUD_OK : fps10 < 200 ? HUD_BAD : HUD_WARN;
+    char *t = mx_hud_cat(mx_hud_u(l->s[1], tris / n_frames), " TRIS  ");
+    t = mx_hud_cat(mx_hud_u(t, verts / n_frames), " VERTS  ");
+    mx_hud_cat(mx_hud_u(t, draws / n_frames), " DRAWS");
+    l->rgb[1] = HUD_TEXT;
+    /* RAM: the program (with the kernel and stacks), the core heap, VM
+       pages; without VM, malloc's part of the heap */
+    struct mx_core_stats cs;
+    mx_core_stats(&cs);
+    ram = (struct hud_bar){32u << 20, {0, cs.used, cs.total - cs.used, 0, 0},
+                           {BAR_PROG, BAR_CORE, BAR_CORE_FREE, BAR_VM, BAR_PIN}};
+    l = &line[1];
+    if (mx_vm_active()) {
+      struct mx_vm_stats vs;
+      mx_vm_stats(&vs);
+      ram.amt[0] = ram.total - cs.total - vs.frames * MX_VM_PAGE;
+      ram.amt[3] = (vs.frames - vs.free_frames - vs.pinned) * MX_VM_PAGE;
+      ram.amt[4] = vs.pinned * MX_VM_PAGE;
+      u32 out = vs.swap_outs + vs.writer_outs;
+      u32 si = (vs.swap_ins - swap_in) * (MX_VM_PAGE / 1024) * mx_gs.hz / dv;
+      u32 so = (out - swap_out) * (MX_VM_PAGE / 1024) * mx_gs.hz / dv;
+      swap_in = vs.swap_ins, swap_out = out;
+      mx_hud_cat(hud_mb(mx_hud_cat(l->s[0], "VM "), (u32)((u8 *)mx_sbrk(0) - (u8 *)mx_vm_base())),
+                 " MB");
+      l->rgb[0] = HUD_TEXT;
+      t = mx_hud_cat(mx_hud_u(mx_hud_cat(l->s[1], "SWAP IN "), si), " OUT ");
+      mx_hud_cat(mx_hud_u(t, so), " KB/S");
+      l->rgb[1] = si || so ? HUD_WARN : HUD_TEXT;
+    } else {
+      u8 *lo = (u8 *)mx_heap_start();
+      ram.amt[0] = ram.total - (u32)((u8 *)mx_heap_end() - lo);
+      ram.amt[2] = 0; /* free: the bar's end */
+      ram.amt[3] = (u32)((u8 *)mx_sbrk(0) - lo);
+      mx_hud_cat(hud_mb(mx_hud_cat(l->s[0], "MALLOC "), ram.amt[3]), " MB");
+      l->rgb[0] = HUD_TEXT;
+    }
+    t = mx_hud_cat(hud_mb(mx_hud_cat(l->s[2], "CORE "), cs.used), "/");
+    mx_hud_cat(hud_mb(t, cs.total), " MB");
+    l->rgb[2] = cs.used * 100 >= cs.total * 95 ? HUD_BAD : HUD_TEXT;
+    /* GS memory (KiB): the screen, Z, font and CLUTs; textures since the
+       last refill, the end of them uploaded a frame */
+    u32 room = (VRAM_END - vram_lo) / 4, tex = (vram_pos - vram_lo) / 4, up = up_kb / n_frames;
+    vram = (struct hud_bar){VRAM_END / 4, {vram_lo / 4, tex > up ? tex - up : 0, 0, 0, 0},
+                            {BAR_PROG, wraps ? BAR_REFILL : BAR_VM, BAR_UP, 0, 0}};
+    vram.amt[2] = tex - vram.amt[1];
+    l = &line[2];
+    mx_hud_cat(mx_hud_u(mx_hud_cat(mx_hud_u(mx_hud_cat(l->s[0], "TEX "), tex), "/"), room), " KB");
+    l->rgb[0] = tex * 100 >= room * 95 ? HUD_BAD : tex * 100 >= room * 80 ? HUD_WARN : HUD_OK;
+    mx_hud_cat(mx_hud_u(mx_hud_cat(l->s[1], "UP "), up), " KB/F");
+    l->rgb[1] = HUD_TEXT;
+    mx_hud_cat(mx_hud_u1(mx_hud_cat(l->s[2], "REFILL "), wraps * 10 / n_frames, 10), "/F");
+    l->rgb[2] = wraps ? HUD_BAD : HUD_OK;
+    /* the log: the lines, and more */
     u32 c = MX_EE_HZ / 10000;
-    mx_printf("stats: %s | %s\n", a, b);
-    mx_printf("stats: longest frame %u us, %u frames over a field\n", ee_max, n_long);
-    ee_max = n_long = 0;
-    mx_printf("stats: xf %u.%u tri %u.%u (incl flush %u.%u) ms, verts %u, wait ring %u ms buf %u ms "
+    for (int i = 0; i < 3; i++)
+      mx_printf("stats: %s  %s  %s\n", line[i].s[0], line[i].s[1], line[i].s[2]);
+    mx_printf("stats: longest frame %u us, %u frames over a field, arena %u/%u KB\n", ee_max,
+              n_long, arena_pos / 1024, ARENA_BYTES / 1024);
+    mx_printf("stats: ram: program %u KB, core %u/%u KB, %s %u KB, pinned %u KB\n",
+              ram.amt[0] / 1024, cs.used / 1024, cs.total / 1024,
+              mx_vm_active() ? "VM pages" : "malloc", ram.amt[3] / 1024, ram.amt[4] / 1024);
+    static u32 ring0, buf0;
+    mx_printf("stats: xf %u.%u tri %u.%u (incl flush %u.%u) ms, wait ring %u ms buf %u ms "
               "(since last)\n",
               st_last.xf_cycles / c / 10, st_last.xf_cycles / c % 10, st_last.tri_cycles / c / 10,
               st_last.tri_cycles / c % 10, st_last.flush_cycles / c / 10,
-              st_last.flush_cycles / c % 10, st_last.verts,
+              st_last.flush_cycles / c % 10,
               (mx_frame_stats.wait_ring - ring0) / (MX_EE_HZ / 1000),
               (mx_frame_stats.wait_buffer - buf0) / (MX_EE_HZ / 1000));
     ring0 = mx_frame_stats.wait_ring, buf0 = mx_frame_stats.wait_buffer;
-    mx_printf("stats: lists: bounds %u us, state %u us, call %u us\n", st_last.c_bounds / 295,
-              st_last.c_state / 295, st_last.c_call / 295);
+    mx_printf("stats: lists %u: bounds %u us, state %u us, call %u us\n", st_last.lists,
+              st_last.c_bounds / 295, st_last.c_state / 295, st_last.c_call / 295);
     mx_printf("stats: calls %u, batches %u; matrix %u us, lod %u us, set_state %u us; "
               "clipped %u in %u us, refused %u\n",
               st_last.calls, st_last.draws, st_last.c_mvp / 295, st_last.c_lod / 295,
@@ -376,10 +469,37 @@ static void draw_stats(void) {
               mx_hires_stats.pass_us[0], mx_hires_stats.pass_us[1], mx_hires_stats.pass_us[2]);
     mx_hires_stats.pass_us[0] = mx_hires_stats.pass_us[1] = mx_hires_stats.pass_us[2] = 0;
     }
+    v_last = mx_gs.vsync, f_last = shown;
+    n_frames = tris = verts = draws = up_kb = wraps = 0;
+    ee_max = n_long = 0;
   }
-  mx_hud_box(4 * HUD_SCALE, 2, 360 * HUD_SCALE, 20 * HUD_SCALE, 0x60000000);
-  mx_hud_text(8 * HUD_SCALE, 4, a, 0x80ff80, HUD_SCALE);
-  mx_hud_text(8 * HUD_SCALE, 4 + 9 * HUD_SCALE, b, 0x80ff80, HUD_SCALE);
+  if (!line[0].s[0][0])
+    return; /* the first second: nothing yet */
+  /* full screen, no tests */
+  u64 *c = mx_frame_reserve(5);
+  c = mx_e_cnt(c, 3, mx_vif_flush(), mx_vif_direct(3));
+  c = mx_e_ad_tag(c, 2, 1);
+  if (hires)
+    c = mx_e_ad(c, MX_GS_REG_ALPHA_1, mx_gs_alpha(0, 1, 0, 1, 0)); /* the box: over */
+  else
+    c = mx_e_ad(c, MX_GS_REG_SCISSOR_1, mx_gs_scissor(0, fb_w - 1, 0, fb_h - 1));
+  c = mx_e_ad(c, MX_GS_REG_TEST_1, mx_gs_test(0, 0, 0, 0, 0, 0, 1, 1));
+  mx_frame_commit(c);
+  gs.valid = 0, gs_serial++;
+  u32 x0 = 8 * HUD_SCALE, x1 = HUD_TEXT_X * HUD_SCALE, w = hud_line(x0, 0, &line[0], 0);
+  for (int i = 1; i < 3; i++) {
+    u32 e = hud_line(x1, 0, &line[i], 0);
+    if (e > w)
+      w = e;
+  }
+  mx_hud_box(4 * HUD_SCALE, 2, w - 12 * HUD_SCALE, 31, 0x60000000);
+  hud_line(x0, 4, &line[0], 1);
+  mx_hud_text(x0, 13, "RAM", HUD_LABEL, HUD_SCALE);
+  hud_bar(14, &ram);
+  hud_line(x1, 13, &line[1], 1);
+  mx_hud_text(x0, 22, "VRAM", HUD_LABEL, HUD_SCALE);
+  hud_bar(23, &vram);
+  hud_line(x1, 22, &line[2], 1);
 }
 
 void mxgl_end_frame(void) {
@@ -627,12 +747,38 @@ static void tex_upload(struct tex *t) {
 
 static int clut_pick; /* the CLUT of a brightness texture (blend_mode) */
 
+/* the blend factors; the framebuffer keeps no alpha (GL_ALPHA_BITS 0):
+   DST_ALPHA is 1 */
+static void blend_factors(GLenum *s, GLenum *d) {
+  *s = gl.sf == GL_DST_ALPHA ? GL_ONE : gl.sf == GL_ONE_MINUS_DST_ALPHA ? GL_ZERO : gl.sf;
+  *d = gl.dfac == GL_DST_ALPHA ? GL_ONE : gl.dfac == GL_ONE_MINUS_DST_ALPHA ? GL_ZERO : gl.dfac;
+}
+
+/* a product with the destination colour: done with a brightness texture
+   (blend_mode), a colour texture's brightness copy (tex_twin) */
+static int blend_product(void) {
+  GLenum s, d;
+  blend_factors(&s, &d);
+  return (s == GL_DST_COLOR && (d == GL_ZERO || d == GL_ONE || d == GL_SRC_COLOR)) ||
+         (s == GL_ZERO && (d == GL_SRC_COLOR || d == GL_ONE_MINUS_SRC_COLOR));
+}
+
+static struct tex *tex_twin(struct tex *t);
+
 static int blend_mode(u64 *alpha, const struct tex *t) {
-  GLenum s = gl.sf, d = gl.dfac;
+  GLenum s, d;
+  blend_factors(&s, &d);
   if (s == GL_ONE && d == GL_ZERO)
     return 0;
   if (s == GL_SRC_ALPHA && d == GL_ONE_MINUS_SRC_ALPHA) {
     *alpha = mx_gs_alpha(0, 1, 0, 1, 0);
+    return 1;
+  }
+  /* DST_COLOR ONE (Cd * (1 + Cs), a dynamic light) of a brightness
+     texture: Cd * (1 + As), As its brightness (1x) times the vertex alpha */
+  if (s == GL_DST_COLOR && d == GL_ONE && t && t->bright) {
+    *alpha = mx_gs_alpha(1, 2, 0, 1, 0);
+    clut_pick = CLUT_1X;
     return 1;
   }
   if ((s == GL_ONE || s == GL_DST_COLOR) && d == GL_ONE) {
@@ -671,6 +817,12 @@ static int blend_mode(u64 *alpha, const struct tex *t) {
     clut_pick = gl.cshift ? CLUT_2X : CLUT_1X;
     return 1;
   }
+  /* DST_COLOR SRC_COLOR: 2 Cd Cs, Cd * As up to 2x */
+  if (s == GL_DST_COLOR && d == GL_SRC_COLOR && t && t->bright) {
+    *alpha = mx_gs_alpha(1, 2, 0, 2, 0);
+    clut_pick = CLUT_2X;
+    return 1;
+  }
   if (s == GL_ZERO && d == GL_ONE_MINUS_SRC_COLOR && t && t->bright) {
     *alpha = mx_gs_alpha(1, 2, 0, 2, 0);
     clut_pick = CLUT_INV;
@@ -686,6 +838,9 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   struct tex *t = NULL;
   if (gl.tex2d && gl.bound && gl.bound < MAX_TEX && texs[gl.bound].used && texs[gl.bound].data)
     t = &texs[gl.bound];
+  /* a colour texture multiplied with the destination: its brightness */
+  if (t && !t->bright && gl.blend && blend_product() && !(t = tex_twin(t)))
+    return -1;
 
   u64 alpha = 0;
   clut_pick = CLUT_1X;
@@ -878,11 +1033,33 @@ static inline __attribute__((always_inline)) void o_put_pos(u32 n, const void *x
   u64 *d = (u64 *)o_pos[n];
   d[0] = a, d[1] = (u64)z | (u64)w << 32;
 }
+/* A polygon's texture coordinates less whole repeats (st_poly): the GS
+   takes S times the texture's width as a fixed-point texel coordinate of
+   limited range (about 2048 texels), so a floor far from the map's origin
+   (Quake 2: S of 20 to 30 repeats of a 128-texel texture) was drawn in
+   streaks on the PS2 (PCSX2 computes in float). */
+static float st_off[2];
+static int st_shift;
 static inline __attribute__((always_inline)) void o_put_st(u32 n, const void *t) {
   u64 a;
   memcpy(&a, t, 8);
+  if (st_shift) {
+    float f[2];
+    memcpy(f, &a, 8);
+    f[0] -= st_off[0], f[1] -= st_off[1];
+    memcpy(&a, f, 8);
+  }
   *(u64 *)o_st[n] = a;
 }
+/* the next vertices are a polygon's whose vertex 0 has texture coordinates
+   st0: the whole repeats of them are taken off (on the axes that repeat) */
+static void st_poly(const float *st0) {
+  const struct tex *t = gl.tex2d && gl.bound && gl.bound < MAX_TEX ? &texs[gl.bound] : NULL;
+  st_off[0] = t && !t->clamp_s ? (float)(s32)st0[0] : 0.0f;
+  st_off[1] = t && !t->clamp_t ? (float)(s32)st0[1] : 0.0f;
+  st_shift = st_off[0] != 0.0f || st_off[1] != 0.0f;
+}
+
 /* s_at: the parts' used bytes */
 static u32 o_prim;
 static float o_uni[VU_MXGLV_UNI_QW][4] MX_ALIGNED(16);
@@ -1250,6 +1427,12 @@ static u32 vu0_xform(const u8 *src, int stride, int n, float (*vp)[4], u8 *vo,
   while (n > 0) {
     int k = n < XFORM_RUN ? n : XFORM_RUN;
     u32 o;
+    /* the run's vertices resident first (with virtual memory, the game's
+       arrays may be swapped out: interrupts are off in the run) */
+    const u8 *end = src + (k - 1) * stride;
+    for (const u8 *p = src; p <= end; p += MX_VM_PAGE)
+      (void)*(const volatile u8 *)p;
+    (void)*(const volatile u8 *)end;
     oand &= vu0_xform_run(src, stride, k, vp, vo, mats, &o);
     o_or |= o;
     src += k * stride, vp += k, vo += k, n -= k;
@@ -1474,11 +1657,12 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
     vp_cache = SPR_VP, vo_cache = SPR_VO;
   } else {
     if ((u32)nverts > v_cache_n) {
-      free(vp_ram);
-      free(vo_ram);
+      mx_core_free(vp_ram);
+      mx_core_free(vo_ram);
       v_cache_n = (u32)nverts + 256;
-      vp_ram = memalign(16, v_cache_n * 16);
-      vo_ram = malloc(v_cache_n);
+      /* core memory: VU0 writes them with interrupts off */
+      vp_ram = mx_core_alloc(v_cache_n * 16, 16);
+      vo_ram = mx_core_alloc((v_cache_n + 15) & ~15u, 16);
     }
     vp_cache = vp_ram, vo_cache = vo_ram;
   }
@@ -1544,6 +1728,8 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
 
   u32 tt0 = mx_count();
   if (draw_polygon && nverts == nidx / 3 + 2 && nverts <= CLIP_MAX - 6) {
+    if (gl.ta && gl.tptr)
+      st_poly((const float *)gl.tptr);
     if (!oor && has_z) {
       /* inside: one facing test for the whole polygon */
       if (gl.cull) {
@@ -1569,6 +1755,7 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
         }
       }
       st_cur.tris += (u32)nverts - 2;
+      st_shift = 0;
       goto done;
     }
     if (oor) {
@@ -1580,8 +1767,10 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
       clip_poly(poly, nverts, oor);
       st_cur.clipped++;
       st_cur.c_clip += mx_count() - tc0;
+      st_shift = 0;
       goto done;
     }
+    st_shift = 0;
   }
   /* a strip or fan inside all planes: one strip (ADC on the vertex that
      ends a culled triangle; a fan's centre again, with ADC, every second
@@ -1912,7 +2101,7 @@ static void dl_record(const u32 *idx, int nidx, int nverts) {
 int mxgl_NewList(int id) {
   static int warned;
   if (!dl_pool) /* taken by the first list (a game without lists does not pay) */
-    dl_pool = memalign(64, DL_POOL_BYTES);
+    dl_pool = mx_core_alloc(DL_POOL_BYTES, 64); /* the DMAC reads it */
   if (!dl_pool && !warned++)
     mx_printf("mxgl: no memory for the display lists (%u KB): drawn without\n",
               DL_POOL_BYTES / 1024);
@@ -2071,6 +2260,7 @@ void mxgl_CallList(int id) {
     st_cur.draws++;
     st_cur.lists++;
     st_cur.tris += e->n / 3;
+    st_cur.verts += e->n;
   }
   dl_set_state(&keep);
   st_cur.gl_cycles += mx_count() - t0;
@@ -2259,6 +2449,7 @@ static void draw_polys(void) {
       }
       if (oand)
         continue;
+      st_poly((const float *)vb + pq_st);
       if (!oor) {
         if (gl.cull) {
           const float *pp[CLIP_MAX];
@@ -2287,6 +2478,7 @@ static void draw_polys(void) {
       }
     }
   }
+  st_shift = 0;
   st_cur.gl_cycles += mx_count() - t0;
   gl.vptr = vp0, gl.tptr = tp0, gl.cptr = cp0;
   gl.vsize = vs0, gl.vstride = vst0, gl.tstride = tst0;
@@ -2375,11 +2567,12 @@ void mxgl_DrawGlCmds(const int *cmds, const float *pos, int stride, const unsign
     vp_cache = SPR_VP, vo_cache = SPR_VO;
   } else {
     if ((u32)nv > v_cache_n) {
-      free(vp_ram);
-      free(vo_ram);
+      mx_core_free(vp_ram);
+      mx_core_free(vo_ram);
       v_cache_n = (u32)nv + 256;
-      vp_ram = memalign(16, v_cache_n * 16);
-      vo_ram = malloc(v_cache_n);
+      /* core memory: VU0 writes them with interrupts off */
+      vp_ram = mx_core_alloc(v_cache_n * 16, 16);
+      vo_ram = mx_core_alloc((v_cache_n + 15) & ~15u, 16);
     }
     vp_cache = vp_ram, vo_cache = vo_ram;
   }
@@ -2839,7 +3032,7 @@ static void defer_collect(void) {
     return;
   defer_frame = mx_gs.frames;
   for (int i = 0; i < ndeferred[k]; i++)
-    free(deferred[k][i]);
+    mx_core_free(deferred[k][i]);
   ndeferred[k] = 0;
 }
 
@@ -2855,6 +3048,7 @@ void APIENTRY glDeleteTextures(GLsizei n, const GLuint *t) {
     if (t[i] && t[i] < MAX_TEX) {
       defer_free(texs[t[i]].data);
       texs[t[i]].data = NULL;
+      tex_drop_twin(&texs[t[i]]);
       texs[t[i]].used = 0;
     }
 }
@@ -2974,6 +3168,60 @@ static u8 *to_rgba(GLenum format, GLsizei w, GLsizei h, const GLvoid *px) {
 
 static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
                          GLint border, GLenum format, GLenum type, const GLvoid *px);
+static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const GLvoid *px);
+
+static void tex_drop_twin(struct tex *t) {
+  if (!t->twin)
+    return;
+  struct tex *c = &twins[t->twin - 1];
+  defer_free(c->data);
+  memset(c, 0, sizeof *c);
+  t->twin = 0;
+}
+
+/* t's brightness copy (T8, the largest of R, G and B; for blendFunc
+   products, blend_product), made from its level 0 when first asked for;
+   NULL if there is no room */
+static struct tex *tex_twin(struct tex *t) {
+  if (!t->twin) {
+    int k = 0;
+    while (k < MAX_TWIN && twins[k].used)
+      k++;
+    if (k == MAX_TWIN)
+      return NULL;
+    u8 *rgba = malloc(t->w * t->h * 4);
+    if (!rgba)
+      return NULL;
+    const u8 *src = (const u8 *)t->data + t->off[0];
+    for (u32 i = 0; i < t->w * t->h; i++) {
+      u8 *o = rgba + i * 4;
+      if (t->pal) {
+        o[0] = pal_rgb[src[i]][0], o[1] = pal_rgb[src[i]][1], o[2] = pal_rgb[src[i]][2];
+      } else if (t->psm == MX_GS_PSM_CT32) {
+        o[0] = src[i * 4], o[1] = src[i * 4 + 1], o[2] = src[i * 4 + 2];
+      } else {
+        u32 c = ((const u16 *)src)[i];
+        o[0] = (u8)((c & 31) << 3), o[1] = (u8)((c >> 5 & 31) << 3), o[2] = (u8)((c >> 10 & 31) << 3);
+      }
+      o[3] = 255;
+    }
+    struct tex *c = &twins[k];
+    memset(c, 0, sizeof *c);
+    c->used = 1;
+    tex_brightness = 1;
+    tex_set_image(c, GL_RGB, (GLsizei)t->w, (GLsizei)t->h, rgba);
+    free(rgba);
+    if (!c->data) {
+      c->used = 0;
+      return NULL;
+    }
+    t->twin = k + 1;
+  }
+  struct tex *c = &twins[t->twin - 1];
+  c->clamp_s = t->clamp_s, c->clamp_t = t->clamp_t;
+  c->lin_mag = t->lin_mag, c->lin_min = t->lin_min, c->mip = t->mip;
+  return c;
+}
 void APIENTRY glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
                            GLint border, GLenum format, GLenum type, const GLvoid *px) {
   pq_flush();
@@ -3014,6 +3262,12 @@ static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsi
     w = 8;
   if (h < 8)
     h = 8;
+  tex_drop_twin(t);
+  tex_set_image(t, ifmt, w, h, px);
+}
+
+/* t's image, w x h RGBA8 texels s (NULL: zeros), at least 8 x 8 */
+static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const GLvoid *px) {
   /* alpha in the texels? Only 0 and 255 (a colour key: Descent 3's 1555)
      fits 16 bits (the alpha bit, TEXA); other alpha takes 32 */
   int alpha = 0, alpha8 = 0;
@@ -3051,7 +3305,7 @@ static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsi
     t->off[lv] = t->bytes;
     t->bytes += (((t->w >> lv) * (t->h >> lv) * tex_bpp(t)) + 63) & ~63u;
   }
-  t->data = memalign(64, t->bytes);
+  t->data = mx_core_alloc((t->bytes + 63) & ~63u, 64); /* IMAGE reads it by DMA */
   t->gen = 0;
   if (!t->data)
     return;
@@ -3072,6 +3326,7 @@ void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsi
   struct tex *t = &texs[gl.bound];
   if (!t->data)
     return;
+  tex_drop_twin(t);
   u8 *rgba = to_rgba(format, w, h, px);
   if (rgba) {
     glTexSubImage2D(target, level, x, y, w, h, GL_RGBA, type, rgba);
@@ -3209,19 +3464,9 @@ static int start_sd(int pal) {
 
 /* hires: the records of the frame stream (each played every field until
    the next replaces it) and arenas 2, 3, taken while it is on */
-static int hires_keep; /* mxgl_reserve_1080i: kept in SD too */
 static int start_hires(void) {
   if (!hires_mem)
-    hires_mem = memalign(64, REC_BYTES + 2 * ARENA_BYTES);
-  if (!hires_mem && dl_pool) {
-    /* the display lists' pool makes room (the lists are dirty: a game
-       makes them again, or draws without, when the pool cannot be had) */
-    memset(dlists, 0, sizeof dlists);
-    free(dl_pool);
-    dl_pool = NULL;
-    dl_pool_pos = 0;
-    hires_mem = memalign(64, REC_BYTES + 2 * ARENA_BYTES);
-  }
+    hires_mem = mx_core_alloc(REC_BYTES + 2 * ARENA_BYTES, 64);
   if (!hires_mem)
     return -1;
   mx_vu_reset(2);
@@ -3239,26 +3484,9 @@ static int start_hires(void) {
 }
 
 static void hires_free(void) {
-  if (hires_keep)
-    return;
-  free(hires_mem);
+  mx_core_free(hires_mem);
   hires_mem = NULL;
   arena[2] = arena[3] = NULL;
-}
-
-/* the largest block left (a probe the compiler keeps) */
-static u32 mem_free(void) {
-  u32 lo = 0, hi = 32u << 20;
-  while (hi - lo > 65536) {
-    u32 mid = (lo + hi) / 2;
-    void *volatile p = malloc(mid);
-    if (p)
-      lo = mid;
-    else
-      hi = mid;
-    free(p);
-  }
-  return lo;
 }
 
 int mxgl_set_mode(int mode) {
@@ -3280,7 +3508,7 @@ int mxgl_set_mode(int mode) {
        1080i, after a game freed its textures for a mode change) */
     for (int k = 0; k < NDEFER; k++) {
       for (int i = 0; i < ndeferred[k]; i++)
-        free(deferred[k][i]);
+        mx_core_free(deferred[k][i]);
       ndeferred[k] = 0;
     }
   }
@@ -3299,8 +3527,8 @@ int mxgl_set_mode(int mode) {
   }
   mode_set = mode;
   frame_par = 0;
-  mx_printf("mxgl: %s %ux%u, %u KB free\n", mode == MXGL_1080I ? "1080i" : mode == MXGL_PAL ? "PAL" : "NTSC",
-            fb_w, fb_h, mem_free() / 1024);
+  mx_printf("mxgl: %s %ux%u\n", mode == MXGL_1080I ? "1080i" : mode == MXGL_PAL ? "PAL" : "NTSC", fb_w,
+            fb_h);
   /* the HUD's font (256 x 8) in the first page after the buffers, the
      CLUTs after it, then the textures: all copied in again */
   mx_gs.w = (u32)fb_w, mx_gs.h = (u32)fb_h; /* the HUD's coordinates */
@@ -3317,12 +3545,6 @@ int mxgl_set_mode(int mode) {
 
 int mxgl_mode(void) { return mode_set; }
 
-int mxgl_reserve_1080i(void) {
-  if (!hires_mem)
-    hires_mem = memalign(64, REC_BYTES + 2 * ARENA_BYTES);
-  hires_keep = hires_mem != NULL;
-  return hires_keep ? 0 : -1;
-}
 
 
 void mxgl_screen(int *w, int *h) {
@@ -3337,7 +3559,7 @@ void mxgl_init(void) {
   done = 1;
   shader = MX_VU_SHADER(MXGLV, mxglv_vu, mxglv_vu_end);
   for (int i = 0; i < 2; i++) {
-    arena[i] = memalign(64, ARENA_BYTES);
+    arena[i] = mx_core_alloc(ARENA_BYTES, 64);
     /* written through UCAB only: no line of them may be in the cache */
     if (arena[i])
       mx_dcache_invalidate(arena[i], ARENA_BYTES);
