@@ -1889,30 +1889,59 @@ static void clip_tri(const struct cv *a, const struct cv *b, const struct cv *c,
   clip_poly(v, 3, planes);
 }
 
+/* plane k of plane_d as coefficients of (x, y, z, w) */
+static void plane_coef(int k, float *c) {
+  static const float base[6][4] = {{1, 0, 0, -GB_LO}, {-1, 0, 0, GB_HI}, {0, 1, 0, -GB_LO},
+                                   {0, -1, 0, GB_HI}, {0, 0, -1, 0},     {0, 0, 1, 0}};
+  if (k == 6) {
+    memcpy(c, ucp, 16);
+    return;
+  }
+  memcpy(c, base[k], 16);
+  if (k == 4)
+    c[3] = zn;
+  else if (k == 5)
+    c[3] = -zf;
+}
+
 static void clip_poly(struct cv *buf0, int n, u32 planes) {
-  static struct cv buf1[CLIP_MAX];
-  struct cv *in = buf0, *out = buf1;
+  /* the polygon as pointers to its vertices: the cut ones in pool (a
+     convex polygon gains at most two a plane) */
+  static struct cv pool[2 * 7 + 2];
+  const struct cv *b0[CLIP_MAX], *b1[CLIP_MAX];
+  const struct cv **in = b0, **out = b1;
+  float d[CLIP_MAX];
+  int np = 0;
+  for (int i = 0; i < n; i++)
+    in[i] = &buf0[i];
   for (int k = 0; k < 7 && n >= 3; k++) {
     if (!(planes & (1u << k)))
       continue;
+    float c[4];
+    plane_coef(k, c);
+    for (int i = 0; i < n; i++) {
+      const float *q = in[i]->p;
+      d[i] = c[0] * q[0] + c[1] * q[1] + c[2] * q[2] + c[3] * q[3];
+    }
     int m = 0;
     for (int i = 0; i < n; i++) {
-      const struct cv *p = &in[i], *q = &in[i + 1 == n ? 0 : i + 1];
-      float dp = plane_d(p->p, k), dq = plane_d(q->p, k);
+      int j = i + 1 == n ? 0 : i + 1;
+      float dp = d[i], dq = d[j];
       if (dp >= 0 && m < CLIP_MAX)
-        out[m++] = *p;
-      if ((dp >= 0) != (dq >= 0) && m < CLIP_MAX) {
+        out[m++] = in[i];
+      if ((dp >= 0) != (dq >= 0) && m < CLIP_MAX && np < (int)(sizeof pool / sizeof pool[0])) {
         /* from the inside vertex, whichever way round the edge is: two
            triangles sharing it (a quad's diagonal, cut one by one) get
            the same point to the bit, else a pixel line between them */
-        const struct cv *a = p, *b = q;
+        const struct cv *a = in[i], *b = in[j];
         float da = dp, db = dq;
         if (da < 0)
-          a = q, b = p, da = dq, db = dp;
-        lerp(&out[m++], a, b, da / (da - db));
+          a = in[j], b = in[i], da = dq, db = dp;
+        lerp(&pool[np], a, b, da / (da - db));
+        out[m++] = &pool[np++];
       }
     }
-    struct cv *t = in;
+    const struct cv **t = in;
     in = out, out = t, n = m;
   }
   if (n < 3)
@@ -1920,7 +1949,7 @@ static void clip_poly(struct cv *buf0, int n, u32 planes) {
   if (gl.cull) {
     const float *pp[CLIP_MAX];
     for (int i = 0; i < n; i++)
-      pp[i] = in[i].p;
+      pp[i] = in[i]->p;
     if (culled_poly(pp, n))
       return;
   }
@@ -1930,7 +1959,7 @@ static void clip_poly(struct cv *buf0, int n, u32 planes) {
      triangle) */
   for (int k = 0, lo = 1, hi = n - 1; k < n; k++) {
     int v = k == 0 ? 0 : (k & 1) ? lo++ : hi--;
-    out_vertex(&in[v], k < 2);
+    out_vertex(in[v], k < 2);
   }
   st_cur.tris += (u32)n - 2;
 }
@@ -2136,8 +2165,10 @@ static u32 vu0_xform_run(const u8 *src, int stride, int n, float (*vp)[4], u8 *v
   *oor = o_or;
   return oand;
 }
-static u32 vu0_xform(const u8 *src, int stride, int n, float (*vp)[4], u8 *vo,
-                     const float *mats, u32 *oor) {
+/* the vertices' GS coordinates and outcodes; wmin: NULL, or the smallest
+   w (the nearest vertex) is taken into it */
+static u32 vu0_xform_w(const u8 *src, int stride, int n, float (*vp)[4], u8 *vo,
+                       const float *mats, u32 *oor, float *wmin) {
   u32 oand = 0x3F, o_or = 0;
   while (n > 0) {
     int k = n < XFORM_RUN ? n : XFORM_RUN;
@@ -2150,16 +2181,25 @@ static u32 vu0_xform(const u8 *src, int stride, int n, float (*vp)[4], u8 *vo,
     (void)*(const volatile u8 *)end;
     oand &= vu0_xform_run(src, stride, k, vp, vo, mats, &o);
     o_or |= o;
-    /* the nearest vertex: the finest level the draw's texture is sampled at */
-    if (tex_bias_auto) {
-      float wm = vp[0][3];
-      for (int i = 1; i < k; i++)
+    if (wmin) {
+      float wm = *wmin;
+      for (int i = 0; i < k; i++)
         wm = vp[i][3] < wm ? vp[i][3] : wm;
-      tex_need_note(k_lod, wm);
+      *wmin = wm;
     }
     src += k * stride, vp += k, vo += k, n -= k;
   }
   *oor = o_or;
+  return oand;
+}
+static u32 vu0_xform(const u8 *src, int stride, int n, float (*vp)[4], u8 *vo,
+                     const float *mats, u32 *oor) {
+  if (!tex_bias_auto)
+    return vu0_xform_w(src, stride, n, vp, vo, mats, oor, NULL);
+  /* the nearest vertex: the finest level the draw's texture is sampled at */
+  float wm = 3.4e38f;
+  u32 oand = vu0_xform_w(src, stride, n, vp, vo, mats, oor, &wm);
+  tex_need_note(k_lod, wm);
   return oand;
 }
 
@@ -3658,6 +3698,23 @@ static inline __attribute__((always_inline)) const u32 *mode_ix(GLenum mode, int
   }
 }
 
+/* a polygon's vertices (x, y, z at xyz, s, t at st) copied into the
+   polygon queue (pq_buf) */
+static void pq_copy(const void *xyz, int xs, const void *st, int ss, int n) {
+  if (pq_n && (pq_stride != 5 || pq_st != 3 || pq_n == PQ_MAX || pq_buf_n + 5 * n > PQ_BUF_FLOATS))
+    draw_polys();
+  float *d = pq_buf + pq_buf_n;
+  for (int i = 0; i < n; i++, d += 5) {
+    const float *x = (const float *)((const u8 *)xyz + i * xs);
+    const float *t = (const float *)((const u8 *)st + i * ss);
+    d[0] = x[0], d[1] = x[1], d[2] = x[2], d[3] = t[0], d[4] = t[1];
+  }
+  pq[pq_n].v = pq_buf + pq_buf_n, pq[pq_n].n = n;
+  pq_stride = 5, pq_st = 3;
+  pq_n++;
+  pq_buf_n += 5 * n;
+}
+
 void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
   /* a polygon of one buffer object's records (Quake's world): straight
      into the polygon queue, as a pointer into the buffer */
@@ -3728,19 +3785,7 @@ void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
   }
   if (mode == GL_POLYGON && gl.vsize == 3 && gl.ta && gl.tptr && !gl.ca && !u1_on() &&
       !dl_compiling && count <= CLIP_MAX - 6 && count <= SPR_VERTS) {
-    if (pq_n && (pq_stride != 5 || pq_st != 3 || pq_n == PQ_MAX ||
-                 pq_buf_n + 5 * count > PQ_BUF_FLOATS))
-      draw_polys();
-    float *d = pq_buf + pq_buf_n;
-    for (int i = 0; i < count; i++, d += 5) {
-      const float *x = (const float *)((const u8 *)gl.vptr + i * gl.vstride);
-      const float *t = (const float *)((const u8 *)gl.tptr + i * gl.tstride);
-      d[0] = x[0], d[1] = x[1], d[2] = x[2], d[3] = t[0], d[4] = t[1];
-    }
-    pq[pq_n].v = pq_buf + pq_buf_n, pq[pq_n].n = count;
-    pq_stride = 5, pq_st = 3;
-    pq_n++;
-    pq_buf_n += 5 * count;
+    pq_copy(gl.vptr, gl.vstride, gl.tptr, gl.tstride, count);
     gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
     return;
   }
@@ -3886,6 +3931,9 @@ static void draw_polys(void) {
   int k;
   const u32 *ix = mode_ix(GL_POLYGON, pq[0].n, &k);
   struct fastv fv;
+  /* the nearest vertex of the polygons drawn, noted once (they share the
+     texture and its LOD) */
+  float wmin = 3.4e38f, wpoly;
   if (prepare_state(ix, k, pq[0].n) && fastv_get(&fv)) {
     for (int i = 0; i < np; i++) {
       const u8 *vb = (const u8 *)pq[i].v;
@@ -3901,8 +3949,9 @@ static void draw_polys(void) {
       u32 oand, oor = 0;
       st_cur.calls++;
       st_cur.verts += (u32)n;
+      wpoly = 3.4e38f;
       if (mats_ok) {
-        oand = vu0_xform(vb, vs, n, vp_cache, vo_cache, mats, &oor);
+        oand = vu0_xform_w(vb, vs, n, vp_cache, vo_cache, mats, &oor, tex_bias_auto ? &wpoly : NULL);
         if (oor & 0x80) {
           oand = 0x3F, oor = 0;
           for (int j = 0; j < n; j++) {
@@ -3936,6 +3985,7 @@ static void draw_polys(void) {
         ucp_outcodes((const float(*)[4])vp_cache, vo_cache, n, &oand, &oor);
       if (oand)
         continue;
+      wmin = wpoly < wmin ? wpoly : wmin;
       st_poly((const float *)vb + pq_st);
       if (!oor) {
         if (gl.cull) {
@@ -3964,6 +4014,8 @@ static void draw_polys(void) {
         st_cur.c_clip += mx_count() - tc0;
       }
     }
+    if (tex_bias_auto && wmin < 3.4e38f)
+      tex_need_note(k_lod, wmin);
   }
   st_shift = 0;
   st_cur.gl_cycles += mx_count() - t0;
@@ -4231,6 +4283,18 @@ void APIENTRY glEnd(void) {
   if (n < (lp_mode ? 1 : 3))
     return;
   int k = 0;
+  /* a polygon of the current colour (Quake's water and sky, subdivided
+     into many): into the polygon queue, drawn with the next ones */
+  if (imm.mode == GL_POLYGON && !imm.st1 && !dl_compiling && n <= CLIP_MAX - 6 &&
+      n <= SPR_VERTS && !u1_on()) {
+    int same = 1;
+    for (int i = 0; i < n && same; i++)
+      same = imm.v[i].col == gl.col8;
+    if (same) {
+      pq_copy(imm.v[0].xyz, sizeof imm.v[0], imm.v[0].st, sizeof imm.v[0], n);
+      return;
+    }
+  }
   const u32 *ix = lp_mode ? NULL : mode_ix(imm.mode, n, &k);
   if (!ix && !lp_mode)
     return;
@@ -4574,12 +4638,33 @@ void APIENTRY glScalef(GLfloat x, GLfloat y, GLfloat z) {
   t[0] = x, t[5] = y, t[10] = z;
   glMultMatrixf(t);
 }
+/* sine and cosine of r on the FPU (libm's are software floating point):
+   r to [-pi, pi], then [-pi/2, pi/2], Taylor series (error < 1e-7) */
+static void fsincos(float r, float *ps, float *pc) {
+  float q = r * 0.159154943f;
+  q = (float)(int)(q + (q >= 0 ? 0.5f : -0.5f));
+  r = r - q * 6.28318548f + q * 1.74845553e-7f;
+  float cs = 1;
+  if (r > 1.57079633f)
+    r = 3.14159265f - r, cs = -1;
+  else if (r < -1.57079633f)
+    r = -3.14159265f - r, cs = -1;
+  float r2 = r * r;
+  *ps = r * (1 + r2 * (-1.0f / 6 + r2 * (1.0f / 120 + r2 * (-1.0f / 5040 + r2 * (1.0f / 362880 +
+                                                                                r2 * (-1.0f / 39916800))))));
+  *pc = cs * (1 + r2 * (-0.5f + r2 * (1.0f / 24 + r2 * (-1.0f / 720 + r2 * (1.0f / 40320 +
+                                                                          r2 * (-1.0f / 3628800 +
+                                                                                r2 * (1.0f / 479001600)))))));
+}
+
 void APIENTRY glRotatef(GLfloat a, GLfloat x, GLfloat y, GLfloat z) {
   float l = sqrtf(x * x + y * y + z * z);
   if (l == 0)
     return;
   x /= l, y /= l, z /= l;
-  float r = a * (3.14159265f / 180.0f), c = cosf(r), s = sinf(r), k = 1 - c;
+  float c, s;
+  fsincos(a * (3.14159265f / 180.0f), &s, &c);
+  float k = 1 - c;
   float t[16] = {x * x * k + c,     y * x * k + z * s, z * x * k - y * s, 0,
                  x * y * k - z * s, y * y * k + c,     z * y * k + x * s, 0,
                  x * z * k + y * s, y * z * k - x * s, z * z * k + c,     0,
@@ -4824,22 +4909,33 @@ static u32 ilog2(u32 v) {
 static void convert(struct tex *t, u32 lv, int x0, int y0, int w, int h, const u8 *src) {
   u32 lw = t->w >> lv;
   u8 *dst = TLV(t, lv);
-  for (int y = 0; y < h; y++)
-    for (int x = 0; x < w; x++) {
-      const u8 *s = src + (y * w + x) * 4;
-      u32 at = (u32)(y0 + y) * lw + (u32)(x0 + x);
-      if (t->pal) {
-        dst[at] = pal_nearest(s);
-      } else if (t->psm == MX_GS_PSM_T8) {
+  /* the format chosen once, not per texel (lightmaps change every frame) */
+  int f = t->pal ? 0 : t->psm == MX_GS_PSM_T8 ? 1 : t->psm == MX_GS_PSM_CT32 ? 2 : 3;
+  for (int y = 0; y < h; y++) {
+    const u8 *s = src + (u32)(y * w) * 4;
+    u32 at = (u32)(y0 + y) * lw + (u32)x0;
+    switch (f) {
+    case 0:
+      for (int x = 0; x < w; x++, s += 4)
+        dst[at + (u32)x] = pal_nearest(s);
+      break;
+    case 1:
+      for (int x = 0; x < w; x++, s += 4) {
         u8 m = s[0] > s[1] ? s[0] : s[1];
-        dst[at] = m > s[2] ? m : s[2];
-      } else if (t->psm == MX_GS_PSM_CT32) {
-        u32 a = (s[3] + 1u) >> 1;
-        ((u32 *)dst)[at] = (u32)s[0] | (u32)s[1] << 8 | (u32)s[2] << 16 | a << 24;
-      } else {
-        ((u16 *)dst)[at] = (u16)(s[0] >> 3 | (s[1] >> 3) << 5 | (s[2] >> 3) << 10 | (s[3] >= 128 ? 0x8000 : 0));
+        dst[at + (u32)x] = m > s[2] ? m : s[2];
       }
+      break;
+    case 2:
+      for (int x = 0; x < w; x++, s += 4)
+        ((u32 *)dst)[at + (u32)x] = (u32)s[0] | (u32)s[1] << 8 | (u32)s[2] << 16 | ((s[3] + 1u) >> 1) << 24;
+      break;
+    default:
+      for (int x = 0; x < w; x++, s += 4)
+        ((u16 *)dst)[at + (u32)x] =
+            (u16)(s[0] >> 3 | (s[1] >> 3) << 5 | (s[2] >> 3) << 10 | (s[3] >= 128 ? 0x8000 : 0));
+      break;
     }
+  }
 }
 
 /* levels 1 .. max_levels - 1 from level 0's RGBA8 texels: each the mean of
@@ -5153,6 +5249,8 @@ static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const
 }
 
 static void tex_sub(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const GLvoid *px);
+static void tex_sub_l8(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const GLvoid *px);
+static void tex_sub_ch(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const u8 *px);
 void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w,
                                      GLsizei h, GLenum format, GLenum type, const GLvoid *px) {
   pq_flush();
@@ -5162,6 +5260,15 @@ void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsi
   struct tex *t = &texs[bound];
   if (!t->data)
     return;
+  /* bytes into a brightness texture (Quake's lightmaps, every frame): its
+     texels as they are, without the RGBA8 copy */
+  if ((format == GL_LUMINANCE || format == GL_INTENSITY) && px && t->psm == MX_GS_PSM_T8 &&
+      !t->pal && !t->planar && !t->oclut && !t->twin[0] && !t->twin[1] && !t->twin[2] &&
+      !t->twin[3] && x >= 0 && y >= 0 && w > 0 && h > 0 && (u32)(x + w) <= t->w &&
+      (u32)(y + h) <= t->h) {
+    tex_sub_l8(t, x, y, w, h, px);
+    return;
+  }
   u8 *rgba = to_rgba(format, w, h, px);
   if (rgba) {
     glTexSubImage2D(target, level, x, y, w, h, GL_RGBA, type, rgba);
@@ -5194,6 +5301,12 @@ void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsi
       continue;
     struct tex *c = t->planar && ch == 1 ? t : &twins[t->twin[ch] - 1];
     const u8 *src = px;
+    /* a channel into a T8 copy (the planes of coloured light): its bytes
+       as they are */
+    if (ch && c->psm == MX_GS_PSM_T8 && !c->pal) {
+      tex_sub_ch(c, x, y, w, h, (const u8 *)px + ch - 1);
+      continue;
+    }
     if (ch && (one || (one = malloc((size_t)(w * h * 4))))) {
       for (int i = 0; i < w * h; i++)
         one[i * 4] = one[i * 4 + 1] = one[i * 4 + 2] = ((const u8 *)px)[i * 4 + ch - 1];
@@ -5207,11 +5320,10 @@ void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsi
   free(one);
 }
 
-/* RGBA8 texels px into t's level 0 at (x, y), its lines marked changed
-   (tex_place uploads them alone); level 0 only from now on */
-static void tex_sub(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const GLvoid *px) {
+/* lines y .. y + h - 1 of t's level 0 changed: written back, marked for
+   tex_place (which uploads them alone); level 0 only from now on */
+static void tex_sub_mark(struct tex *t, GLint y, GLsizei h) {
   t->levels = 1;
-  convert(t, 0, x, y, w, h, px);
   u32 rb = t->w * tex_bpp(t);
   mx_dcache_writeback(TLV(t, 0) + (u32)y * rb, (u32)h * rb);
   if (!t->dirty)
@@ -5219,6 +5331,31 @@ static void tex_sub(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const
   else
     t->dy0 = (u32)y < t->dy0 ? (u32)y : t->dy0, t->dy1 = (u32)(y + h) > t->dy1 ? (u32)(y + h) : t->dy1;
   t->dirty = 1;
+}
+
+/* RGBA8 texels px into t's level 0 at (x, y) */
+static void tex_sub(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const GLvoid *px) {
+  convert(t, 0, x, y, w, h, px);
+  tex_sub_mark(t, y, h);
+}
+
+/* every fourth byte from px (a channel of RGBA8 texels) into the T8
+   texture t's level 0 at (x, y) */
+static void tex_sub_ch(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const u8 *px) {
+  u8 *dst = TLV(t, 0) + (u32)y * t->w + (u32)x;
+  for (int r = 0; r < h; r++, dst += t->w)
+    for (int i = 0; i < w; i++, px += 4)
+      dst[i] = *px;
+  tex_sub_mark(t, y, h);
+}
+
+/* bytes px into the T8 texture t's level 0 at (x, y) */
+static void tex_sub_l8(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const GLvoid *px) {
+  u8 *dst = TLV(t, 0) + (u32)y * t->w + (u32)x;
+  const u8 *src = px;
+  for (int r = 0; r < h; r++, dst += t->w, src += w)
+    memcpy(dst, src, (size_t)w);
+  tex_sub_mark(t, y, h);
 }
 
 void APIENTRY glTexParameterf(GLenum target, GLenum p, GLfloat v) {
