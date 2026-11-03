@@ -759,6 +759,38 @@ int main(void) {
     glDeleteLists(list, 1);
     glDeleteTextures(1, &base);
     glDeleteTextures(1, &id);
+    /* two lightmaps one after the other, both in GS memory already (the
+       second frame: no upload between them): each surface its own green
+       and blue (the batch before drawn with its own channels' textures) */
+    {
+      static u8 la[8 * 8 * 4], lb[8 * 8 * 4];
+      for (int i = 0; i < 64; i++) {
+        la[i * 4] = 200, la[i * 4 + 1] = 50, la[i * 4 + 2] = 50, la[i * 4 + 3] = 255;
+        lb[i * 4] = 50, lb[i * 4 + 1] = 200, lb[i * 4 + 2] = 100, lb[i * 4 + 3] = 255;
+      }
+      GLuint two[2];
+      glGenTextures(2, two);
+      for (int k = 0; k < 2; k++) {
+        glBindTexture(GL_TEXTURE_2D, two[k]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, k ? lb : la);
+      }
+      for (int f = 0; f < 2; f++) {
+        frame();
+        quad(100, 100, 200, 200, 0);
+        quad(300, 100, 400, 200, 0);
+        glEnable(GL_TEXTURE_2D), glEnable(GL_BLEND);
+        glBlendFunc(GL_ZERO, GL_SRC_COLOR);
+        glBindTexture(GL_TEXTURE_2D, two[0]);
+        quad(100, 100, 200, 200, 0);
+        glBindTexture(GL_TEXTURE_2D, two[1]);
+        quad(300, 100, 400, 200, 0);
+        glDisable(GL_TEXTURE_2D), glDisable(GL_BLEND);
+        CHECK_PIX(150, 150, 0x3232C8);
+        CHECK_PIX(350, 150, 0x64C832);
+      }
+      glDeleteTextures(2, two);
+    }
     mxgl_color_light(0);
   }
 

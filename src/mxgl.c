@@ -252,7 +252,11 @@ static void tex_free_mem(struct tex *t) {
    upper levels pageable when it has 3 or more (not brightness textures:
    lightmaps change every frame) */
 static int tex_alloc_mem(struct tex *t, u32 clut_bytes) {
+#ifdef MXGL_NO_HEADS /* debugging: every texture pinned whole */
+  int split = 0;
+#else
   int split = gl_assets && !t->bright && t->max_levels >= 3;
+#endif
   t->bytes = 0;
   for (u32 lv = 0; lv < t->max_levels; lv++)
     t->bytes += mx_tex_level_bytes(t->psm, t->lw, t->lh, lv);
@@ -343,6 +347,9 @@ static u32 gs_serial;
 /* something was drawn through VU1 since the last FLUSH: a register write
    or an upload must wait for it (FLUSH); else it need not */
 static int gs_drew = 1;
+/* beam: the frame stream goes into the frame's once record (once_on): an
+   upload there does not wait for the main record's batches */
+static int in_once;
 #ifdef MXGL_NO_FLUSHSKIP
 #define GS_DREW 1
 #else
@@ -488,6 +495,14 @@ static void frame_start(void) {
   in_frame = 1;
   gs_drew = 1;
   mx_vcache_frame(mx_frame_number(), mx_frame_done());
+#ifdef MXGL_VCACHE_CHECK /* debugging: the cache's places checked every frame */
+  {
+    int mx__vcache_check(void);
+    static int told;
+    if (!told && mx__vcache_check())
+      told = 1, mx_printf("mxgl: the cache's places are wrong at frame %u\n", mx_frame_number());
+  }
+#endif
   arena_pos = 0;
   s_at[0] = s_at[1] = s_at[2] = 0;
   batch_place();
@@ -835,7 +850,10 @@ static void image_xfer_at(u32 dbp, u32 dbw, u32 psm, u32 y, u32 w, u32 h, u32 bp
   u64 *c = mx_frame_reserve(6 + 3 * (qwc / 0x7FFF + 1));
   const u8 *d = data;
   c = mx_e_cnt(c, 5, flush && GS_DREW ? mx_vif_flush() : mx_vif_nop(), mx_vif_direct(5));
-  if (flush)
+  /* the batches before are drawn: no FLUSH needed before the next
+     register writes, unless this went into the once record, apart from
+     the main record's batches */
+  if (flush && !in_once)
     gs_drew = 0;
   c = mx_e_ad_tag(c, 4, 0);
   c = mx_e_ad(c, MX_GS_REG_BITBLTBUF, mx_gs_bitbltbuf(0, 0, 0, dbp, dbw, psm));
@@ -965,14 +983,22 @@ static void clut_make(void) {
    not in every pass), unless GS memory was refilled in this frame: then
    their order among the draws matters */
 static void once_on(void) {
+#ifdef MXGL_NO_ONCE /* debugging: beam racing's uploads in the main record */
+  return;
+#endif
   if (!beam)
     return;
   flush_out();
   mx_hires_once(1);
+  in_once = 1;
 }
 static void once_off(void) {
+#ifdef MXGL_NO_ONCE
+  return;
+#endif
   if (beam)
     mx_hires_once(0);
+  in_once = 0;
 }
 
 static void clut_send(void) {
@@ -1194,7 +1220,12 @@ static int tex_place(struct tex *t) {
   t->m.levels = (u8)tex_levels(t);
   /* without MIPMAP filtering level 0 is drawn: wait for it rather than a proxy */
   u32 from;
-  int r = mx_vcache_tex_mem(tex_key(t), &t->m, t->psm, t->lw, t->lh, cpsm, tex_need(t), !t->mip,
+#ifdef MXGL_FORCE_TAIL /* debugging: split textures drawn from their tails */
+  u32 need_ = t->m.tail ? t->m.tail : tex_need(t);
+#else
+  u32 need_ = tex_need(t);
+#endif
+  int r = mx_vcache_tex_mem(tex_key(t), &t->m, t->psm, t->lw, t->lh, cpsm, need_, !t->mip,
                             &t->mt, &from);
   u32 nl = t->m.levels - from;
   if (r == MX_VCACHE_FULL)
@@ -1213,8 +1244,8 @@ static int tex_place(struct tex *t) {
       k <<= 1;
     u32 y0 = t->dy0 & ~(k - 1), y1 = (t->dy1 + k - 1) & ~(k - 1);
     y1 = y1 > t->h ? t->h : y1;
-    image_xfer_at(t->mt.tbp[0], t->mt.tbw[0], t->mt.psm, y0, t->w, y1 - y0, tex_bpp(t),
-                  TLV(t, 0) + y0 * rb, 1);
+    const u8 *src = TLV(t, 0) + y0 * rb;
+    image_xfer_at(t->mt.tbp[0], t->mt.tbw[0], t->mt.psm, y0, t->w, y1 - y0, tex_bpp(t), src, 1);
   } else {
     if (r == MX_VCACHE_MISS) {
       /* other textures moved only if the miss evicted some */
@@ -1345,6 +1376,9 @@ static int blend_mode(u64 *alpha, const struct tex *t) {
    in *prim and 0, or -1 if the draw cannot be done. */
 static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   struct tex *t = NULL;
+  /* the per channel passes' TEX0 and FRAME (mxgl_color_light): kept for
+     the batch before until write_regs has drawn it */
+  u64 ntex0[3] = {0, 0, 0}, nframe[3] = {0, 0, 0};
   if (gl.tex2d && gl.bound && gl.bound < MAX_TEX && texs[gl.bound].used && texs[gl.bound].data)
     t = &texs[gl.bound];
   /* a colour texture multiplied with the destination: its brightness, or
@@ -1405,9 +1439,9 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
       if (!ok)
         return -1;
       g->mt.cbp = b->mt.cbp = t->mt.cbp;
-      cl_tex0[0] = tex0;
-      cl_tex0[1] = mx_tex_tex0(&g->mt, tcc, tfx);
-      cl_tex0[2] = mx_tex_tex0(&b->mt, tcc, tfx);
+      ntex0[0] = tex0;
+      ntex0[1] = mx_tex_tex0(&g->mt, tcc, tfx);
+      ntex0[2] = mx_tex_tex0(&b->mt, tcc, tfx);
     }
     /* MMIN: 0/1 nearest/linear; with levels 2/3 (nearest texel) or 4/5
        (linear), the nearest level or both (trilinear): both unless the
@@ -1478,9 +1512,9 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
     /* glColorMask (beam: FRAME is the passes'; not kept); per channel:
        red first (flush_out draws green and blue) */
     for (int k = 0; k < 3; k++)
-      cl_frame[k] = mx_gs_frame(target->fbp, target->fbw, target->psm,
-                                gl.cmask | (0x00FFFFFFu & ~(0xFFu << (8 * k))));
-    u64 frame = cl_src ? cl_frame[0] : mx_gs_frame(target->fbp, target->fbw, target->psm, gl.cmask);
+      nframe[k] = mx_gs_frame(target->fbp, target->fbw, target->psm,
+                              gl.cmask | (0x00FFFFFFu & ~(0xFFu << (8 * k))));
+    u64 frame = cl_src ? nframe[0] : mx_gs_frame(target->fbp, target->fbw, target->psm, gl.cmask);
     if (!gs.valid || frame != gs.frame)
       reg[n] = MX_GS_REG_FRAME_1, val[n++] = gs.frame = frame;
   }
@@ -1503,6 +1537,10 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   write_regs(reg, val, n); /* the batch before drawn first */
   gs.valid = 1;
   cl_batch = cl_src != NULL;
+  if (cl_batch) {
+    memcpy(cl_tex0, ntex0, sizeof cl_tex0);
+    memcpy(cl_frame, nframe, sizeof cl_frame);
+  }
 
   /* beam: context 2 for no Z writes (SD: ZBUF's ZMSK) */
   *prim = (u32)mx_gs_prim(MX_GS_PRIM_TRISTRIP, 1, t != NULL, 0, abe, 0, 0, beam && zmsk, 0);
@@ -5842,10 +5880,12 @@ int mxgl_set_mode(int mode) {
   /* the top bytes no drawing writes (24-bit colour strips, a Z24 buffer):
      8-bit textures as T8H (the cache gives mt.psm) */
   u32 hp = 0, hn = 0;
+#ifndef MXGL_NO_HBYTE /* debugging: no textures in top bytes */
   if (beam)
     hn = mx_hires_hbyte(&hp);
   else if (rt[0].zpsm == MX_GS_PSM_Z24)
     hp = rt[0].zbp, hn = mx_rt_pages((u32)fb_w, (u32)fb_h, MX_GS_PSM_Z24);
+#endif
   mx_vcache_hpages(hp, hn);
   h_blocks = hn * 32;
   vram_gen++;
@@ -5919,10 +5959,60 @@ void mxgl_frame_done(void) {
   }
 }
 
+#ifdef MXGL_CHECK_TEX
+/* debugging (the pipeline stopped): every resident texture's level 0 in
+   GS memory against its texels in RAM; and the CLUTs at clut_cbp */
+static void check_textures(void) {
+  static u8 buf[128 * 128 * 4] MX_ALIGNED(64);
+  u32 nt = 0, nbad = 0;
+  for (u32 i = 1; i < MAX_TEX; i++) {
+    struct tex *t = &texs[i];
+    if (!t->used || !t->data)
+      continue;
+    struct mx_tex m;
+    u32 f = t->m.from;
+    if (!mx_vcache_peek(mx_vcache_tex_key(tex_key(t), f), &m))
+      continue;
+    u32 bytes = (t->w >> f) * (t->h >> f) * tex_bpp(t);
+    if (f)
+      mx_printf("check: tex %u %ux%u from level %u (levels %u, tail %u, mip %d, pal %d): %ux%u at %u, "
+                "TEX0 tw %u th %u levels %u\n", i, t->w, t->h, f, t->m.levels, t->m.tail, t->mip,
+                t->pal, t->w >> f, t->h >> f, m.tbp[0], m.tw, m.th, m.levels);
+    if (bytes % 128 || bytes > sizeof buf)
+      continue;
+    nt++;
+    if (mx_gs_download(buf, m.tbp[0], m.tbw[0], m.psm, 0, 0, t->w >> f, t->h >> f) < 0)
+      continue;
+    u32 bad = 0;
+    for (u32 k = 0; k < bytes; k++)
+      bad += buf[k] != TLV(t, f)[k];
+    if (bad && nbad++ < 20)
+      mx_printf("check: tex %u %ux%u psm %u bright %d pal %d at %u: %u of %u bytes wrong\n", i, t->w,
+                t->h, m.psm, t->bright, t->pal, m.tbp[0], bad, bytes);
+  }
+  mx_printf("check: %u textures, %u wrong\n", nt, nbad);
+  static u32 cl[256] MX_ALIGNED(64);
+  for (int k = 0; k <= NCLUT; k++) {
+    if (mx_gs_download(cl, clut_cbp + 4 * (u32)k, 1, MX_GS_PSM_CT32, 0, 0, 16, 16) < 0)
+      continue;
+    const u32 *want = k < NCLUT ? clut[k] : clut_pal;
+    u32 bad = 0;
+    for (int j = 0; j < 256; j++)
+      bad += cl[j] != want[j];
+    mx_printf("check: CLUT %d: %u of 256 entries wrong (first %08x, want %08x)\n", k, bad, cl[0], want[0]);
+  }
+}
+#endif
+
 int mxgl_screenshot(const char *path) {
   /* beam racing: both fields (1920 x 1080, 640 x 448 / 512) */
-  if (beam)
-    return mx_hires_save_tga(path);
+  if (beam) {
+    int r = mx_hires_save_tga(path);
+#ifdef MXGL_CHECK_TEX
+    check_textures();
+#endif
+    return r;
+  }
   /* the last frame on the screen, then the pipeline stopped (as the
      tutorials' tut_screenshot); its CT16S buffer as a 24-bit TGA */
   u32 t0 = mx_count();
