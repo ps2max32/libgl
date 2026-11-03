@@ -6,7 +6,10 @@
 // cscale scales the GL colour (0..255) to the GS's (0x80 is 1.0 when
 // modulated by a texture, and for alpha). tms, tmt: the texture matrix's
 // columns for s and t (xy), and its translation of S in tms.z, of T in
-// tmt.z. The draws are triangle strips:
+// tmt.z. cmul, cadd: the colour is col * cmul + cadd before the scale
+// (libgl: 1 and 0); a program of a game's (glUseProgram) with these six
+// uniforms has this program's data layout, so switching to it and back
+// costs no FLUSH. The draws are triangle strips:
 // pos.w is 1 for a vertex that ends no triangle (ADC: the first two of a
 // strip, so one batch holds many strips: a polygon is a strip of its
 // vertices, a triangle a strip of three).
@@ -17,6 +20,8 @@ cbuffer Uniforms {
     float4 cscale;
     float4 tms;
     float4 tmt;
+    float4 cmul;
+    float4 cadd;
 };
 
 struct In {
@@ -38,7 +43,7 @@ Out mxglv(In v) {
     float2 st = tms.xy * v.st.x + tmt.xy * v.st.y + float2(tms.z, tmt.z);
     Out o;
     o.st = float4(st * q, q, 0);
-    o.rgbaq = vu::rgba8(float4(v.col) * cscale);
+    o.rgbaq = vu::rgba8((float4(v.col) * cmul + cadd) * cscale);
     o.xyz2 = vu::ftoi4(p * q);
     o.xyz2.w = vu::adc(uint(v.pos.w));
     return o;

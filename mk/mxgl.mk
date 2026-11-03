@@ -12,7 +12,9 @@
 MXGL_DIR  := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 MXGL_INC  := $(MXGL_DIR)/include
 HLSL_DIRS += $(MXGL_DIR)/src
-MXGL_OBJS  = $(OUT)/mxgl/mxgl.o
+# MXGL_PROGS: the app's vertex programs (NAME.hlsl in HLSL_DIRS) for
+# glShaderBinary: NAME_vu1 in $(OUT)/mxgl/NAME_vu1.o (<mxgl.h>)
+MXGL_OBJS  = $(OUT)/mxgl/mxgl.o $(patsubst %,$(OUT)/mxgl/%_vu1.o,$(MXGL_PROGS))
 # MXGL_ARENA_BYTES: the size of each frame arena (512 KB by default; two,
 # four with beam racing); MXGL_REC_BYTES: beam racing's record of a frame's
 # stream (256 KB by default, four of them; a quarter of each is the
@@ -28,3 +30,10 @@ MXGL_CFLAGS = $(MXGL_DEFS) -mvu0 -ffast-math -fapprox-func -cl-single-precision-
 $(OUT)/mxgl/mxgl.o: $(MXGL_DIR)/src/mxgl.c $(MXGL_INC)/mxgl.h $(OUT)/hlsl/mxglv.h
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out -ffreestanding,$(CFLAGS)) $(MXGL_CFLAGS) -c $< -o $@
+
+$(OUT)/mxgl/%_vu1.c: $(OUT)/hlsl/%.h $(MXGL_DIR)/mk/vu1bin.awk
+	@mkdir -p $(dir $@)
+	awk -v name=$* -f $(MXGL_DIR)/mk/vu1bin.awk $< > $@
+
+$(OUT)/mxgl/%_vu1.o: $(OUT)/mxgl/%_vu1.c
+	$(CC) $(filter-out -ffreestanding,$(CFLAGS)) $(MXGL_CFLAGS) -I$(OUT)/hlsl -c $< -o $@

@@ -762,5 +762,66 @@ int main(void) {
     mxgl_color_light(0);
   }
 
+  /* a vertex program (GL_PS2_vertex_program_binary): the colour as
+     col * cmul + cadd (inverted here); glUseProgram(0) draws as before;
+     a display list draws as recorded with a program in use */
+  {
+    extern const struct mxgl_vu1_binary glprog_vu1;
+    frame();
+    CHECK(strstr((const char *)glGetString(GL_EXTENSIONS), "GL_PS2_vertex_program_binary") != NULL);
+    GLuint sh = glCreateShader(GL_VERTEX_SHADER), prog = glCreateProgram();
+    glShaderBinary(1, &sh, GL_PS2_VU1_BINARY, &glprog_vu1, sizeof glprog_vu1);
+    glAttachShader(prog, sh);
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    CHECK_EQ(ok, 1);
+    GLint cmul = glGetUniformLocation(prog, "cmul"), cadd = glGetUniformLocation(prog, "cadd");
+    CHECK(cmul >= 0 && cadd >= 0);
+    CHECK_EQ(glGetUniformLocation(prog, "nothing"), -1);
+    CHECK_EQ(glGetAttribLocation(prog, "COLOR"), 2);
+    glUseProgram(prog);
+    glUniform4f(cmul, -1, -1, -1, 1);
+    glUniform4f(cadd, 255, 255, 255, 0);
+    glColor3ub(51, 102, 153);
+    quad(100, 100, 200, 200, 0);
+    /* the uniforms changed between two draws: each has its own */
+    glUniform4f(cmul, 0, 0, 0, 1);
+    glUniform4f(cadd, 0, 255, 0, 0);
+    quad(300, 100, 400, 200, 0);
+    glUseProgram(0);
+    quad(500, 100, 600, 200, 0);
+    CHECK_PIX(150, 150, 0x6699CC);
+    CHECK_PIX(350, 150, 0x00FF00);
+    CHECK_PIX(550, 150, 0x996633);
+    /* a list, called with the program in use and without */
+    GLuint list = glGenLists(1);
+    glNewList(list, GL_COMPILE);
+    glColor3ub(51, 102, 153);
+    quad(100, 250, 200, 350, 0);
+    glEndList();
+    frame();
+    glUseProgram(prog);
+    glUniform4f(cmul, -1, -1, -1, 1);
+    glUniform4f(cadd, 255, 255, 255, 0);
+    glCallList(list);
+    glUseProgram(0);
+    glTranslatef(200, 0, 0);
+    glCallList(list);
+    glLoadIdentity();
+    CHECK_PIX(150, 300, 0x996633);
+    CHECK_PIX(350, 300, 0x996633);
+    /* and a draw after the list: the program again */
+    glUseProgram(prog);
+    glColor3ub(51, 102, 153);
+    quad(500, 250, 600, 350, 0);
+    glUseProgram(0);
+    CHECK_PIX(550, 300, 0x6699CC);
+    glDeleteLists(list, 1);
+    glDeleteProgram(prog);
+    glDeleteShader(sh);
+    CHECK_EQ(glGetError(), GL_NO_ERROR);
+  }
+
   return t_done("glconf");
 }

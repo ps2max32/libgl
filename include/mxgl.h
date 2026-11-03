@@ -115,6 +115,51 @@ void mxgl_color_light(int on);
    or NULL: the platform's GetProcAddress */
 void (*mxglGetProcAddress(const char *name))(void);
 
+/* ---- vertex programs (GL_PS2_vertex_program_binary) ----
+
+   GL 2.0's vertex shaders as VU1 programs, compiled from HLSL by the build:
+   glCreateShader(GL_VERTEX_SHADER), glShaderBinary(1, &sh,
+   GL_PS2_VU1_BINARY, &NAME_vu1, sizeof NAME_vu1), glCreateProgram,
+   glAttachShader, glLinkProgram, glUseProgram (0: fixed function again),
+   glGetUniformLocation, glUniform*, glGetAttribLocation. Fragments stay
+   fixed function (texture environment, blending, tests).
+
+   A program's inputs are the fixed arrays' (glVertexPointer,
+   glTexCoordPointer, glColorPointer), as libgl's own program (src/mxglv.hlsl)
+   takes them: float4 POSITION (x, y, z, and w: 1 for a vertex that ends no
+   triangle: the program's XYZ2 gets vu::adc(uint(pos.w))), float2 TEXCOORD,
+   uint4 COLOR_V4_8U (0..255); a link fails for others. libgl transforms the
+   positions on the EE for culling and clipping as for its own draws (the
+   uniform mvp), so the program must place a vertex where mvp does (no
+   deforms); a triangle cut by a plane gets vertices whose inputs are
+   interpolated (exact for programs affine in their inputs). Uniforms libgl
+   sets by name: mvp (float4x4: to GS coordinates times w), cscale (the
+   texture environment's colour scale: GS colour = colour * cscale), tms,
+   tmt (the texture matrix, as in mxglv.hlsl); the others glUniform* sets
+   (a location is a float's index in the uniforms). A program whose
+   uniforms are these four and two float4 more (mxglv.hlsl's cmul, cadd)
+   has libgl's own program's data layout: switching between them costs no
+   FLUSH (others: one a switch). Display lists draw as recorded, with
+   libgl's own program, whatever program is in use.
+
+   The build (mk/mxgl.mk): MXGL_PROGS lists the app's programs (NAME.hlsl
+   in HLSL_DIRS); each gives `extern const struct mxgl_vu1_binary
+   NAME_vu1;`. */
+#define GL_PS2_VU1_BINARY 0x6A50
+struct mxgl_vu1_uniform {
+  const char *name;           /* the cbuffer member's, lower case */
+  unsigned short at, qw;      /* quadwords */
+};
+struct mxgl_vu1_binary {
+  unsigned magic;             /* MXGL_VU1_MAGIC */
+  void (*shader)(void *s);    /* fills a struct mx_shader (<mx/frame.h>) */
+  unsigned nuni;
+  const struct mxgl_vu1_uniform *uni;
+  unsigned nin;
+  const char *const *in;      /* the inputs' semantics (POSITION, ...) */
+};
+#define MXGL_VU1_MAGIC 0x31555658u /* "XVU1" */
+
 /* OpenGL ES 1.1's float forms (not in <GL/gl.h>), after it */
 #ifdef GL_VERSION_1_1
 void APIENTRY glClipPlanef(GLenum plane, const GLfloat *equation);

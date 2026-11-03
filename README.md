@@ -10,8 +10,8 @@ frame and the screen are the PS2's own (`mxgl.h`).
 | `include/GL/gl.h`, `glext.h`, `KHR/` | Mesa's and Khronos' headers (MIT licence), as they are |
 | `include/mxgl.h` | the PS2's own calls: set-up, mode, window, end of frame, screenshot, the counters; `mxglGetProcAddress`; deprecated drawing calls (each says the GL calls that do the same) |
 | `src/mxgl.c` | the GL calls: state to GS registers, clipping on the EE, textures (CT32/CT16/T8, mipmaps made here) in GS memory as needed |
-| `src/mxglv.hlsl` | the one VU1 vertex program: transform, divide, texture matrix, ST·Q, colour |
-| `mk/mxgl.mk` | for an app's Makefile (see its head) |
+| `src/mxglv.hlsl` | libgl's own VU1 vertex program: transform, divide, texture matrix, ST·Q, colour (`col * cmul + cadd`, scaled) |
+| `mk/mxgl.mk` | for an app's Makefile (see its head); `MXGL_PROGS`: the app's vertex programs (`mk/vu1bin.awk` makes their binaries) |
 | `tests/glconf.c` | each feature drawn and read back (`glReadPixels`): `make -C tests run` (PCSX2), or the ELF on the PS2 |
 
 `glGetString(GL_EXTENSIONS)` lists the extensions, and `mxglGetProcAddress` gives every call
@@ -26,6 +26,26 @@ by name (core and ARB/EXT names):
 | `GL_EXT_paletted_texture`, `GL_EXT_shared_texture_palette` | `glColorTableEXT` and `GL_COLOR_INDEX` texels; the textures whose texels are all of the shared palette are kept as its indices (T8 with one CLUT: exact, half the memory of 16 bits) |
 | `GL_OES_compressed_paletted_texture` | `glCompressedTexImage2D` of 16 or 256 colours: T8 with the texture's own CLUT, its levels as given |
 | `GL_SGIS_generate_mipmap`, `GL_EXT_texture_edge_clamp` | the levels are made here anyway; CLAMP_TO_EDGE is the GS's clamp |
+| `GL_PS2_vertex_program_binary` | GL 2.0's vertex shaders as VU1 programs from HLSL (`glShaderBinary` with `GL_PS2_VU1_BINARY`, `glLinkProgram`, `glUseProgram`, `glUniform*`); below |
+
+### Vertex programs
+
+An app's HLSL vertex program (`NAME.hlsl` in its `HLSL_DIRS`, listed in `MXGL_PROGS`) gives
+`NAME_vu1`, a binary for `glShaderBinary(1, &sh, GL_PS2_VU1_BINARY, &NAME_vu1, sizeof
+NAME_vu1)`; then `glAttachShader`, `glLinkProgram`, `glUseProgram`, `glGetUniformLocation`,
+`glUniform*` as in GL 2.0. Fragments stay fixed function. `tests/glprog.hlsl` is one.
+
+- Its inputs are libgl's own (`float4 POSITION`, `float2 TEXCOORD`, `uint4 COLOR_V4_8U`: the
+  fixed arrays), else the link fails: the draws go through libgl's batches as its own do,
+  culled and clipped on the EE (a cut triangle's new vertices get interpolated inputs:
+  exact for a program affine in them), so the program places a vertex where `mvp` does.
+- libgl sets the uniforms `mvp`, `cscale`, `tms`, `tmt` (as in `mxglv.hlsl`); `glUniform*`
+  the others (a location is a float's index). A program whose uniforms are these four and two
+  `float4` more (`cmul`, `cadd`) has libgl's own data layout: switching costs no FLUSH; each
+  program stays in VU1's micro memory at an address of its own (no upload).
+- Display lists draw as recorded, with libgl's own program.
+- Quake 3's `code/ps2/q3stage.hlsl`: a stage's `rgbGen`/`alphaGen` as `col * cmul + cadd`
+  (and the vertex light's hue), so the EE no longer fills a colour per vertex and stage.
 
 Display lists (`glNewList` .. `glCallList`) hold their draws as DMA chains the frame calls,
 with the matrices of the call; `glReadPixels` reads colour and depth (the stream drawn first:

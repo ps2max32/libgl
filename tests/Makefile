@@ -10,6 +10,9 @@ MAXSDK   ?= $(PS2MAX)/libs/maxsdk
 MXGL     ?= $(PS2MAX)/libs/libgl
 OUT      ?= $(PS2MAX)/build/libs/libgl/tests
 all: $(OUT)/glconf.elf
+# glprog.hlsl: a vertex program for glShaderBinary (MXGL_PROGS)
+HLSL_DIRS   := $(HERE)
+MXGL_PROGS  := glprog
 include $(MXGL)/mk/mxgl.mk
 include $(MAXSDK)/mk/maxsdk.mk
 
@@ -19,7 +22,7 @@ LIBC_LIBS = $(MAXSDK_OUT)/libc/glue.c.o $(MAXSDK_OUT)/libmxc.a $(PICOLIBC)/lib/l
 TCFLAGS   = $(filter-out -ffreestanding,$(CFLAGS)) -MMD -nostdlibinc -isystem $(PICOLIBC)/include \
             -I$(MXGL_INC) -I$(MAXSDK)/tests/ps2
 
-$(OUT)/glconf.o: $(HERE)/glconf.c
+$(OUT)/glconf.o: $(HERE)/glconf.c $(OUT)/hlsl/glprog.h
 	@mkdir -p $(dir $@)
 	$(CC) $(TCFLAGS) -c $< -o $@
 

@@ -137,6 +137,13 @@ static void gl_free(void *p) { mx_heap_free(mx_is_vm(p) ? gl_assets : gl_heap, p
 static u32 arena_pos;
 static int in_frame, buf, frame_par;
 static struct mx_shader shader;
+/* vertex programs (glUseProgram; NULL: libgl's own, shader): the one the
+   batch is drawn with, the one in use; the program the stream has set up */
+struct vprog;
+static struct vprog *o_prog, *cur_prog;
+static const struct mx_shader *vu_cur;
+static const struct mx_shader *vprog_use(struct vprog *p);
+static const void *vprog_uni(struct vprog *p, const float (*fixed)[4]);
 static struct mx_rt rt[2];
 static struct mx_display disp[2];
 static u32 dropped_draws;
@@ -486,6 +493,7 @@ static void frame_start(void) {
   batch_place();
   gs.valid = 0, gs_serial++;
   mx_frame_shader_setup(&shader);
+  vu_cur = &shader;
   /* TEXA: CT16 alpha bit 1 is 0x80, 0 is 0 */
   u64 *c = mx_frame_direct(1 + 2);
   c = mx_e_ad_tag(c, 2, 1);
@@ -666,14 +674,16 @@ static void draw_stats(void) {
       /* where the cache's GS memory goes (KB), and the room made since the
          last line: the blocks in use in the runs taken, the blocks evicted */
       static u32 run0, ev0;
+      struct mx_vcache_space sp;
+      mx_vcache_space(&sp);
       u32 run = cv.evict_run_blocks - run0, ev = cv.evicted_blocks - ev0;
       run0 = cv.evict_run_blocks, ev0 = cv.evicted_blocks;
       mx_printf("stats: gs memory: room %u KB, held %u (pages %u); texels %u, between blocks %u, "
                 "whole pages %u, free in shared pages %u; top bytes %u of %u KB (texels %u); "
                 "evicted %u KB for runs with %u KB in use\n",
-                (MX_VRAM_BLOCKS - vram_lo) / 4, cv.pages * 8, cv.pages, cv.need_blocks / 4,
-                cv.span_waste / 4, cv.round_waste / 4, cv.small_free / 4, cv.hbyte_used / 16,
-                cv.hbyte_blocks / 16, cv.hbyte_need / 16, ev / 4, run / 4);
+                (MX_VRAM_BLOCKS - vram_lo) / 4, cv.pages * 8, cv.pages, sp.need_blocks / 4,
+                sp.span_waste / 4, sp.round_waste / 4, sp.small_free / 4, cv.hbyte_used / 16,
+                cv.hbyte_blocks / 16, sp.hbyte_need / 16, ev / 4, run / 4);
     }
     mx_printf("stats: ram: program %u KB, pinned %u KB (libgl %u in %u, stream %u in %u), free %u KB, "
               "%s %u KB, pinned pages %u KB\n",
@@ -1696,7 +1706,8 @@ static void st_poly(const float *st0) {
 
 /* s_at: the parts' used bytes */
 static u32 o_prim;
-static float o_uni[VU_MXGLV_UNI_QW][4] MX_ALIGNED(16);
+static float o_uni[VU_MXGLV_UNI_QW][4] MX_ALIGNED(16) = {
+    [VU_MXGLV_CMUL] = {1, 1, 1, 1}}; /* the colour as it is (cadd 0) */
 
 /* the next batch's place: after the batches of this frame */
 static void batch_place(void) {
@@ -1750,14 +1761,16 @@ static void flush_out(void) {
   /* the UCAB stores are done before the DMA reads them */
   mx_sync();
   const void *streams[3] = {pos, st, col};
-  mx_frame_shader_draw(&shader, o_prim, o_uni, streams, o_n);
+  const struct mx_shader *sh = vprog_use(o_prog);
+  const void *uni = vprog_uni(o_prog, (const float(*)[4])o_uni);
+  mx_frame_shader_draw(sh, o_prim, uni, streams, o_n);
   gs_drew = 1;
   if (cl_batch) {
     /* green and blue: the same batch again, then red's registers back */
     cl_regs(1);
-    mx_frame_shader_draw(&shader, o_prim, o_uni, streams, o_n);
+    mx_frame_shader_draw(sh, o_prim, uni, streams, o_n);
     cl_regs(2);
-    mx_frame_shader_draw(&shader, o_prim, o_uni, streams, o_n);
+    mx_frame_shader_draw(sh, o_prim, uni, streams, o_n);
     cl_regs(0);
   }
   st_cur.flush_cycles += mx_count() - tf0;
@@ -2344,8 +2357,9 @@ have:
   /* gathered with the triangles before if they are drawn the same way */
   float *ocs = o_uni[VU_MXGLV_CSCALE];
   if (o_n && (k_prim != o_prim || o_mser != m_serial || k_cs[0] != ocs[0] || k_cs[1] != ocs[1] ||
-              k_cs[2] != ocs[2] || k_cs[3] != ocs[3]))
+              k_cs[2] != ocs[2] || k_cs[3] != ocs[3] || o_prog != cur_prog))
     flush_out();
+  o_prog = cur_prog;
   o_prim = k_prim;
   ocs[0] = k_cs[0], ocs[1] = k_cs[1], ocs[2] = k_cs[2], ocs[3] = k_cs[3];
   if (o_mser != m_serial) {
@@ -3374,7 +3388,8 @@ void APIENTRY glCallList(GLuint id) {
         continue;
     }
     static u32 prim;
-    static float uni[VU_MXGLV_UNI_QW][4] MX_ALIGNED(16);
+    static float uni[VU_MXGLV_UNI_QW][4] MX_ALIGNED(16) = {
+        [VU_MXGLV_CMUL] = {1, 1, 1, 1}}; /* the colour as it is */
     static struct dl_state last_st;
     static s32 last_k;
     static u32 last_serial, last_gen;
@@ -3400,12 +3415,16 @@ void APIENTRY glCallList(GLuint id) {
     u32 c2 = mx_count();
     st_cur.c_state += c2 - c1;
     flush_out();
-    mx_frame_shader_call(&shader, prim, uni, &e->ch);
+    /* libgl's own program: a list's chain calls it (the entry is in its
+       batches); the colours are the recorded ones */
+    const struct mx_shader *sh = vprog_use(NULL);
+    const void *pu = uni;
+    mx_frame_shader_call(sh, prim, pu, &e->ch);
     if (cl_batch) { /* a channel a pass (mxgl_color_light) */
       cl_regs(1);
-      mx_frame_shader_call(&shader, prim, uni, &e->ch);
+      mx_frame_shader_call(sh, prim, pu, &e->ch);
       cl_regs(2);
-      mx_frame_shader_call(&shader, prim, uni, &e->ch);
+      mx_frame_shader_call(sh, prim, pu, &e->ch);
       cl_regs(0);
     }
     gs_drew = 1;
@@ -5262,7 +5281,7 @@ const GLubyte *APIENTRY glGetString(GLenum name) {
                             "GL_EXT_paletted_texture GL_EXT_shared_texture_palette "
                             "GL_OES_compressed_paletted_texture GL_SGIS_generate_mipmap "
                             "GL_EXT_texture_edge_clamp GL_SGIS_texture_edge_clamp "
-                            "GL_ARB_vertex_buffer_object";
+                            "GL_ARB_vertex_buffer_object GL_PS2_vertex_program_binary";
   default: gl_error(GL_INVALID_ENUM); return (const GLubyte *)"";
   }
 }
@@ -5934,6 +5953,326 @@ int mxgl_screenshot(const char *path) {
   return 0;
 }
 
+/* ---- vertex programs (GL 2.0 shaders and programs, GL_PS2_VU1_BINARY) ----- */
+
+/* VU1's micro memory (64-bit units): libgl's own program from 0, the
+   programs' code after it, each where it stays (a switch is a call: no
+   upload, and no FLUSH between programs of the same layout); when it is
+   full, from after libgl's own again (maxsdk uploads what is not
+   resident) */
+#define VU1_CODE 2048
+#define MAX_GLSL 64
+struct vprog {
+  struct mx_shader s; /* its entry where the code was placed */
+  u32 at;             /* the code's address */
+  const struct mxgl_vu1_binary *bin;
+  int r_mvp, r_cscale, r_tms, r_tmt; /* libgl's uniforms: quadwords, -1 none */
+  float (*uni)[4];
+};
+static struct {
+  u8 kind; /* 0 free, 1 shader, 2 program */
+  u8 linked;
+  const struct mxgl_vu1_binary *bin; /* a shader's; a program's attached */
+  struct vprog *p;
+  const char *log;
+} glsl[MAX_GLSL];
+static u32 vu1_next;
+
+/* the stream's program becomes p's (NULL: libgl's own); its shader */
+static const struct mx_shader *vprog_use(struct vprog *p) {
+  const struct mx_shader *s = p ? &p->s : &shader;
+  if (s == vu_cur)
+    return s;
+  const struct mx_shader *o = vu_cur;
+  if (!o || s->buf_qw != o->buf_qw || s->ctx_at != o->ctx_at || s->ctx_qw != o->ctx_qw ||
+      s->nctx != o->nctx || s->in_at != o->in_at || s->out_at != o->out_at) {
+    /* another layout: its inputs or contexts may be where the GIF still
+       reads the last program's packets (as mx_frame_shader_setup) */
+    u64 *c = mx_frame_reserve(2);
+    c = mx_e_cnt(c, 1, mx_vif_flush(), mx_vif_base(0));
+    c = mx_e_vif4(c, mx_vif_offset(s->buf_qw), mx_vif_stcycl(1, 1), 0, 0);
+    mx_frame_commit(c);
+  }
+  mx_frame_mpg(s->code, s->code_bytes, p ? p->at : 0);
+  vu_cur = s;
+  return s;
+}
+
+/* p's uniforms with libgl's (mvp, cscale, tms, tmt) from those of its own
+   program; fixed itself for libgl's */
+static const void *vprog_uni(struct vprog *p, const float (*fixed)[4]) {
+  if (!p)
+    return fixed;
+  if (p->r_mvp >= 0)
+    memcpy(p->uni[p->r_mvp], fixed[VU_MXGLV_MVP], 64);
+  if (p->r_cscale >= 0)
+    memcpy(p->uni[p->r_cscale], fixed[VU_MXGLV_CSCALE], 16);
+  if (p->r_tms >= 0)
+    memcpy(p->uni[p->r_tms], fixed[VU_MXGLV_TMS], 16);
+  if (p->r_tmt >= 0)
+    memcpy(p->uni[p->r_tmt], fixed[VU_MXGLV_TMT], 16);
+  return p->uni;
+}
+
+static int glsl_new(int kind) {
+  for (int i = 1; i < MAX_GLSL; i++)
+    if (!glsl[i].kind) {
+      glsl[i].kind = (u8)kind, glsl[i].linked = 0, glsl[i].bin = NULL, glsl[i].p = NULL;
+      glsl[i].log = "";
+      return i;
+    }
+  gl_error(GL_OUT_OF_MEMORY);
+  return 0;
+}
+static int glsl_is(GLuint id, int kind) { return id && id < MAX_GLSL && glsl[id].kind == kind; }
+
+GLuint APIENTRY glCreateShader(GLenum type) {
+  if (type != GL_VERTEX_SHADER) {
+    gl_error(GL_INVALID_ENUM);
+    return 0;
+  }
+  return (GLuint)glsl_new(1);
+}
+void APIENTRY glDeleteShader(GLuint sh) {
+  if (glsl_is(sh, 1))
+    glsl[sh].kind = 0;
+}
+/* binary: a struct mxgl_vu1_binary (<mxgl.h>) */
+void APIENTRY glShaderBinary(GLsizei count, const GLuint *shaders, GLenum format, const void *binary,
+                             GLsizei length) {
+  const struct mxgl_vu1_binary *b = binary;
+  if (format != GL_PS2_VU1_BINARY || !b || length < (GLsizei)sizeof *b || b->magic != MXGL_VU1_MAGIC) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  for (int i = 0; i < count; i++)
+    if (glsl_is(shaders[i], 1))
+      glsl[shaders[i]].bin = b;
+    else
+      gl_error(GL_INVALID_VALUE);
+}
+void APIENTRY glGetShaderiv(GLuint sh, GLenum pname, GLint *v) {
+  if (!glsl_is(sh, 1)) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  *v = pname == GL_COMPILE_STATUS ? glsl[sh].bin != NULL : pname == GL_SHADER_TYPE ? GL_VERTEX_SHADER : 0;
+}
+GLuint APIENTRY glCreateProgram(void) { return (GLuint)glsl_new(2); }
+void APIENTRY glAttachShader(GLuint prog, GLuint sh) {
+  if (!glsl_is(prog, 2) || !glsl_is(sh, 1)) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  glsl[prog].bin = glsl[sh].bin;
+}
+void APIENTRY glDetachShader(GLuint prog, GLuint sh) {
+  if (glsl_is(prog, 2))
+    glsl[prog].bin = NULL;
+}
+void APIENTRY glDeleteProgram(GLuint prog) {
+  if (!glsl_is(prog, 2))
+    return;
+  struct vprog *p = glsl[prog].p;
+  if (p && (p == cur_prog || p == o_prog)) {
+    /* still in use (the batch's, or glUseProgram's): its memory is kept
+       (a few hundred bytes) */
+    glsl[prog].kind = 0;
+    return;
+  }
+  if (p) {
+    gl_free(p->uni);
+    free(p);
+  }
+  glsl[prog].kind = 0;
+}
+
+/* the uniform name (lower case in the binary) of a cbuffer member */
+static int uni_find(const struct mxgl_vu1_binary *b, const char *name) {
+  for (u32 i = 0; i < b->nuni; i++) {
+    const char *a = b->uni[i].name, *n = name;
+    while (*a && *n && (*n | 0x20) == *a)
+      a++, n++;
+    if (!*a && !*n)
+      return (int)i;
+  }
+  return -1;
+}
+
+/* the binary's program placed in VU1's micro memory; its inputs must be
+   libgl's own (the batches and the display lists' chains are made for
+   them) */
+void APIENTRY glLinkProgram(GLuint prog) {
+  if (!glsl_is(prog, 2)) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  glsl[prog].linked = 0;
+  const struct mxgl_vu1_binary *b = glsl[prog].bin;
+  if (!b) {
+    glsl[prog].log = "no shader binary attached";
+    return;
+  }
+  struct mx_shader s;
+  b->shader(&s);
+  if (s.nin != shader.nin || memcmp(s.in, shader.in, sizeof s.in[0] * s.nin) ||
+      s.in_at != shader.in_at || s.align != shader.align || s.max_i) {
+    glsl[prog].log = "inputs not float4 POSITION, float2 TEXCOORD, uint4 COLOR_V4_8U (mxglv.hlsl)";
+    return;
+  }
+  u32 own = (shader.code_bytes + 7) / 8, n = (s.code_bytes + 7) / 8;
+  if (own + n > VU1_CODE) {
+    glsl[prog].log = "code larger than VU1's micro memory";
+    return;
+  }
+  struct vprog *p = glsl[prog].p;
+  if (!p) {
+    p = calloc(1, sizeof *p);
+    if (!p) {
+      gl_error(GL_OUT_OF_MEMORY);
+      return;
+    }
+  } else {
+    gl_free(p->uni);
+    p->uni = NULL;
+  }
+  if (vu1_next < own || vu1_next + n > VU1_CODE)
+    vu1_next = own;
+  p->at = vu1_next;
+  vu1_next += n;
+  p->s = s;
+  p->s.entry = s.entry + p->at;
+  p->bin = b;
+  p->uni = gl_alloc(s.uni_qw * 16 + 16, 16);
+  if (!p->uni) {
+    free(p);
+    glsl[prog].p = NULL;
+    gl_error(GL_OUT_OF_MEMORY);
+    return;
+  }
+  memset(p->uni, 0, s.uni_qw * 16);
+  int k;
+  p->r_mvp = (k = uni_find(b, "mvp")) >= 0 ? b->uni[k].at : -1;
+  p->r_cscale = (k = uni_find(b, "cscale")) >= 0 ? b->uni[k].at : -1;
+  p->r_tms = (k = uni_find(b, "tms")) >= 0 ? b->uni[k].at : -1;
+  p->r_tmt = (k = uni_find(b, "tmt")) >= 0 ? b->uni[k].at : -1;
+  glsl[prog].p = p;
+  glsl[prog].linked = 1;
+  glsl[prog].log = "";
+}
+void APIENTRY glGetProgramiv(GLuint prog, GLenum pname, GLint *v) {
+  if (!glsl_is(prog, 2)) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  switch (pname) {
+  case GL_LINK_STATUS: *v = glsl[prog].linked; break;
+  case GL_INFO_LOG_LENGTH: *v = (GLint)strlen(glsl[prog].log) + 1; break;
+  case GL_ATTACHED_SHADERS: *v = glsl[prog].bin != NULL; break;
+  case GL_ACTIVE_UNIFORMS: *v = glsl[prog].bin ? (GLint)glsl[prog].bin->nuni : 0; break;
+  case GL_ACTIVE_ATTRIBUTES: *v = glsl[prog].bin ? (GLint)glsl[prog].bin->nin : 0; break;
+  default: gl_error(GL_INVALID_ENUM);
+  }
+}
+void APIENTRY glGetProgramInfoLog(GLuint prog, GLsizei size, GLsizei *len, GLchar *log) {
+  const char *m = glsl_is(prog, 2) ? glsl[prog].log : "";
+  GLsizei n = (GLsizei)strlen(m);
+  if (size > 0) {
+    n = n < size - 1 ? n : size - 1;
+    memcpy(log, m, (size_t)n);
+    log[n] = 0;
+  }
+  if (len)
+    *len = n;
+}
+void APIENTRY glUseProgram(GLuint prog) {
+  if (!prog) {
+    cur_prog = NULL;
+    return;
+  }
+  if (!glsl_is(prog, 2) || !glsl[prog].linked) {
+    gl_error(GL_INVALID_OPERATION);
+    return;
+  }
+  cur_prog = glsl[prog].p;
+}
+/* a float's index in the uniforms (the member's first), or -1 */
+GLint APIENTRY glGetUniformLocation(GLuint prog, const GLchar *name) {
+  if (!glsl_is(prog, 2) || !glsl[prog].linked)
+    return -1;
+  int k = uni_find(glsl[prog].bin, name);
+  return k < 0 ? -1 : (GLint)glsl[prog].bin->uni[k].at * 4;
+}
+/* the input's index (by its semantic: POSITION, TEXCOORD, COLOR), or -1 */
+GLint APIENTRY glGetAttribLocation(GLuint prog, const GLchar *name) {
+  if (!glsl_is(prog, 2) || !glsl[prog].bin)
+    return -1;
+  const struct mxgl_vu1_binary *b = glsl[prog].bin;
+  for (u32 i = 0; i < b->nin; i++)
+    if (!strcmp(b->in[i], name))
+      return (GLint)i;
+  return -1;
+}
+
+/* n floats of the program in use from location loc (the batch drawn with
+   the old values first) */
+static float *uni_at(GLint loc, int n) {
+  struct vprog *p = cur_prog;
+  if (!p) {
+    gl_error(GL_INVALID_OPERATION);
+    return NULL;
+  }
+  if (loc < 0 || (u32)loc + (u32)n > p->s.uni_qw * 4) {
+    if (loc != -1)
+      gl_error(GL_INVALID_OPERATION);
+    return NULL;
+  }
+  if (o_n && o_prog == p)
+    flush_out();
+  return &p->uni[0][0] + loc;
+}
+void APIENTRY glUniform1f(GLint loc, GLfloat x) {
+  float *u = uni_at(loc, 1);
+  if (u)
+    u[0] = x;
+}
+void APIENTRY glUniform2f(GLint loc, GLfloat x, GLfloat y) {
+  float *u = uni_at(loc, 2);
+  if (u)
+    u[0] = x, u[1] = y;
+}
+void APIENTRY glUniform3f(GLint loc, GLfloat x, GLfloat y, GLfloat z) {
+  float *u = uni_at(loc, 3);
+  if (u)
+    u[0] = x, u[1] = y, u[2] = z;
+}
+void APIENTRY glUniform4f(GLint loc, GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
+  float *u = uni_at(loc, 4);
+  if (u)
+    u[0] = x, u[1] = y, u[2] = z, u[3] = w;
+}
+/* arrays: one element a quadword (a cbuffer's float4 array) */
+static void uni_v(GLint loc, GLsizei count, const GLfloat *v, int k) {
+  float *u = uni_at(loc, count > 0 ? (count - 1) * 4 + k : 0);
+  if (u)
+    for (int i = 0; i < count; i++)
+      memcpy(u + 4 * i, v + k * i, (size_t)k * 4);
+}
+void APIENTRY glUniform1fv(GLint loc, GLsizei count, const GLfloat *v) { uni_v(loc, count, v, 1); }
+void APIENTRY glUniform2fv(GLint loc, GLsizei count, const GLfloat *v) { uni_v(loc, count, v, 2); }
+void APIENTRY glUniform3fv(GLint loc, GLsizei count, const GLfloat *v) { uni_v(loc, count, v, 3); }
+void APIENTRY glUniform4fv(GLint loc, GLsizei count, const GLfloat *v) { uni_v(loc, count, v, 4); }
+/* column-major as GL's matrices (libgl's mvp is too) */
+void APIENTRY glUniformMatrix4fv(GLint loc, GLsizei count, GLboolean transpose, const GLfloat *v) {
+  float *u = uni_at(loc, count * 16);
+  if (!u)
+    return;
+  for (int i = 0; i < count; i++, u += 16, v += 16)
+    for (int c = 0; c < 4; c++)
+      for (int r = 0; r < 4; r++)
+        u[4 * c + r] = transpose ? v[4 * r + c] : v[4 * c + r];
+}
+
 /* ---- mxglGetProcAddress ---------------------------------------------------- */
 
 /* every GL call of libgl by name (the extensions' too), in strcmp order */
@@ -5945,6 +6284,7 @@ static const struct {
     {"glActiveTextureARB", (void (*)(void))glActiveTextureARB},
     {"glAlphaFunc", (void (*)(void))glAlphaFunc},
     {"glArrayElement", (void (*)(void))glArrayElement},
+    {"glAttachShader", (void (*)(void))glAttachShader},
     {"glBegin", (void (*)(void))glBegin},
     {"glBindBuffer", (void (*)(void))glBindBuffer},
     {"glBindBufferARB", (void (*)(void))glBindBufferARB},
@@ -5978,15 +6318,20 @@ static const struct {
     {"glColorTableEXT", (void (*)(void))glColorTableEXT},
     {"glCompressedTexImage2D", (void (*)(void))glCompressedTexImage2D},
     {"glCompressedTexImage2DARB", (void (*)(void))glCompressedTexImage2DARB},
+    {"glCreateProgram", (void (*)(void))glCreateProgram},
+    {"glCreateShader", (void (*)(void))glCreateShader},
     {"glCullFace", (void (*)(void))glCullFace},
     {"glDeleteBuffers", (void (*)(void))glDeleteBuffers},
     {"glDeleteBuffersARB", (void (*)(void))glDeleteBuffersARB},
     {"glDeleteLists", (void (*)(void))glDeleteLists},
+    {"glDeleteProgram", (void (*)(void))glDeleteProgram},
+    {"glDeleteShader", (void (*)(void))glDeleteShader},
     {"glDeleteTextures", (void (*)(void))glDeleteTextures},
     {"glDepthFunc", (void (*)(void))glDepthFunc},
     {"glDepthMask", (void (*)(void))glDepthMask},
     {"glDepthRange", (void (*)(void))glDepthRange},
     {"glDepthRangef", (void (*)(void))glDepthRangef},
+    {"glDetachShader", (void (*)(void))glDetachShader},
     {"glDisable", (void (*)(void))glDisable},
     {"glDisableClientState", (void (*)(void))glDisableClientState},
     {"glDrawArrays", (void (*)(void))glDrawArrays},
@@ -6006,11 +6351,16 @@ static const struct {
     {"glGenBuffersARB", (void (*)(void))glGenBuffersARB},
     {"glGenLists", (void (*)(void))glGenLists},
     {"glGenTextures", (void (*)(void))glGenTextures},
+    {"glGetAttribLocation", (void (*)(void))glGetAttribLocation},
     {"glGetBooleanv", (void (*)(void))glGetBooleanv},
     {"glGetError", (void (*)(void))glGetError},
     {"glGetFloatv", (void (*)(void))glGetFloatv},
     {"glGetIntegerv", (void (*)(void))glGetIntegerv},
+    {"glGetProgramInfoLog", (void (*)(void))glGetProgramInfoLog},
+    {"glGetProgramiv", (void (*)(void))glGetProgramiv},
+    {"glGetShaderiv", (void (*)(void))glGetShaderiv},
     {"glGetString", (void (*)(void))glGetString},
+    {"glGetUniformLocation", (void (*)(void))glGetUniformLocation},
     {"glHint", (void (*)(void))glHint},
     {"glIsBuffer", (void (*)(void))glIsBuffer},
     {"glIsBufferARB", (void (*)(void))glIsBufferARB},
@@ -6018,6 +6368,7 @@ static const struct {
     {"glIsList", (void (*)(void))glIsList},
     {"glIsTexture", (void (*)(void))glIsTexture},
     {"glLineWidth", (void (*)(void))glLineWidth},
+    {"glLinkProgram", (void (*)(void))glLinkProgram},
     {"glLoadIdentity", (void (*)(void))glLoadIdentity},
     {"glLoadMatrixd", (void (*)(void))glLoadMatrixd},
     {"glLoadMatrixf", (void (*)(void))glLoadMatrixf},
@@ -6050,6 +6401,7 @@ static const struct {
     {"glScalef", (void (*)(void))glScalef},
     {"glScissor", (void (*)(void))glScissor},
     {"glShadeModel", (void (*)(void))glShadeModel},
+    {"glShaderBinary", (void (*)(void))glShaderBinary},
     {"glStencilFunc", (void (*)(void))glStencilFunc},
     {"glStencilMask", (void (*)(void))glStencilMask},
     {"glStencilOp", (void (*)(void))glStencilOp},
@@ -6068,7 +6420,17 @@ static const struct {
     {"glTexParameteriv", (void (*)(void))glTexParameteriv},
     {"glTexSubImage2D", (void (*)(void))glTexSubImage2D},
     {"glTranslatef", (void (*)(void))glTranslatef},
+    {"glUniform1f", (void (*)(void))glUniform1f},
+    {"glUniform1fv", (void (*)(void))glUniform1fv},
+    {"glUniform2f", (void (*)(void))glUniform2f},
+    {"glUniform2fv", (void (*)(void))glUniform2fv},
+    {"glUniform3f", (void (*)(void))glUniform3f},
+    {"glUniform3fv", (void (*)(void))glUniform3fv},
+    {"glUniform4f", (void (*)(void))glUniform4f},
+    {"glUniform4fv", (void (*)(void))glUniform4fv},
+    {"glUniformMatrix4fv", (void (*)(void))glUniformMatrix4fv},
     {"glUnlockArraysEXT", (void (*)(void))glUnlockArraysEXT},
+    {"glUseProgram", (void (*)(void))glUseProgram},
     {"glVertex2f", (void (*)(void))glVertex2f},
     {"glVertex2fv", (void (*)(void))glVertex2fv},
     {"glVertex2i", (void (*)(void))glVertex2i},
