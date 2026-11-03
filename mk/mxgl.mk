@@ -14,8 +14,11 @@ MXGL_INC  := $(MXGL_DIR)/include
 HLSL_DIRS += $(MXGL_DIR)/src
 MXGL_OBJS  = $(OUT)/mxgl/mxgl.o
 # MXGL_ARENA_BYTES: the size of each frame arena (512 KB by default; two,
-# four in 1080i); the app's sources may add MXGL_DEFS too
-MXGL_DEFS  := $(if $(MXGL_ARENA_BYTES),-DMXGL_ARENA_BYTES=$(MXGL_ARENA_BYTES))
+# four with beam racing); MXGL_REC_BYTES: beam racing's record of a frame's
+# stream (256 KB by default, four of them; a quarter of each is the
+# uploads'); the app's sources may add MXGL_DEFS too
+MXGL_DEFS  := $(if $(MXGL_ARENA_BYTES),-DMXGL_ARENA_BYTES=$(MXGL_ARENA_BYTES)) \
+              $(if $(MXGL_REC_BYTES),-DMXGL_REC_BYTES=$(MXGL_REC_BYTES))
 # VU0 macro mode for the vector code (v4f), fast float math, float
 # literals (the FPU has no doubles), builtins (not -ffreestanding: sqrtf is
 # sqrt.s, small memcpy inline); picolibc's headers (malloc.h, math.h)

@@ -22,25 +22,32 @@
      brightness texture, whose CLUT puts its texels in alpha.
    - Display lists (mxgl_NewList ...) keep a draw's streams as a DMA chain
      the frame stream calls.
-   - The screen (mxgl_set_mode) is SD, the console's TV mode, or 1080i:
+   - The screen (mxgl_set_mode) is SD, the console's TV mode, or 1080i,
+     with or without beam racing:
      - SD: 640 x 448 (NTSC) or 640 x 512 (PAL), interlaced FIELD mode, two
        16-bit colour buffers (CT16S, dithered) and one 24-bit Z buffer,
        which leaves about 1.8 MiB (PAL 1.5) of GS memory for textures.
-     - 1080i: 1920 x 1080 interlaced by maxsdk's hires passes
-       (<mx/hires.h>): one 1920 x 540 CT16S buffer drawn in three strips
-       just ahead of the beam, every field, from the frame's stream
-       recorded; Z (16 bits) in the next strip; each field's lines half a
-       line apart, so the game's 1080 lines are all drawn. The passes own
-       FRAME, ZBUF, XYOFFSET and SCISSOR: a draw without Z writes uses GS
-       context 2 (ZMSK set), so the state registers are written in both
-       contexts, and the GL scissor is not kept. About 1.8 MiB of GS memory
-       is left for textures.
+     - 1080i: 640 x 540 shown by both fields (FRAME mode), stretched to
+       1920 x 1080, two CT16S buffers and a 16-bit Z: 1.9 MiB left.
+     - Beam racing (maxsdk's passes, <mx/hires.h>): one buffer of a field's
+       lines (SD 640 x 224 / 256, 1080i 1920 x 540; CT16S, or CT32 in SD)
+       drawn in strips just ahead of the beam, every field, from the
+       frame's stream recorded; Z (16 bits, or 32 with CT32) in the next
+       strip; each field's lines half a line apart, so all the screen's
+       lines are drawn. The passes own FRAME, ZBUF, XYOFFSET and SCISSOR: a
+       draw without Z writes uses GS context 2 (ZMSK set), so the state
+       registers are written in both contexts, and the GL scissor is not
+       kept. GS memory left for textures: SD 3.6 MiB (CT32: 3.3), 1080i
+       1.9 MiB.
      The mode can change between frames: the pipeline is started again,
      GS memory filled again.
 
-   Not done: lines and points, stencil, clip planes, polygon offset, colour
-   mask, glReadPixels, the other blends with the destination colour (the
-   draw is skipped). */
+   - Lines and points are GS primitives made on the EE; glReadPixels reads
+     the GS's buffers back (mx_frame_sync first); one user clip plane is a
+     seventh plane of the clipping; polygon offset is a Z bias in the
+     matrix; the colour mask is FRAME's FBMSK; the texture matrix is on VU1.
+   Not done: stencil, destination alpha, the other blends with the
+   destination colour (the draw is skipped). */
 
 #include <stdlib.h>
 #include <string.h>
@@ -51,9 +58,13 @@
 #include <mx/hud.h>
 #include <mx/sif.h>
 #include <mx/tex.h>
+#include <mx/vcache.h>
+#include <mx/mem.h>
 #include <mx/vm.h>
 
+#define GL_GLEXT_PROTOTYPES 1
 #include <GL/gl.h>
+#include <GL/glext.h>
 #include "mxglv.h"
 
 #include "mxgl.h"
@@ -61,14 +72,15 @@
 extern const u8 mxglv_vu[], mxglv_vu_end[];
 
 #include <mx/hires.h>
-/* the picture (mxgl_set_mode): SD, 640 x 448 (NTSC) or 640 x 512 (PAL)
-   with two buffers, or hires, 1920 x 540 a field (1080i) */
-static int hires;
-static int fb_w = 640, fb_h = 448;
-#define ZMAX_SD 1048575.0f  /* GS Z (24 bits) / 16: ftoi4 */
-#define ZMAX_HIRES 4095.0f  /* 16 bits */
-static float zmax = ZMAX_SD;
-#define NARENA MX_HIRES_SLOTS /* hires: an arena per record; SD uses two */
+/* the picture (mxgl_set_mode): the buffer drawn into, fb_w x fb_h (beam
+   racing: a field's), and the screen it shows, scr_w x scr_h; beam: by
+   maxsdk's passes; rgb24: 24-bit colour (CT24 strips with Z24) */
+static int beam, rgb24;
+static int fb_w = 640, fb_h = 448, scr_w = 640, scr_h = 448;
+#define ZMAX_Z24 1048575.0f /* GS Z (24 bits) / 16: ftoi4 (Z32: the same range) */
+#define ZMAX_Z16 4095.0f    /* 16 bits */
+static float zmax = ZMAX_Z24;
+#define NARENA MX_HIRES_SLOTS /* beam racing: an arena per record; else two */
 #define HUD_SCALE 1
 /* the window the game sees (mxgl_window), mapped onto the whole buffer */
 static int gl_w = 640, gl_h = 448;
@@ -76,6 +88,20 @@ static int gl_w = 640, gl_h = 448;
 #define GB_HI (2048.0f + 1900.0f)
 
 /* ---- frame stream, arenas ---------------------------------------------------- */
+
+static int tex_bias, tex_bias_auto; /* mxgl_texture_quality */
+/* MXGL_TEX_AUTO's state (tex_auto, below) */
+#define NEED_HOLD 60
+static int tq_hi = 120, tq_lo = 80, tq_swap = 30;
+static int v_low, ram_cold;
+static u32 v_epoch = 1;
+#define WS_MAX 1024
+static struct tex *ws[2][WS_MAX];
+static u32 ws_n[2], ws_cur;
+static u32 ws_w0;              /* W of the frame being made, at full quality */
+static u32 ws_sum, ws_frames;  /* this second's */
+static u32 ws_last_w0, ws_last_e; /* the last second's average W, and its estimate placed */
+static u32 ws_far[3];             /* the last frame's mipped textures by need (0, 1, 2+) */
 
 #define RING_BYTES (64 * 1024) /* the stream's slots (chain mode) */
 static u8 ring[RING_BYTES] MX_ALIGNED(64);
@@ -86,11 +112,28 @@ static u8 ring[RING_BYTES] MX_ALIGNED(64);
 #else
 #define ARENA_BYTES (512 * 1024)
 #endif
-#define REC_BYTES (MX_HIRES_SLOTS * 256 * 1024) /* hires: the records (Quake: up to ~60 KB) */
-/* arenas 0 and 1 are always there; hires takes the records and arenas 2,
+/* beam racing: the records of the frame stream, each its main part (three
+   quarters) and its uploads' (Quake 1, 2: up to ~60 KB a frame; Quake 3
+   ~200 KB: MXGL_REC_BYTES 512 KB) */
+#ifdef MXGL_REC_BYTES
+#define REC_BYTES (MX_HIRES_SLOTS * (MXGL_REC_BYTES))
+#else
+#define REC_BYTES (MX_HIRES_SLOTS * 256 * 1024)
+#endif
+/* arenas 0 and 1 are always there; beam racing takes the records and arenas 2,
    3 in one block (hires_mem) while it is on */
 static u8 *arena[NARENA];
 static u8 *hires_mem;
+/* libgl's memory (<mx/mem.h>): pinned (the DMAC or VU0 reads it, VU0 with
+   interrupts off): gl_heap its objects (textures, lists, buffers, tables),
+   gl_stream the arenas and beam racing's records */
+static struct mx_heap *gl_heap, *gl_stream;
+/* with VM: the textures' upper levels, pageable (<mx/vcache.h>,
+   struct mx_tex_mem); the tails stay in gl_heap */
+static struct mx_heap *gl_assets;
+#define GL_ASSET_BYTES (32u << 20) /* of the heap window (mx_vm_config.heap_size) */
+static void *gl_alloc(u32 bytes, u32 align) { return mx_heap_alloc(gl_heap, bytes, align); }
+static void gl_free(void *p) { mx_heap_free(mx_is_vm(p) ? gl_assets : gl_heap, p); }
 static u32 arena_pos;
 static int in_frame, buf, frame_par;
 static struct mx_shader shader;
@@ -123,41 +166,131 @@ int mxgl_show_stats = 1;
    made here from level 0 (box filter) for every texture, whether the engine
    asked for levels or not (its level n calls are ignored). */
 struct tex {
-  int used;
-  u32 w, h, lw, lh;      /* level 0: size, log2 */
-  u32 psm;
-  u32 max_levels;        /* the levels it can have */
-  u32 levels;            /* the levels that came (1 .. max_levels) */
-  u32 off[MX_TEX_LEVELS]; /* each level in data */
+  u32 w, h;              /* level 0's size */
+  u8 lw, lh;             /* its log2 */
+  u8 used;
+  u8 psm;
+  u8 max_levels;         /* the levels it can have */
+  u8 levels;             /* the levels that came (1 .. max_levels) */
+  u8 alpha;
+  u8 alpha_fmt;          /* its format has alpha (REPLACE takes the texture's) */
+  u8 bright;             /* T8 brightness texture (CLUT_2X/1X/INV) */
+  u8 planar;             /* mxgl_color_light's GL_RGB8 texture without MIPMAP (a
+                            lightmap): its texels the red channel's brightness,
+                            twin[2], twin[3] the green and blue ones; no levels */
+  u8 pal;                /* T8 indices of the shared palette */
+  u8 clamp_s, clamp_t;
+  u8 lin_mag, lin_min;   /* filters: 1 linear */
+  u8 mip;                /* MIN_FILTER: 0 no levels, 1 nearest level, 2 both levels */
+  u8 dirty;              /* changed (glTexSubImage2D) while in GS memory: upload it again */
+  u16 twin[4];           /* its brightness copy (0) and channel copies (1 R, 2 G, 3 B):
+                            twins[twin - 1], or 0 */
+  u16 dy0, dy1;          /* the lines of level 0 changed since: dy0 .. dy1 - 1 */
+  struct mx_tex_mem m;   /* its levels in GS format (m.level[], 64-byte aligned): the
+                            upper ones pageable (m.head), the others pinned */
   u32 bytes;             /* all levels */
-  void *data;            /* GS format, 64-byte aligned */
-  struct mx_tex mt;      /* the levels in GS memory, valid if gen == vram_gen */
-  u32 gen;
-  int alpha;
-  int bright;            /* T8 brightness texture (CLUT_2X/1X/INV) */
-  int pal;               /* T8 indices of the game's palette (mxgl_Palette) */
-  int clamp_s, clamp_t;
-  int lin_mag, lin_min;  /* filters: 1 linear */
-  int mip;               /* MIN_FILTER: 0 no levels, 1 nearest level, 2 both levels */
-  int dirty;             /* changed (glTexSubImage2D) while in GS memory: upload it again */
-  u32 vram_blocks;       /* the room it has there */
-  int twin;              /* its brightness copy: twins[twin - 1], or 0 */
+  void *data;            /* its texels are there (m.tail_mem), or NULL */
+  struct mx_tex mt;      /* the levels in GS memory (mx_vcache: valid until a lookup misses) */
+  u32 gen;               /* its texels' number: with the struct's address the cache's key */
+  u8 need_lvl;           /* the finest level its draws sampled lately (LOD), held
+                            NEED_HOLD frames before it may get coarser */
+  u8 vfrom;              /* the level the VRAM control places it from (vfrom_epoch) */
+  u32 need_until, ws_frame, vfrom_epoch;
+  u32 vc_frame, vc_gen;  /* the frame and vram_gen of its last lookup (once a frame
+                            is enough while nothing was evicted since) */
+  u32 *oclut;            /* T8 with its own palette (glCompressedTexImage2D): 256
+                            CT32 in CSM1's order (m.clut, pinned); after the levels
+                            in GS memory */
+  u8 (*ipal)[4];         /* glColorTableEXT(GL_TEXTURE_2D): the palette of its
+                            GL_COLOR_INDEX texels (RGBA, malloc'ed) */
 };
 static struct tex texs[MAX_TEX];
 /* brightness copies of colour textures, made when a draw multiplies with
    the destination (tex_twin) */
-#define MAX_TWIN 64
+#define MAX_TWIN 512 /* a lightmap page has 3 with mxgl_color_light */
 static struct tex twins[MAX_TWIN];
 static void tex_drop_twin(struct tex *t);
-static u32 vram_lo, vram_pos, vram_gen = 1;
-#define VRAM_END 16384u /* 64-word blocks in 4 MiB */
+static void defer_free(void *p);
+static u32 dl_pool_pos;
+static int dl_nused, dl_nfailed; /* lists made; of the glNewLists since, those that did not fit */
+static const void *buf_ptr(GLuint b, uintptr_t off);
+/* GS memory: the screen, the HUD's font and the CLUTs below vram_lo (64-word
+   blocks), the textures in the pages after, as maxsdk's cache
+   (<mx/vcache.h>) places them. vram_gen is made again when a lookup
+   misses (places of other textures may have gone): the states kept
+   (prepare_state, the lists' calls) are made again then. */
+static u32 vram_lo, vram_gen = 1, tex_gens;
+static u32 h_blocks; /* blocks of top bytes the cache has (mx_vcache_hpages) */
+/* GS memory's room for textures, bytes of texels: a top byte's block
+   holds 64 */
+static u32 tex_room(void) { return (MX_VRAM_BLOCKS - vram_lo) * 256 + h_blocks * 64; }
+static u64 tex_key(const struct tex *t) { return (u64)t->gen << 32 | (u32)(uintptr_t)t; }
+/* a level's texels */
+#define TLV(t, lv) ((u8 *)(t)->m.level[lv])
+/* t's entries in the cache go: whole and from its tail (if the GS may
+   still read one, it goes as the cache needs room) */
+static void tex_drop(struct tex *t) {
+  for (u32 f = 0; f < 3; f++)
+    mx_vcache_drop(mx_vcache_tex_key(tex_key(t), f));
+}
+/* its texels freed once no frame reads them */
+static void defer_free(void *p);
+static void tex_free_mem(struct tex *t) {
+  defer_free(t->m.head);
+  defer_free(t->m.tail_mem);
+  t->m = (struct mx_tex_mem){0};
+  t->data = NULL, t->oclut = NULL;
+}
+/* memory for its levels (max_levels, of psm, lw x lh), and a CLUT: the
+   upper levels pageable when it has 3 or more (not brightness textures:
+   lightmaps change every frame) */
+static int tex_alloc_mem(struct tex *t, u32 clut_bytes) {
+  int split = gl_assets && !t->bright && t->max_levels >= 3;
+  t->bytes = 0;
+  for (u32 lv = 0; lv < t->max_levels; lv++)
+    t->bytes += mx_tex_level_bytes(t->psm, t->lw, t->lh, lv);
+  if (mx_tex_mem_alloc(&t->m, t->psm, t->lw, t->lh, t->max_levels, clut_bytes, gl_heap,
+                       split ? gl_assets : 0) < 0) {
+    t->data = NULL;
+    return -1;
+  }
+  t->data = t->m.tail_mem;
+  t->oclut = clut_bytes ? t->m.clut : NULL;
+  return 0;
+}
+/* its texels written: out of the D-cache for the DMAC */
+static void tex_writeback(struct tex *t) {
+  if (t->m.head)
+    mx_dcache_writeback(t->m.head, t->m.head_bytes);
+  mx_dcache_writeback(t->m.tail_mem, t->m.tail_bytes + (t->oclut ? 1024u : 0));
+}
+/* t gets new texels: the cache's entry of the old ones goes */
+static void tex_new_gen(struct tex *t) {
+  if (t->gen)
+    tex_drop(t);
+  t->gen = ++tex_gens;
+  t->vc_gen = 0; /* looked up again */
+}
 
 /* ---- GL state ------------------------------------------------------------- */
 
+#define MV_DEPTH 32 /* GL's minimum */
+#define PR_DEPTH 4
+#define TM_DEPTH 4
 static struct {
-  float mv[8][16], pr[4][16];
-  int mv_top, pr_top;
+  float mv[MV_DEPTH][16], pr[PR_DEPTH][16], tm[TM_DEPTH][16];
+  int mv_top, pr_top, tm_top;
   GLenum mode;
+  /* glPolygonOffset (GL_POLYGON_OFFSET_FILL) */
+  int poffset;
+  float pofactor, pounits;
+  /* glColorMask as FRAME's FBMSK (bits of the colour before it is made 16 bits) */
+  u32 cmask;
+  /* GL_CLIP_PLANE0: the plane in eye space (glClipPlane) */
+  int ucp_on;
+  float ucp_eye[4];
+  int pack_align;
+  GLenum err; /* glGetError */
   int vp[4], sc[4];
   float dn, df;
   int tex2d, blend, atest, dtest, cull, scissor;
@@ -177,15 +310,40 @@ static struct {
   int cstride;
   int va, ta, ca;
   GLuint bound;
-  int cunit;
+  int cunit, ccunit; /* the active texture unit (glActiveTexture), the client's */
+  /* texture unit 1 (GL_ARB_multitexture): drawn as a second pass that
+     multiplies the first (draw_tris) */
+  struct {
+    int tex2d, cshift;
+    GLuint bound;
+    GLenum texenv;
+    const float *tptr;
+    int tstride, ta;
+  } u1;
+  int shared_pal; /* GL_SHARED_TEXTURE_PALETTE_EXT */
+  /* buffer objects (GL 1.5): the bound ones, and each array's (0: client
+     memory) with its offset; the pointers above are made from them */
+  GLuint abuf, ebuf;
+  GLuint vbuf, tbuf, cbuf, u1buf;
+  uintptr_t voff, toff, coff, u1off;
 } gl;
+/* the texture of texture calls (glTexImage2D, glTexParameter): the active unit's */
+#define TBOUND (gl.cunit ? gl.u1.bound : gl.bound)
 
 /* bumped by each register write (write_regs), and when the copy below is
    dropped: the list calls' state is right while it stays */
 static u32 gs_serial;
+/* something was drawn through VU1 since the last FLUSH: a register write
+   or an upload must wait for it (FLUSH); else it need not */
+static int gs_drew = 1;
+#ifdef MXGL_NO_FLUSHSKIP
+#define GS_DREW 1
+#else
+#define GS_DREW gs_drew
+#endif
 /* GS registers last written in this frame */
 static struct {
-  u64 tex0, tex1, clamp, alpha, test, zbuf, scissor, mip1, mip2;
+  u64 tex0, tex1, clamp, alpha, test, zbuf, scissor, mip1, mip2, frame;
   int valid;
 } gs;
 
@@ -228,16 +386,58 @@ static struct {
   int n;
 } pq[PQ_MAX];
 static int pq_n, pq_stride, pq_st;
+/* glDrawArrays(GL_POLYGON)'s vertices, copied for the queue (GL reads
+   the arrays at the call): x, y, z, s, t */
+#define PQ_BUF_FLOATS (5 * 1280) /* 5 vertices a polygon of PQ_MAX */
+static float pq_buf[PQ_BUF_FLOATS];
+static int pq_buf_n;
 static void draw_polys(void);
 static inline void pq_flush(void) {
   if (pq_n)
     draw_polys();
 }
 
+static inline float fast_log2(float x);
+
+/* the first error since glGetError */
+static void gl_error(GLenum e) {
+  if (gl.err == GL_NO_ERROR)
+    gl.err = e;
+}
+
 static float *cur_mat(void) {
   pq_flush();
   mat_serial++;
-  return gl.mode == GL_PROJECTION ? gl.pr[gl.pr_top] : gl.mv[gl.mv_top];
+  return gl.mode == GL_PROJECTION ? gl.pr[gl.pr_top]
+         : gl.mode == GL_TEXTURE  ? gl.tm[gl.tm_top]
+                                  : gl.mv[gl.mv_top];
+}
+
+/* the texture matrix is the identity, or moves S and T by whole repeats
+   at most (st_poly's offsets may then be taken off before it) */
+static int tm_ident(void) {
+  /* made again when a matrix may have changed (mat_serial) */
+  static u32 ser;
+  static int id;
+  if (ser != mat_serial) {
+    const float *t = gl.tm[gl.tm_top];
+    id = t[0] == 1 && t[1] == 0 && t[4] == 0 && t[5] == 1 && t[12] == 0 && t[13] == 0;
+    ser = mat_serial;
+  }
+  return id;
+}
+/* log2 of how much the texture matrix scales an area of S, T (lod_k) */
+static float tm_log2_area(void) {
+  const float *t = gl.tm[gl.tm_top];
+  float d = t[0] * t[5] - t[1] * t[4];
+  d = d < 0 ? -d : d;
+  return d > 1e-12f ? fast_log2(d) : 0.0f;
+}
+/* the texture matrix as the program's tms, tmt */
+static void tm_uniforms(float *tms, float *tmt) {
+  const float *t = gl.tm[gl.tm_top];
+  tms[0] = t[0], tms[1] = t[1], tms[2] = t[12], tms[3] = 0;
+  tmt[0] = t[4], tmt[1] = t[5], tmt[2] = t[13], tmt[3] = 0;
 }
 
 /* ---- the stream ---------------------------------------------------------- */
@@ -251,18 +451,12 @@ static void frame_start(void) {
   if (in_frame)
     return;
   u64 *e;
-  if (hires) {
+  if (beam) {
     /* the passes set the target and clear the strips; the arena is the
        record's (kept while the record is played) */
     mx_frame_begin_n();
     frame_par = (int)mx_hires_slot();
     mx_hires_clear((u32)(gl.clear[0] * 255), (u32)(gl.clear[1] * 255), (u32)(gl.clear[2] * 255));
-    /* the frame before overwrote textures (GS memory refilled): this one
-       uploads all it uses, as its passes are played again after the refill */
-    if (st_last.wraps) {
-      vram_gen++;
-      vram_pos = vram_lo;
-    }
     /* TEXFLUSH: textures uploaded by PATH3 since (the once records) */
     e = mx_frame_direct(6);
     e = mx_e_ad_tag(e, 5, 1);
@@ -279,12 +473,14 @@ static void frame_start(void) {
   e = mx_e_ad(e, MX_GS_REG_PRMODECONT, 1);
   e = mx_e_ad(e, MX_GS_REG_COLCLAMP, 1);
   e = mx_e_ad(e, MX_GS_REG_DIMX, 0x6071243571603524ull);
-  e = mx_e_ad(e, MX_GS_REG_DTHE, 1);
-  if (!hires)
+  e = mx_e_ad(e, MX_GS_REG_DTHE, !rgb24); /* not defined into 32 bits */
+  if (!beam)
     e = mx_rt_e_clear(e, &rt[buf], 0, (u32)(gl.clear[0] * 255), (u32)(gl.clear[1] * 255),
                       (u32)(gl.clear[2] * 255), 1);
   mx_frame_commit(e);
   in_frame = 1;
+  gs_drew = 1;
+  mx_vcache_frame(mx_frame_number(), mx_frame_done());
   arena_pos = 0;
   s_at[0] = s_at[1] = s_at[2] = 0;
   batch_place();
@@ -362,12 +558,13 @@ static u32 hud_line(u32 x, u32 y, const struct hud_line *l, int draw) {
 
 static void draw_stats(void) {
   flush_out();
-  /* the second: frames shown (hires: made), and the sums of the counters */
+  gs_drew = 1; /* the HUD's draws */
+  /* the second: frames shown (beam racing: made), and the sums of the counters */
   static u32 v_last, f_last, n_frames, tris, verts, draws, up_kb, wraps;
   static u32 swap_in, swap_out, ee_last, ee_max, n_long;
   static struct hud_line line[3];
   static struct hud_bar ram, vram;
-  u32 shown = hires ? mx_gs.frames : mx_gs.shown;
+  u32 shown = beam ? mx_gs.frames : mx_gs.shown;
   u32 now = mx_count(), ee_us = (now - ee_last) / (MX_EE_HZ / 1000000);
   ee_last = now;
   if (ee_us > ee_max)
@@ -390,18 +587,24 @@ static void draw_stats(void) {
     t = mx_hud_cat(mx_hud_u(t, verts / n_frames), " VERTS  ");
     mx_hud_cat(mx_hud_u(t, draws / n_frames), " DRAWS");
     l->rgb[1] = HUD_TEXT;
-    /* RAM: the program (with the kernel and stacks), the core heap, VM
-       pages; without VM, malloc's part of the heap */
-    struct mx_core_stats cs;
-    mx_core_stats(&cs);
-    ram = (struct hud_bar){32u << 20, {0, cs.used, cs.total - cs.used, 0, 0},
+    /* RAM: the program (with the kernel, the VM's tables and the stack),
+       pinned memory, free frames, VM pages in use, pinned VM pages;
+       without VM, libgl's heaps and malloc's part of the heap */
+    u32 gu, gh, su, sh;
+    mx_heap_stats(gl_heap, &gu, &gh);
+    mx_heap_stats(gl_stream, &su, &sh);
+    ram = (struct hud_bar){32u << 20, {0, gh + sh, 0, 0, 0},
                            {BAR_PROG, BAR_CORE, BAR_CORE_FREE, BAR_VM, BAR_PIN}};
+    u32 pinned = gh + sh;
     l = &line[1];
     if (mx_vm_active()) {
       struct mx_vm_stats vs;
       mx_vm_stats(&vs);
-      ram.amt[0] = ram.total - cs.total - vs.frames * MX_VM_PAGE;
-      ram.amt[3] = (vs.frames - vs.free_frames - vs.pinned) * MX_VM_PAGE;
+      pinned = vs.pinned_frames * MX_VM_PAGE;
+      ram.amt[0] = ram.total - vs.frames * MX_VM_PAGE;
+      ram.amt[1] = pinned;
+      ram.amt[2] = vs.free_frames * MX_VM_PAGE;
+      ram.amt[3] = (vs.frames - vs.free_frames - vs.pinned_frames - vs.pinned) * MX_VM_PAGE;
       ram.amt[4] = vs.pinned * MX_VM_PAGE;
       u32 out = vs.swap_outs + vs.writer_outs;
       u32 si = (vs.swap_ins - swap_in) * (MX_VM_PAGE / 1024) * mx_gs.hz / dv;
@@ -416,18 +619,22 @@ static void draw_stats(void) {
     } else {
       u8 *lo = (u8 *)mx_heap_start();
       ram.amt[0] = ram.total - (u32)((u8 *)mx_heap_end() - lo);
-      ram.amt[2] = 0; /* free: the bar's end */
       ram.amt[3] = (u32)((u8 *)mx_sbrk(0) - lo);
       mx_hud_cat(hud_mb(mx_hud_cat(l->s[0], "MALLOC "), ram.amt[3]), " MB");
       l->rgb[0] = HUD_TEXT;
     }
-    t = mx_hud_cat(hud_mb(mx_hud_cat(l->s[2], "CORE "), cs.used), "/");
-    mx_hud_cat(hud_mb(t, cs.total), " MB");
-    l->rgb[2] = cs.used * 100 >= cs.total * 95 ? HUD_BAD : HUD_TEXT;
-    /* GS memory (KiB): the screen, Z, font and CLUTs; textures since the
-       last refill, the end of them uploaded a frame */
-    u32 room = (VRAM_END - vram_lo) / 4, tex = (vram_pos - vram_lo) / 4, up = up_kb / n_frames;
-    vram = (struct hud_bar){VRAM_END / 4, {vram_lo / 4, tex > up ? tex - up : 0, 0, 0, 0},
+    /* libgl's part of the pinned memory, of all of it */
+    t = mx_hud_cat(hud_mb(mx_hud_cat(l->s[2], "PIN GL "), gu + su), "/");
+    mx_hud_cat(hud_mb(t, pinned), " MB");
+    l->rgb[2] = HUD_TEXT;
+    /* GS memory (KiB): the screen, Z, font and CLUTs; the textures in the
+       cache, the end of them uploaded a frame */
+    struct mx_vcache_stats vs;
+    mx_vcache_stats(&vs);
+    /* the top bytes' blocks hold a byte a word: a quarter */
+    u32 room = tex_room() / 1024, tex = vs.used_blocks / 4 + vs.hbyte_used / 16,
+        up = up_kb / n_frames;
+    vram = (struct hud_bar){MX_VRAM_BLOCKS / 4, {vram_lo / 4, tex > up ? tex - up : 0, 0, 0, 0},
                             {BAR_PROG, wraps ? BAR_REFILL : BAR_VM, BAR_UP, 0, 0}};
     vram.amt[2] = tex - vram.amt[1];
     l = &line[2];
@@ -435,17 +642,44 @@ static void draw_stats(void) {
     l->rgb[0] = tex * 100 >= room * 95 ? HUD_BAD : tex * 100 >= room * 80 ? HUD_WARN : HUD_OK;
     mx_hud_cat(mx_hud_u(mx_hud_cat(l->s[1], "UP "), up), " KB/F");
     l->rgb[1] = HUD_TEXT;
-    mx_hud_cat(mx_hud_u1(mx_hud_cat(l->s[2], "REFILL "), wraps * 10 / n_frames, 10), "/F");
+    mx_hud_cat(mx_hud_u1(mx_hud_cat(l->s[2], "EVICT "), wraps * 10 / n_frames, 10), "/F");
     l->rgb[2] = wraps ? HUD_BAD : HUD_OK;
     /* the log: the lines, and more */
     u32 c = MX_EE_HZ / 10000;
     for (int i = 0; i < 3; i++)
       mx_printf("stats: %s  %s  %s\n", line[i].s[0], line[i].s[1], line[i].s[2]);
-    mx_printf("stats: longest frame %u us, %u frames over a field, arena %u/%u KB\n", ee_max,
-              n_long, arena_pos / 1024, ARENA_BYTES / 1024);
-    mx_printf("stats: ram: program %u KB, core %u/%u KB, %s %u KB, pinned %u KB\n",
-              ram.amt[0] / 1024, cs.used / 1024, cs.total / 1024,
-              mx_vm_active() ? "VM pages" : "malloc", ram.amt[3] / 1024, ram.amt[4] / 1024);
+    struct mx_vcache_stats cv;
+    mx_vcache_stats(&cv);
+    mx_printf("stats: longest frame %u us, %u frames over a field, arena %u/%u KB; textures: %d "
+              "levels left out%s, %u drawn from their tails (upper levels paged out), %u whole again\n",
+              ee_max, n_long, arena_pos / 1024, ARENA_BYTES / 1024, tex_bias,
+              tex_bias_auto ? " (auto)" : "", cv.proxies, cv.upgrades);
+    if (tex_bias_auto) {
+      u32 room = tex_room();
+      mx_printf("stats: texture quality: W %u KB = %u%% of GS memory%s (placed about %u%%), RAM %s; "
+                "mipped textures sampled from level 0/1/2+: %u/%u/%u\n",
+                ws_last_w0 / 1024, room ? (u32)((u64)ws_last_w0 * 100 / room) : 0,
+                v_low ? ", lowered" : "", v_low && room ? (u32)((u64)ws_last_e * 100 / room) : 0,
+                ram_cold ? "cold (heads not used)" : "normal", ws_far[0], ws_far[1], ws_far[2]);
+    }
+    {
+      /* where the cache's GS memory goes (KB), and the room made since the
+         last line: the blocks in use in the runs taken, the blocks evicted */
+      static u32 run0, ev0;
+      u32 run = cv.evict_run_blocks - run0, ev = cv.evicted_blocks - ev0;
+      run0 = cv.evict_run_blocks, ev0 = cv.evicted_blocks;
+      mx_printf("stats: gs memory: room %u KB, held %u (pages %u); texels %u, between blocks %u, "
+                "whole pages %u, free in shared pages %u; top bytes %u of %u KB (texels %u); "
+                "evicted %u KB for runs with %u KB in use\n",
+                (MX_VRAM_BLOCKS - vram_lo) / 4, cv.pages * 8, cv.pages, cv.need_blocks / 4,
+                cv.span_waste / 4, cv.round_waste / 4, cv.small_free / 4, cv.hbyte_used / 16,
+                cv.hbyte_blocks / 16, cv.hbyte_need / 16, ev / 4, run / 4);
+    }
+    mx_printf("stats: ram: program %u KB, pinned %u KB (libgl %u in %u, stream %u in %u), free %u KB, "
+              "%s %u KB, pinned pages %u KB\n",
+              ram.amt[0] / 1024, ram.amt[1] / 1024, gu / 1024, gh / 1024, su / 1024, sh / 1024,
+              ram.amt[2] / 1024, mx_vm_active() ? "VM pages" : "malloc", ram.amt[3] / 1024,
+              ram.amt[4] / 1024);
     static u32 ring0, buf0;
     mx_printf("stats: xf %u.%u tri %u.%u (incl flush %u.%u) ms, wait ring %u ms buf %u ms "
               "(since last)\n",
@@ -455,19 +689,24 @@ static void draw_stats(void) {
               (mx_frame_stats.wait_ring - ring0) / (MX_EE_HZ / 1000),
               (mx_frame_stats.wait_buffer - buf0) / (MX_EE_HZ / 1000));
     ring0 = mx_frame_stats.wait_ring, buf0 = mx_frame_stats.wait_buffer;
-    mx_printf("stats: lists %u: bounds %u us, state %u us, call %u us\n", st_last.lists,
+    mx_printf("stats: lists %u (made %u, %u did not fit; pool %u KB): bounds %u us, state %u us, "
+              "call %u us\n", st_last.lists, dl_nused, dl_nfailed, dl_pool_pos / 1024,
               st_last.c_bounds / 295, st_last.c_state / 295, st_last.c_call / 295);
     mx_printf("stats: calls %u, batches %u; matrix %u us, lod %u us, set_state %u us; "
               "clipped %u in %u us, refused %u\n",
               st_last.calls, st_last.draws, st_last.c_mvp / 295, st_last.c_lod / 295,
               st_last.c_set / 295, st_last.clipped, st_last.c_clip / 295, st_last.refused);
-    if (hires) {
-    mx_printf("stats: hires: fields %u, passes %u, late %u, records shown %u, held %u, largest %u KB of %u; "
-              "longest pass per strip %u %u %u us\n",
-              mx_hires_stats.fields, mx_hires_stats.passes, mx_hires_stats.late,
-              mx_hires_stats.shown, mx_hires_stats.held, mx_hires_stats.rec_max / 1024, REC_BYTES / MX_HIRES_SLOTS / 1024,
-              mx_hires_stats.pass_us[0], mx_hires_stats.pass_us[1], mx_hires_stats.pass_us[2]);
-    mx_hires_stats.pass_us[0] = mx_hires_stats.pass_us[1] = mx_hires_stats.pass_us[2] = 0;
+    if (beam) {
+      /* the longest pass of each strip */
+      u32 n = mx_hires_passes(), us = 0;
+      for (u32 k = 0; k < n; k++) {
+        us = mx_hires_stats.pass_us[k] > us ? mx_hires_stats.pass_us[k] : us;
+        mx_hires_stats.pass_us[k] = 0;
+      }
+      mx_printf("stats: beam: fields %u, passes %u (%u a field), late %u, records shown %u, held %u, "
+                "largest %u KB of %u; longest pass %u us\n",
+                mx_hires_stats.fields, mx_hires_stats.passes, n, mx_hires_stats.late, mx_hires_stats.shown,
+                mx_hires_stats.held, mx_hires_stats.rec_max / 1024, REC_BYTES / MX_HIRES_SLOTS / 4 * 3 / 1024, us);
     }
     v_last = mx_gs.vsync, f_last = shown;
     n_frames = tris = verts = draws = up_kb = wraps = 0;
@@ -479,7 +718,7 @@ static void draw_stats(void) {
   u64 *c = mx_frame_reserve(5);
   c = mx_e_cnt(c, 3, mx_vif_flush(), mx_vif_direct(3));
   c = mx_e_ad_tag(c, 2, 1);
-  if (hires)
+  if (beam)
     c = mx_e_ad(c, MX_GS_REG_ALPHA_1, mx_gs_alpha(0, 1, 0, 1, 0)); /* the box: over */
   else
     c = mx_e_ad(c, MX_GS_REG_SCISSOR_1, mx_gs_scissor(0, fb_w - 1, 0, fb_h - 1));
@@ -502,6 +741,7 @@ static void draw_stats(void) {
   hud_line(x1, 22, &line[2], 1);
 }
 
+static void tex_auto(u32 up_kb);
 void mxgl_end_frame(void) {
   pq_flush();
   if (!in_frame)
@@ -509,6 +749,15 @@ void mxgl_end_frame(void) {
   flush_out();
   if (mxgl_show_stats)
     draw_stats();
+  /* the textures the cache evicted this frame */
+  {
+    static u32 evicted;
+    struct mx_vcache_stats vs;
+    mx_vcache_stats(&vs);
+    st_cur.wraps = vs.evicted - evicted;
+    evicted = vs.evicted;
+  }
+  tex_auto(st_cur.upload_kb);
   st_last = st_cur;
   memset(&st_cur, 0, sizeof st_cur);
   mx_frame_end();
@@ -522,10 +771,10 @@ static void write_regs(const u32 *reg, const u64 *val, int n) {
     return;
   /* the triangles gathered so far are drawn with the registers before */
   flush_out();
-  /* hires: the same in context 2 (the draws without Z writes) */
+  /* beam: the same in context 2 (the draws without Z writes) */
   u32 reg2[24];
   u64 val2[24];
-  if (hires) {
+  if (beam) {
     for (int i = 0; i < n; i++) {
       reg2[2 * i] = reg[i], val2[2 * i] = val[i];
       reg2[2 * i + 1] = reg[i] + 1, val2[2 * i + 1] = val[i];
@@ -533,7 +782,8 @@ static void write_regs(const u32 *reg, const u64 *val, int n) {
     reg = reg2, val = val2, n *= 2;
   }
   u64 *c = mx_frame_reserve((u32)n + 2);
-  c = mx_e_cnt(c, (u32)n + 1, mx_vif_flush(), mx_vif_direct((u32)n + 1));
+  c = mx_e_cnt(c, (u32)n + 1, GS_DREW ? mx_vif_flush() : mx_vif_nop(), mx_vif_direct((u32)n + 1));
+  gs_drew = 0;
   c = mx_e_ad_tag(c, (u32)n, 1);
   for (int i = 0; i < n; i++)
     c = mx_e_ad(c, reg[i], val[i]);
@@ -560,17 +810,26 @@ static u32 tex_levels(const struct tex *t) { return t->levels; }
    a DIRECT of BITBLTBUF, TRXPOS, TRXREG, TRXDIR; then per piece a DIRECT
    of its IMAGE tag and a ref tag whose own DIRECT sends the texels (a
    DIRECT must not go on past a tag: the next tag's upper half is VIFcodes) */
+static void image_xfer_at(u32 dbp, u32 dbw, u32 psm, u32 y, u32 w, u32 h, u32 bpp,
+                          const void *data, int flush);
 static void image_xfer(u32 dbp, u32 dbw, u32 psm, u32 w, u32 h, u32 bpp, const void *data,
                        int flush) {
+  image_xfer_at(dbp, dbw, psm, 0, w, h, bpp, data, flush);
+}
+/* the same into lines y .. y + h - 1 */
+static void image_xfer_at(u32 dbp, u32 dbw, u32 psm, u32 y, u32 w, u32 h, u32 bpp,
+                          const void *data, int flush) {
   flush_out();
   u32 qwc = w * h * bpp / 16;
   st_cur.upload_kb += qwc / 64;
   u64 *c = mx_frame_reserve(6 + 3 * (qwc / 0x7FFF + 1));
   const u8 *d = data;
-  c = mx_e_cnt(c, 5, flush ? mx_vif_flush() : mx_vif_nop(), mx_vif_direct(5));
+  c = mx_e_cnt(c, 5, flush && GS_DREW ? mx_vif_flush() : mx_vif_nop(), mx_vif_direct(5));
+  if (flush)
+    gs_drew = 0;
   c = mx_e_ad_tag(c, 4, 0);
   c = mx_e_ad(c, MX_GS_REG_BITBLTBUF, mx_gs_bitbltbuf(0, 0, 0, dbp, dbw, psm));
-  c = mx_e_ad(c, MX_GS_REG_TRXPOS, mx_gs_trxpos(0, 0, 0, 0, 0));
+  c = mx_e_ad(c, MX_GS_REG_TRXPOS, mx_gs_trxpos(0, 0, 0, y, 0));
   c = mx_e_ad(c, MX_GS_REG_TRXREG, mx_gs_trxreg(w, h));
   c = mx_e_ad(c, MX_GS_REG_TRXDIR, 0);
   while (qwc) {
@@ -606,6 +865,8 @@ static u32 clut[NCLUT][256] MX_ALIGNED(64);
 static u32 clut_pal[256] MX_ALIGNED(64);
 static int pal_on;
 static u8 pal_rgb[256][3];
+/* the shared palette with alpha (GL_COLOR_INDEX textures) */
+static u8 pal_rgba[256][4];
 /* exact RGB -> index (open addressing, key RGB + 1), and the nearest index
    of a 15-bit colour (for the averaged colours of mipmap levels) */
 static u32 pal_key[1024];
@@ -652,6 +913,8 @@ void mxgl_Palette(const unsigned char *rgb) {
   for (int i = 0; i < 256; i++) {
     const u8 *c = rgb + 3 * i;
     memcpy(pal_rgb[i], c, 3);
+    memcpy(pal_rgba[i], c, 3);
+    pal_rgba[i][3] = 255;
     u32 key = (u32)c[0] | (u32)c[1] << 8 | (u32)c[2] << 16;
     if (pal_find(key) < 0) {
       u32 h = (key * 2654435761u) >> 22;
@@ -666,7 +929,17 @@ void mxgl_Palette(const unsigned char *rgb) {
   }
   mx_dcache_writeback(clut_pal, sizeof clut_pal);
   pal_on = 1;
+  /* a frame being made: its draws from now on take the new one (the CLUTs
+     are sent at each frame's start) */
+  if (in_frame) {
+    flush_out();
+    clut_send();
+    gs.valid = 0, gs_serial++;
+  }
 }
+
+/* CSM1's order of a CLUT's entry i: bits 3 and 4 swapped */
+static inline u32 csm1(u32 i) { return (i & 0xE7) | (i & 8) << 1 | (i & 16) >> 1; }
 
 static void clut_make(void) {
   for (u32 i = 0; i < 256; i++) {
@@ -678,18 +951,17 @@ static void clut_make(void) {
   mx_dcache_writeback(clut, sizeof clut);
 }
 
-/* hires: texture uploads go into the frame's once record (played once,
+/* beam: texture uploads go into the frame's once record (played once,
    not in every pass), unless GS memory was refilled in this frame: then
    their order among the draws matters */
 static void once_on(void) {
-  if (!hires)
+  if (!beam)
     return;
   flush_out();
-  if (!st_cur.wraps)
-    mx_hires_once(1);
+  mx_hires_once(1);
 }
 static void once_off(void) {
-  if (hires)
+  if (beam)
     mx_hires_once(0);
 }
 
@@ -703,44 +975,262 @@ static void clut_send(void) {
   once_off();
 }
 
-static void tex_upload(struct tex *t) {
-  u32 nl = tex_levels(t);
-  struct mx_tex probe;
-  u32 blocks = mx_tex_init(&probe, 0, t->psm, t->lw, t->lh, nl, MX_TEX_PACKED);
-  if (blocks > VRAM_END - vram_lo) {
-    t->gen = 0;
+/* the texture quality (mxgl_texture_quality): the levels left out above
+   (0 .. 2) of textures drawn with MIPMAP filtering */
+static s32 k_lod; /* the LOD constant of the draw being made (prepare_state) */
+
+/* ---- texture quality under pressure (MXGL_TEX_AUTO) ----
+
+   VRAM: W, the bytes of the textures a frame uses (at full quality), against
+   V, GS memory's room for textures. Up to 120% of V the frame streams what
+   does not fit (the textures are in RAM: cheap). Above it for 2 seconds the
+   textures are placed from coarser levels until about 80% of V: first the
+   finest level their draws sample (LOD: no visible change), then the
+   largest ones a level less each, never below MX_VCACHE_TAIL_MIN a side;
+   back to full once W at full quality is at most halfway (100%) for 3
+   seconds.
+   RAM: swap-ins above 30 pages a second for 3 seconds: textures whose
+   draws do not sample their top level are drawn from their tails (their
+   pageable upper levels not touched, and marked to go first: mx_mem_cold);
+   back after 5 quiet seconds. */
+
+void mxgl_texture_limits(int vram_hi_pct, int vram_lo_pct, int swap_ins_s) {
+  tq_hi = vram_hi_pct, tq_lo = vram_lo_pct, tq_swap = swap_ins_s;
+}
+
+/* t's bytes in GS memory placed from level f (and its CLUT) */
+static u32 tex_bytes_from(const struct tex *t, u32 f) {
+  u32 n = t->oclut ? 1024 : 0;
+  for (u32 lv = f; lv < t->levels; lv++)
+    n += mx_tex_level_bytes(t->psm, t->lw, t->lh, lv);
+  return n;
+}
+/* the coarsest level t may be placed from (MX_VCACHE_TAIL_MIN a side) */
+static u32 tex_max_from(const struct tex *t) {
+  u32 f = 0;
+  while (f + 1 < t->levels && (t->w >> (f + 1)) >= MX_VCACHE_TAIL_MIN &&
+         (t->h >> (f + 1)) >= MX_VCACHE_TAIL_MIN)
+    f++;
+  return f;
+}
+static int tex_mipped(const struct tex *t) { return t->mip && t->levels > 1; }
+
+/* a draw of the bound texture with LOD constant k (1/16) whose nearest
+   vertex is at w: the finest level the GS samples there */
+static void tex_need_note(s32 k, float wmin) {
+  if (!gl.tex2d || !gl.bound || gl.bound >= MAX_TEX)
     return;
+  struct tex *t = &texs[gl.bound];
+  if (!t->used || !tex_mipped(t))
+    return;
+  float l = wmin > 1e-6f ? fast_log2(wmin) + (float)k / 16.0f : 0.0f;
+  u32 lvl = l <= 0 ? 0 : (u32)l;
+  if (lvl >= t->levels)
+    lvl = t->levels - 1u;
+  u32 f = mx_frame_number();
+  if (lvl <= t->need_lvl || (s32)(f - t->need_until) > 0)
+    t->need_lvl = (u8)lvl, t->need_until = f + NEED_HOLD;
+}
+
+static u32 tex_need(const struct tex *t) {
+  if (!tex_mipped(t))
+    return 0;
+  u32 n = (u32)tex_bias;
+  if (v_low) {
+    u32 v = t->vfrom_epoch == v_epoch ? t->vfrom : t->need_lvl;
+    n = v > n ? v : n;
   }
-  /* the packed layout keeps its alignments if the base is aligned to the
-     whole (a page at most) */
-  u32 align = blocks >= 32 ? 32 : pow2_ceil(blocks);
-  u32 at;
-  if (t->dirty && t->gen == vram_gen && blocks <= t->vram_blocks) {
-    /* changed: again where it is (the draws before have read it: the
-       upload's FLUSH), not to new room, which would fill GS memory with
-       old copies (a lightmap changed every frame) */
-    at = t->mt.tbp[0];
-  } else {
-    at = (vram_pos + align - 1) & ~(align - 1);
-    if (at + blocks > VRAM_END) {
-      vram_gen++;
-      st_cur.wraps++;
-      at = (vram_lo + align - 1) & ~(align - 1);
+  /* RAM: drawn from its tail while its top level is not sampled */
+  if (ram_cold && t->m.head && t->need_lvl >= 1 && t->m.levels > t->m.tail && t->m.tail > n)
+    n = t->m.tail;
+  return n;
+}
+
+void mxgl_texture_quality(int q) {
+  tex_bias_auto = q == MXGL_TEX_AUTO;
+  int b = tex_bias_auto ? 0 : q < 0 ? 0 : q > 2 ? 2 : q;
+  if (b != tex_bias || !tex_bias_auto)
+    vram_gen++; /* every texture looked up again */
+  tex_bias = b;
+  if (!tex_bias_auto)
+    v_low = ram_cold = 0;
+}
+int mxgl_texture_bias(void) { return tex_bias; }
+
+/* the frame used t (its first lookup in the frame) */
+static void ws_note(struct tex *t) {
+  u32 f = mx_frame_number();
+  if (t->ws_frame == f + 1)
+    return;
+  t->ws_frame = f + 1;
+  ws_w0 += tex_bytes_from(t, 0);
+  if (ws_n[ws_cur] < WS_MAX)
+    ws[ws_cur][ws_n[ws_cur]++] = t;
+}
+
+/* the VRAM control's levels for the textures of the frame before: from
+   the finest level sampled, then the largest a level less until the
+   estimate is at most tq_lo % of V */
+static int vram_assign(u32 room) {
+  v_epoch++;
+  struct tex **l = ws[ws_cur ^ 1];
+  u32 n = ws_n[ws_cur ^ 1], e = 0;
+  static u8 before[WS_MAX];
+  for (u32 i = 0; i < n; i++) {
+    struct tex *t = l[i];
+    before[i] = t->vfrom;
+    t->vfrom = tex_mipped(t) ? t->need_lvl : 0;
+    t->vfrom_epoch = v_epoch;
+    e += tex_bytes_from(t, t->vfrom);
+  }
+  u64 target = (u64)room * (u32)tq_lo / 100;
+  /* a level less each, the textures seen from farthest first (their draws
+     sample coarse levels already: least visible), within those the largest
+     first; the ones sampled at level 0 (near) last */
+  for (int cls = 2; cls >= 0 && e > target; cls--)
+    for (int pass = 0; pass < 3 && e > target; pass++) {
+      u32 big = 0;
+      for (u32 i = 0; i < n; i++)
+        if (tex_mipped(l[i]) && l[i]->vfrom < tex_max_from(l[i]) &&
+            (cls == 2 ? l[i]->need_lvl >= 2 : l[i]->need_lvl == (u32)cls)) {
+          u32 b = tex_bytes_from(l[i], l[i]->vfrom);
+          big = b > big ? b : big;
+        }
+      if (!big)
+        break;
+      for (u32 i = 0; i < n && e > target; i++) {
+        struct tex *t = l[i];
+        if (!tex_mipped(t) || t->vfrom >= tex_max_from(t) ||
+            !(cls == 2 ? t->need_lvl >= 2 : t->need_lvl == (u32)cls))
+          continue;
+        u32 b = tex_bytes_from(t, t->vfrom);
+        if (b * 2 < big && pass < 2)
+          continue; /* the larger ones first */
+        e -= b - tex_bytes_from(t, t->vfrom + 1u);
+        t->vfrom++;
+      }
     }
-    vram_pos = at + blocks;
-    t->vram_blocks = blocks;
+  ws_last_e = e;
+  /* changed: looked up again (the others keep their places) */
+  int changed = 0;
+  for (u32 i = 0; i < n; i++)
+    changed |= l[i]->vfrom != before[i];
+  return changed;
+}
+
+static u32 cold_hot, cold_cool, v_hot, v_cool;
+static void tex_auto(u32 up_kb) {
+  static u32 v0;
+  (void)up_kb;
+  ws_sum += ws_w0, ws_frames++;
+  ws_w0 = 0;
+  ws_cur ^= 1;
+  ws_n[ws_cur] = 0;
+  if (!tex_bias_auto || mx_gs.vsync - v0 < mx_gs.hz)
+    return;
+  v0 = mx_gs.vsync;
+  u32 room = tex_room();
+  u32 w = ws_frames ? ws_sum / ws_frames : 0;
+  ws_last_w0 = w;
+  ws_sum = ws_frames = 0;
+  /* VRAM */
+  int was = v_low;
+  if (!v_low) {
+    v_hot = (u64)w * 100 > (u64)room * (u32)tq_hi ? v_hot + 1 : 0;
+    if (v_hot >= 2)
+      v_low = 1, v_hot = 0, v_cool = 0;
+  } else {
+    /* back at full quality once W at full quality is halfway between the
+       limits (100%): streaming that much is fine */
+    v_cool = (u64)w * 200 <= (u64)room * (u32)(tq_lo + tq_hi) ? v_cool + 1 : 0;
+    if (v_cool >= 3)
+      v_low = 0, v_cool = 0;
   }
-  t->dirty = 0;
-  mx_tex_init(&t->mt, at, t->psm, t->lw, t->lh, nl, MX_TEX_PACKED);
-  t->gen = vram_gen;
+  ws_far[0] = ws_far[1] = ws_far[2] = 0;
+  for (u32 i = 0; i < ws_n[ws_cur ^ 1]; i++)
+    if (tex_mipped(ws[ws_cur ^ 1][i]))
+      ws_far[ws[ws_cur ^ 1][i]->need_lvl > 2 ? 2 : ws[ws_cur ^ 1][i]->need_lvl]++;
+  int changed = v_low ? vram_assign(room) : 0;
+  if (changed || v_low != was)
+    vram_gen++; /* the textures looked up again, from their new levels */
+  /* RAM */
+  struct mx_mem_pressure p;
+  mx_mem_pressure(&p);
+  int busy = p.swap_ins_s >= (u32)tq_swap; /* 0: always (tests) */
+  cold_hot = busy ? cold_hot + 1 : 0;
+  cold_cool = busy ? 0 : cold_cool + 1;
+  if (!ram_cold && cold_hot >= 3) {
+    ram_cold = 1;
+    vram_gen++;
+    struct tex **l = ws[ws_cur ^ 1];
+    for (u32 i = 0; i < ws_n[ws_cur ^ 1]; i++)
+      if (l[i]->m.head && l[i]->need_lvl >= 1)
+        mx_mem_cold(l[i]->m.head, l[i]->m.head_bytes);
+  } else if (ram_cold && cold_cool >= 5) {
+    ram_cold = 0;
+    vram_gen++;
+  }
+}
+
+static int tex_place(struct tex *t) {
+  u32 frame = mx_frame_number();
+  if (t->vc_frame == frame && t->vc_gen == vram_gen && t->vc_gen && !t->dirty) {
+    /* a use all the same: the cache tells a texture done for the frame by its uses */
+    mx_vcache_use(mx_vcache_tex_key(tex_key(t), t->m.from));
+    return 0;
+  }
+  ws_note(t);
+  u32 cpsm = t->psm == MX_GS_PSM_T8 ? (t->oclut ? MX_GS_PSM_CT32 : MX_VCACHE_NO_CLUT) : 0;
+  t->m.levels = (u8)tex_levels(t);
+  /* without MIPMAP filtering level 0 is drawn: wait for it rather than a proxy */
+  u32 from;
+  int r = mx_vcache_tex_mem(tex_key(t), &t->m, t->psm, t->lw, t->lh, cpsm, tex_need(t), !t->mip,
+                            &t->mt, &from);
+  u32 nl = t->m.levels - from;
+  if (r == MX_VCACHE_FULL)
+    return -1;
+  if (r == MX_VCACHE_HIT && !t->dirty) {
+    t->vc_frame = frame, t->vc_gen = vram_gen;
+    return 0;
+  }
   st_cur.uploads++;
   once_on();
-
-  for (u32 lv = 0; lv < nl; lv++)
-    image_xfer(t->mt.tbp[lv], t->mt.tbw[lv], t->psm, t->w >> lv, t->h >> lv, tex_bpp(t),
-               (const u8 *)t->data + t->off[lv], lv == 0);
+  if (r == MX_VCACHE_HIT && nl == 1 && !from) {
+    /* changed lines alone (whole quadwords of lines), read from its head */
+    mx_tex_mem_lock(&t->m);
+    u32 rb = t->w * tex_bpp(t), k = 1;
+    while ((k * rb) & 15)
+      k <<= 1;
+    u32 y0 = t->dy0 & ~(k - 1), y1 = (t->dy1 + k - 1) & ~(k - 1);
+    y1 = y1 > t->h ? t->h : y1;
+    image_xfer_at(t->mt.tbp[0], t->mt.tbw[0], t->mt.psm, y0, t->w, y1 - y0, tex_bpp(t),
+                  TLV(t, 0) + y0 * rb, 1);
+  } else {
+    if (r == MX_VCACHE_MISS) {
+      /* other textures moved only if the miss evicted some */
+      static u32 evicted;
+      struct mx_vcache_stats vs;
+      mx_vcache_stats(&vs);
+      if (vs.evicted != evicted)
+        vram_gen++;
+      evicted = vs.evicted;
+    }
+    for (u32 lv = 0; lv < nl; lv++)
+      image_xfer(t->mt.tbp[lv], t->mt.tbw[lv], t->mt.psm, t->w >> (lv + from), t->h >> (lv + from),
+                 tex_bpp(t), TLV(t, lv + from), lv == 0);
+    if (t->oclut) {
+      image_xfer(t->mt.cbp, 1, MX_GS_PSM_CT32, 16, 16, 4, t->oclut, 0);
+      /* the GS loads a CLUT when TEX0 is written (CLD 1): written again even
+         if the same (another texture of this shape had these places this
+         frame, its CLUT is the one loaded) */
+      gs.tex0 = ~0ull;
+    }
+  }
+  t->dirty = 0;
   texflush();
   once_off();
+  t->vc_frame = frame, t->vc_gen = vram_gen;
+  return 0;
 }
 
 /* ---- draw state ---------------------------------------------------------- */
@@ -763,7 +1253,16 @@ static int blend_product(void) {
          (s == GL_ZERO && (d == GL_SRC_COLOR || d == GL_ONE_MINUS_SRC_COLOR));
 }
 
-static struct tex *tex_twin(struct tex *t);
+static struct tex *tex_twin(struct tex *t, int ch);
+
+/* mxgl_color_light: products with the destination of colour textures (the
+   lightmaps of Quake 2) per channel: three passes of each batch, one
+   channel written in each (FRAME's FBMSK), its texture the channel's copy;
+   not with beam racing (FRAME is the passes'): the brightness then */
+static int cl_enabled;
+static int cl_batch;          /* the batch being gathered is drawn so */
+static u64 cl_tex0[3], cl_frame[3];
+void mxgl_color_light(int on) { cl_enabled = on != 0; }
 
 static int blend_mode(u64 *alpha, const struct tex *t) {
   GLenum s, d;
@@ -838,9 +1337,15 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   struct tex *t = NULL;
   if (gl.tex2d && gl.bound && gl.bound < MAX_TEX && texs[gl.bound].used && texs[gl.bound].data)
     t = &texs[gl.bound];
-  /* a colour texture multiplied with the destination: its brightness */
-  if (t && !t->bright && gl.blend && blend_product() && !(t = tex_twin(t)))
-    return -1;
+  /* a colour texture multiplied with the destination: its brightness, or
+     per channel (mxgl_color_light) */
+  struct tex *cl_src = NULL;
+  if (t && (!t->bright || t->planar) && gl.blend && blend_product()) {
+    if (cl_enabled && !beam && !(t->mip && t->levels > 1))
+      cl_src = t;
+    if (!(t = tex_twin(t, cl_src ? 1 : 0)))
+      return -1;
+  }
 
   u64 alpha = 0;
   clut_pick = CLUT_1X;
@@ -857,21 +1362,43 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
     gs.valid = was;
   }
 
-  u32 reg[10];
-  u64 val[10];
+  u32 reg[12];
+  u64 val[12];
   int n = 0;
   if (t) {
-    if (t->gen != vram_gen || t->dirty) {
-      tex_upload(t);
-      if (t->gen != vram_gen)
-        return -1;
-    }
-    u32 tfx = gl.texenv == GL_REPLACE || gl.texenv == GL_DECAL ? 1 : 0;
+    if (tex_place(t) < 0)
+      return -1;
+    /* REPLACE, DECAL: the GS's DECAL (the texture's colour); the alpha is
+       the texture's if its format has one, else the fragment's (TCC 0).
+       GL's DECAL of an RGBA texture (a blend by its alpha) is drawn so too */
+    int repl = gl.texenv == GL_REPLACE || gl.texenv == GL_DECAL;
+    u32 tfx = repl ? 1 : 0, tcc = repl ? (u32)t->alpha_fmt : 1;
     if (t->bright)
       t->mt.cbp = clut_cbp + 4 * (u32)clut_pick;
     else if (t->pal)
       t->mt.cbp = clut_cbp + 4 * NCLUT;
-    u64 tex0 = mx_tex_tex0(&t->mt, 1, tfx);
+    u64 tex0 = mx_tex_tex0(&t->mt, tcc, tfx);
+    /* per channel: the green and blue copies in GS memory too (the red one
+       kept while they are placed) */
+    if (cl_src) {
+      struct tex *g = tex_twin(cl_src, 2), *b = tex_twin(cl_src, 3);
+      u64 kr = mx_vcache_tex_key(tex_key(t), t->m.from);
+      mx_vcache_pin(kr);
+      int ok = g && tex_place(g) == 0;
+      u64 kg = ok ? mx_vcache_tex_key(tex_key(g), g->m.from) : 0;
+      if (ok)
+        mx_vcache_pin(kg);
+      ok = ok && b && tex_place(b) == 0;
+      if (kg)
+        mx_vcache_unpin(kg);
+      mx_vcache_unpin(kr);
+      if (!ok)
+        return -1;
+      g->mt.cbp = b->mt.cbp = t->mt.cbp;
+      cl_tex0[0] = tex0;
+      cl_tex0[1] = mx_tex_tex0(&g->mt, tcc, tfx);
+      cl_tex0[2] = mx_tex_tex0(&b->mt, tcc, tfx);
+    }
     /* MMIN: 0/1 nearest/linear; with levels 2/3 (nearest texel) or 4/5
        (linear), the nearest level or both (trilinear): both unless the
        engine asked for the nearest (r_textureMode *_MIPMAP_NEAREST) */
@@ -881,8 +1408,10 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
     u32 mmin = (u32)t->lin_min;
     if (mipped)
       mmin = (t->lin_min ? 4 : 2) + (t->mip != 1);
+    /* placed from level m.from (its tail, or a lower quality): that level is
+       level 0, so the level asked for is m.from less (K in 1/16) */
     u64 tex1 = mx_gs_tex1(0, mipped ? t->mt.levels - 1u : 0, (u32)t->lin_mag, mmin, 0, 0,
-                          mipped ? (u32)lod_k : 0);
+                          mipped ? (u32)(lod_k - 16 * (s32)t->m.from) : 0);
     if (mipped) {
       u64 m1 = mx_tex_miptbp1(&t->mt), m2 = mx_tex_miptbp2(&t->mt);
       if (!gs.valid || tex0 != gs.tex0 || m1 != gs.mip1)
@@ -916,19 +1445,34 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
     default: ate = 0; break;
     }
   }
+  /* GS Z is larger nearer (GL's depth reversed); it tests NEVER, ALWAYS,
+     GEQUAL, GREATER: GL's LESS, LEQUAL; EQUAL is LEQUAL (a pass over the
+     same vertices), the tests the other way (GREATER, GEQUAL, NOTEQUAL)
+     pass always */
   u32 ztst = 1;
   if (gl.dtest)
-    ztst = gl.dfunc == GL_ALWAYS ? 1 : gl.dfunc == GL_LESS || gl.dfunc == GL_GREATER ? 3 : 2;
+    ztst = gl.dfunc == GL_NEVER                         ? 0
+           : gl.dfunc == GL_LESS                        ? 3
+           : gl.dfunc == GL_LEQUAL || gl.dfunc == GL_EQUAL ? 2
+                                                        : 1;
   u64 test = mx_gs_test((int)ate, atst, aref, 0, 0, 0, 1, ztst);
   if (!gs.valid || test != gs.test)
     reg[n] = MX_GS_REG_TEST_1, val[n++] = gs.test = test;
 
   int zmsk = !(gl.dtest && gl.dmask);
-  if (!hires) {
+  if (!beam) {
     const struct mx_rt *target = &rt[buf];
     u64 zbuf = mx_gs_zbuf(target->zbp, target->zpsm, (u32)zmsk);
     if (!gs.valid || zbuf != gs.zbuf)
       reg[n] = MX_GS_REG_ZBUF_1, val[n++] = gs.zbuf = zbuf;
+    /* glColorMask (beam: FRAME is the passes'; not kept); per channel:
+       red first (flush_out draws green and blue) */
+    for (int k = 0; k < 3; k++)
+      cl_frame[k] = mx_gs_frame(target->fbp, target->fbw, target->psm,
+                                gl.cmask | (0x00FFFFFFu & ~(0xFFu << (8 * k))));
+    u64 frame = cl_src ? cl_frame[0] : mx_gs_frame(target->fbp, target->fbw, target->psm, gl.cmask);
+    if (!gs.valid || frame != gs.frame)
+      reg[n] = MX_GS_REG_FRAME_1, val[n++] = gs.frame = frame;
   }
 
   int x0 = 0, x1 = fb_w - 1, y0 = 0, y1 = fb_h - 1;
@@ -940,17 +1484,18 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
     if (x1 < x0 || y1 < y0)
       return -1;
   }
-  if (!hires) {
+  if (!beam) {
     u64 sc = mx_gs_scissor((u32)x0, (u32)x1, (u32)y0, (u32)y1);
     if (!gs.valid || sc != gs.scissor)
       reg[n] = MX_GS_REG_SCISSOR_1, val[n++] = gs.scissor = sc;
   }
 
-  write_regs(reg, val, n);
+  write_regs(reg, val, n); /* the batch before drawn first */
   gs.valid = 1;
+  cl_batch = cl_src != NULL;
 
-  /* hires: context 2 for no Z writes (SD: ZBUF's ZMSK) */
-  *prim = (u32)mx_gs_prim(MX_GS_PRIM_TRISTRIP, 1, t != NULL, 0, abe, 0, 0, hires && zmsk, 0);
+  /* beam: context 2 for no Z writes (SD: ZBUF's ZMSK) */
+  *prim = (u32)mx_gs_prim(MX_GS_PRIM_TRISTRIP, 1, t != NULL, 0, abe, 0, 0, beam && zmsk, 0);
   if (t) {
     /* 0x80 is 1.0 when modulated: up to 2x with a colour shift */
     cscale[0] = cscale[1] = cscale[2] = gl.cshift ? 1.0f : 0.5f;
@@ -961,7 +1506,62 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   return 0;
 }
 
-/* GS coordinates from the GL matrices, viewport and depth range */
+/* glPolygonOffset in Z buffer steps: factor stands for the slope GL would
+   take per polygon (one value for all: the GS has none), units for the
+   smallest step */
+#define PO_FACTOR 32.0f
+#define PO_UNITS 4.0f
+
+/* r = the inverse of a (column-major); 0 if a is singular */
+static int mat_inverse(float *r, const float *a) {
+  float t[16];
+  t[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] +
+         a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+  t[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] -
+         a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+  t[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] +
+         a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+  t[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] -
+          a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+  t[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] -
+         a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+  t[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] +
+         a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+  t[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] -
+         a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+  t[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] +
+          a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+  t[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] +
+         a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+  t[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] -
+         a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+  t[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] +
+          a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+  t[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] -
+          a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+  t[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] -
+         a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+  t[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] +
+         a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+  t[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] -
+          a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+  t[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] +
+          a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+  float det = a[0] * t[0] + a[1] * t[4] + a[2] * t[8] + a[3] * t[12];
+  if (det == 0)
+    return 0;
+  det = 1.0f / det;
+  for (int i = 0; i < 16; i++)
+    r[i] = t[i] * det;
+  return 1;
+}
+
+/* the user clip plane in GS coordinates (times w): plane_d's plane 6 */
+static float ucp[4];
+
+/* GS coordinates from the GL matrices, viewport and depth range (and the
+   polygon offset, a Z bias); with the user clip plane on, its plane in GS
+   coordinates into ucp */
 static void make_mvp(float *m) {
   float vpm[16];
   memset(vpm, 0, 64);
@@ -974,9 +1574,25 @@ static void make_mvp(float *m) {
   vpm[10] = -zmax * (gl.df - gl.dn) / 2;
   vpm[14] = zmax * (1 - gl.dn - (gl.df - gl.dn) / 2);
   vpm[15] = 1;
-  float pm[16];
-  mat_mul(pm, gl.pr[gl.pr_top], gl.mv[gl.mv_top]);
-  mat_mul(m, vpm, pm);
+  if (gl.poffset) {
+    /* + offset is farther: a smaller GS Z; Z is 16 times the coordinate (ftoi4) */
+    float bias = -(gl.pofactor * PO_FACTOR + gl.pounits * PO_UNITS) / 16.0f;
+    vpm[14] += bias;
+  }
+  float vpp[16];
+  mat_mul(vpp, vpm, gl.pr[gl.pr_top]);
+  mat_mul(m, vpp, gl.mv[gl.mv_top]);
+  if (gl.ucp_on) {
+    /* eye . e >= 0 with eye = vpp^-1 p: the plane is e (vpp^-1), a row */
+    float inv[16];
+    if (mat_inverse(inv, vpp)) {
+      for (int c = 0; c < 4; c++)
+        ucp[c] = gl.ucp_eye[0] * inv[4 * c] + gl.ucp_eye[1] * inv[4 * c + 1] +
+                 gl.ucp_eye[2] * inv[4 * c + 2] + gl.ucp_eye[3] * inv[4 * c + 3];
+    } else {
+      ucp[0] = ucp[1] = ucp[2] = 0, ucp[3] = 1;
+    }
+  }
 }
 
 /* ---- clipping ------------------------------------------------------------- */
@@ -997,8 +1613,25 @@ static float plane_d(const float *p, int k) {
   case 2: return p[1] - GB_LO * p[3];
   case 3: return GB_HI * p[3] - p[1];
   case 4: return zn * p[3] - p[2]; /* near: Z <= zn */
-  default: return p[2] - zf * p[3]; /* far: Z >= zf */
+  case 5: return p[2] - zf * p[3]; /* far: Z >= zf */
+  default: return ucp[0] * p[0] + ucp[1] * p[1] + ucp[2] * p[2] + ucp[3] * p[3]; /* GL_CLIP_PLANE0 */
   }
+}
+
+/* GL_CLIP_PLANE0 is outcode bit 6 (bit 7 marks a vertex behind the eye
+   while vu0_xform's outcodes are made): sets it in vo[0..n-1] and makes
+   *oand, *oor again */
+#define UCP_BIT 0x40u
+static void ucp_outcodes(const float (*vp)[4], u8 *vo, int n, u32 *oand, u32 *oor) {
+  u32 a = 0x7F, o = 0;
+  for (int i = 0; i < n; i++) {
+    u32 c = vo[i] & 0x3F;
+    if (plane_d(vp[i], 6) < 0)
+      c |= UCP_BIT;
+    vo[i] = (u8)c;
+    a &= c, o |= c;
+  }
+  *oand = a, *oor = o;
 }
 
 /* ---- output ----------------------------------------------------------------- */
@@ -1015,7 +1648,7 @@ static float plane_d(const float *p, int k) {
 #define POS_PART (ARENA_BYTES / 7 * 4 & ~63u) /* 16 bytes a vertex */
 #define ST_PART (ARENA_BYTES / 7 * 2 & ~63u)  /* 8 */
 #define COL_PART (ARENA_BYTES / 7 & ~63u)     /* 4 */
-#define UCAB(p) ((void *)((uintptr_t)(p) | 0x30000000u))
+#define UCAB(p) ((void *)MX_UCAB((u8 *)(p)))
 static float (*o_pos)[4]; /* x, y, z, 1: no triangle ends here (ADC) */
 static float (*o_st)[2];
 static u32 *o_col; /* R, G, B, A bytes: stored as one word (UCAB takes whole words) */
@@ -1054,7 +1687,8 @@ static inline __attribute__((always_inline)) void o_put_st(u32 n, const void *t)
 /* the next vertices are a polygon's whose vertex 0 has texture coordinates
    st0: the whole repeats of them are taken off (on the axes that repeat) */
 static void st_poly(const float *st0) {
-  const struct tex *t = gl.tex2d && gl.bound && gl.bound < MAX_TEX ? &texs[gl.bound] : NULL;
+  /* not under a texture matrix that scales or turns S, T */
+  const struct tex *t = gl.tex2d && gl.bound && gl.bound < MAX_TEX && tm_ident() ? &texs[gl.bound] : NULL;
   st_off[0] = t && !t->clamp_s ? (float)(s32)st0[0] : 0.0f;
   st_off[1] = t && !t->clamp_t ? (float)(s32)st0[1] : 0.0f;
   st_shift = st_off[0] != 0.0f || st_off[1] != 0.0f;
@@ -1089,6 +1723,17 @@ static int batch_room(u32 k) {
   return 0;
 }
 
+/* mxgl_color_light: channel j's texture and colour mask (after a FLUSH:
+   the batch before drawn with the channel before) */
+static void cl_regs(int j) {
+  u64 *c = mx_frame_reserve(2 + 2);
+  c = mx_e_cnt(c, 3, mx_vif_flush(), mx_vif_direct(3));
+  c = mx_e_ad_tag(c, 2, 1);
+  c = mx_e_ad(c, MX_GS_REG_TEX0_1, cl_tex0[j]);
+  c = mx_e_ad(c, MX_GS_REG_FRAME_1, cl_frame[j]);
+  mx_frame_commit(c);
+}
+
 static void flush_out(void) {
   if (!o_n)
     return;
@@ -1106,6 +1751,15 @@ static void flush_out(void) {
   mx_sync();
   const void *streams[3] = {pos, st, col};
   mx_frame_shader_draw(&shader, o_prim, o_uni, streams, o_n);
+  gs_drew = 1;
+  if (cl_batch) {
+    /* green and blue: the same batch again, then red's registers back */
+    cl_regs(1);
+    mx_frame_shader_draw(&shader, o_prim, o_uni, streams, o_n);
+    cl_regs(2);
+    mx_frame_shader_draw(&shader, o_prim, o_uni, streams, o_n);
+    cl_regs(0);
+  }
   st_cur.flush_cycles += mx_count() - tf0;
   st_cur.draws++;
   o_n = 0;
@@ -1187,7 +1841,7 @@ static void clip_tri(const struct cv *a, const struct cv *b, const struct cv *c,
 static void clip_poly(struct cv *buf0, int n, u32 planes) {
   static struct cv buf1[CLIP_MAX];
   struct cv *in = buf0, *out = buf1;
-  for (int k = 0; k < 6 && n >= 3; k++) {
+  for (int k = 0; k < 7 && n >= 3; k++) {
     if (!(planes & (1u << k)))
       continue;
     int m = 0;
@@ -1319,7 +1973,8 @@ static s32 lod_k(const u32 *idx, int nidx, int nverts) {
   }
   if (ao < 1e-6f || at < 1e-12f)
     return 0;
-  float k = (0.5f * fast_log2(at * (float)t->w * (float)t->h / ao) - proj_lpp()) * 16.0f;
+  float k = (0.5f * (fast_log2(at * (float)t->w * (float)t->h / ao) + tm_log2_area()) - proj_lpp()) *
+            16.0f;
   s32 ki = (s32)(k + (k < 0 ? -0.5f : 0.5f));
   return ki < -2048 ? -2048 : ki > 2047 ? 2047 : ki;
 }
@@ -1330,6 +1985,9 @@ struct dl_state {
   GLenum texenv, sf, dfac, afunc, dfunc, cullface;
   float aref;
   int cshift;
+  int poffset;
+  float pofactor, pounits;
+  u32 cmask;
 };
 
 static void dl_get_state(struct dl_state *s) {
@@ -1337,6 +1995,8 @@ static void dl_get_state(struct dl_state *s) {
   s->dmask = gl.dmask, s->cull = gl.cull, s->bound = gl.bound, s->texenv = gl.texenv;
   s->sf = gl.sf, s->dfac = gl.dfac, s->afunc = gl.afunc, s->dfunc = gl.dfunc;
   s->cullface = gl.cullface, s->aref = gl.aref, s->cshift = gl.cshift;
+  s->poffset = gl.poffset, s->pofactor = gl.pofactor, s->pounits = gl.pounits;
+  s->cmask = gl.cmask;
 }
 
 static void dl_set_state(const struct dl_state *s) {
@@ -1346,6 +2006,10 @@ static void dl_set_state(const struct dl_state *s) {
   gl.dmask = s->dmask, gl.cull = s->cull, gl.bound = s->bound, gl.texenv = s->texenv;
   gl.sf = s->sf, gl.dfac = s->dfac, gl.afunc = s->afunc, gl.dfunc = s->dfunc;
   gl.cullface = s->cullface, gl.aref = s->aref, gl.cshift = s->cshift;
+  if (gl.poffset != s->poffset || gl.pofactor != s->pofactor || gl.pounits != s->pounits)
+    mat_serial++;
+  gl.poffset = s->poffset, gl.pofactor = s->pofactor, gl.pounits = s->pounits;
+  gl.cmask = s->cmask;
 }
 
 /* The vertices transformed and their outcodes on VU0 (macro mode): each
@@ -1360,7 +2024,7 @@ static void dl_set_state(const struct dl_state *s) {
    With interrupts off: the loop keeps 128-bit values in GPRs (pcpyld to
    qmtc2, qmfc2 to pcpyud), whose upper halves an interrupt does not keep
    (on the PS2, models came out torn and the program crashed); at most
-   XFORM_RUN vertices at a time, so the hires pass timer is not held up. */
+   XFORM_RUN vertices at a time, so the beam racing pass timer is not held up. */
 #define XFORM_RUN 64
 static u32 vu0_xform_run(const u8 *src, int stride, int n, float (*vp)[4], u8 *vo,
                          const float *mats, u32 *oor) {
@@ -1435,6 +2099,13 @@ static u32 vu0_xform(const u8 *src, int stride, int n, float (*vp)[4], u8 *vo,
     (void)*(const volatile u8 *)end;
     oand &= vu0_xform_run(src, stride, k, vp, vo, mats, &o);
     o_or |= o;
+    /* the nearest vertex: the finest level the draw's texture is sampled at */
+    if (tex_bias_auto) {
+      float wm = vp[0][3];
+      for (int i = 1; i < k; i++)
+        wm = vp[i][3] < wm ? vp[i][3] : wm;
+      tex_need_note(k_lod, wm);
+    }
     src += k * stride, vp += k, vo += k, n -= k;
   }
   *oor = o_or;
@@ -1525,13 +2196,58 @@ static inline __attribute__((always_inline)) int fast_culled(const struct fastv 
 }
 
 static void draw_tris_(const u32 *idx, int nidx, int nverts);
-static void draw_tris(const u32 *idx, int nidx, int nverts) {
+/* texture unit 1 is on (GL_ARB_multitexture): a texture, and its
+   coordinates */
+static int u1_on(void) {
+  return gl.u1.tex2d && gl.u1.bound && gl.u1.bound < MAX_TEX && texs[gl.u1.bound].used &&
+         gl.u1.ta && gl.u1.tptr;
+}
+
+/* A draw, and with texture unit 1 on, its second pass: unit 1's texture
+   with its coordinates over the first pass's pixels (depth EQUAL, no depth
+   writes), MODULATE as the product with the destination colour
+   (blendFunc DST_COLOR ZERO: the GS's Cd * As of the texture's brightness),
+   REPLACE as it is. Exact when the first pass does not blend; an alpha
+   tested first pass has its holes, which the second would fill: it is
+   left out then. */
+/* texture unit 1's pass of a draw (draw_tris) */
+static __attribute__((noinline)) void draw_unit1(const u32 *idx, int nidx, int nverts) {
+  pq_flush();
+  struct dl_state keep;
+  dl_get_state(&keep);
+  const float *tp = gl.tptr;
+  int tst = gl.tstride, ta = gl.ta, ca = gl.ca;
+  u32 col8 = gl.col8;
+  float col[4];
+  memcpy(col, gl.color, sizeof col);
+  gl.tex2d = 1, gl.bound = gl.u1.bound, gl.cshift = gl.u1.cshift;
+  gl.tptr = gl.u1.tptr, gl.tstride = gl.u1.tstride, gl.ta = 1;
+  gl.ca = 0, gl.col8 = 0xFFFFFFFFu;
+  gl.color[0] = gl.color[1] = gl.color[2] = gl.color[3] = 1;
+  if (gl.u1.texenv == GL_REPLACE || gl.u1.texenv == GL_DECAL) {
+    gl.blend = 0, gl.texenv = GL_REPLACE;
+  } else {
+    gl.blend = 1, gl.sf = GL_DST_COLOR, gl.dfac = GL_ZERO, gl.texenv = GL_MODULATE;
+  }
+  if (gl.dtest)
+    gl.dfunc = GL_EQUAL;
+  gl.dmask = 0;
+  st_serial++;
+  draw_tris_(idx, nidx, nverts);
+  gl.tptr = tp, gl.tstride = tst, gl.ta = ta, gl.ca = ca, gl.col8 = col8;
+  memcpy(gl.color, col, sizeof col);
+  dl_set_state(&keep);
+}
+
+static inline __attribute__((always_inline)) void draw_tris(const u32 *idx, int nidx, int nverts) {
   u32 t0 = mx_count();
   draw_tris_(idx, nidx, nverts);
+  if (gl.u1.tex2d && !gl.atest && u1_on())
+    draw_unit1(idx, nidx, nverts);
   st_cur.gl_cycles += mx_count() - t0;
 }
 
-static int dl_compiling;
+static int dl_compiling, dl_execute; /* glNewList .. glEndList; GL_COMPILE_AND_EXECUTE */
 static void dl_record(const u32 *idx, int nidx, int nverts);
 /* set by glEnd: the draw is a GL_POLYGON (convex and planar), a fan from
    vertex 0 */
@@ -1583,7 +2299,6 @@ static void update_matrix(void) {
 /* the GS state of a draw (set_state, unless nothing it depends on has
    changed), and the batch it goes into; 0: it cannot be drawn */
 static u32 k_gen, k_vgen, k_tser, k_mser, k_gser, k_sser, k_prim;
-static s32 k_lod;
 static int k_ok, k_valid;
 static float k_cs[4];
 static u32 o_mser;
@@ -1635,10 +2350,21 @@ have:
   ocs[0] = k_cs[0], ocs[1] = k_cs[1], ocs[2] = k_cs[2], ocs[3] = k_cs[3];
   if (o_mser != m_serial) {
     memcpy(o_uni[VU_MXGLV_MVP], m, 64);
+    tm_uniforms(o_uni[VU_MXGLV_TMS], o_uni[VU_MXGLV_TMT]);
     o_mser = m_serial;
   }
   return 1;
 }
+
+/* glLockArraysEXT (GL_EXT_compiled_vertex_array): the arrays do not change
+   until glUnlockArraysEXT, so the vertices' GS coordinates and outcodes of
+   a draw are kept for the next draws of the same arrays and matrices
+   (Quake III draws a surface once a stage) */
+static struct {
+  int on, valid, n, vstride, vsize;
+  const void *vptr, *vp;
+  u32 mser, oand, oor;
+} lk;
 
 static void draw_tris_(const u32 *idx, int nidx, int nverts) {
   pq_flush();
@@ -1646,7 +2372,8 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
     return;
   if (dl_compiling) {
     dl_record(idx, nidx, nverts);
-    return;
+    if (!dl_execute)
+      return;
   }
   frame_start();
   st_cur.calls++;
@@ -1657,12 +2384,12 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
     vp_cache = SPR_VP, vo_cache = SPR_VO;
   } else {
     if ((u32)nverts > v_cache_n) {
-      mx_core_free(vp_ram);
-      mx_core_free(vo_ram);
+      gl_free(vp_ram);
+      gl_free(vo_ram);
       v_cache_n = (u32)nverts + 256;
       /* core memory: VU0 writes them with interrupts off */
-      vp_ram = mx_core_alloc(v_cache_n * 16, 16);
-      vo_ram = mx_core_alloc((v_cache_n + 15) & ~15u, 16);
+      vp_ram = gl_alloc(v_cache_n * 16, 16);
+      vo_ram = gl_alloc((v_cache_n + 15) & ~15u, 16);
     }
     vp_cache = vp_ram, vo_cache = vo_ram;
   }
@@ -1677,9 +2404,18 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
   u32 oand = 0x3F, oor = 0;
   /* the transform and the outcodes (bit k: outside plane k, plane_d < 0):
      on VU0 (vu0_xform), else in FPU registers, the outcodes as the sign
-     bits of the distances */
+     bits of the distances; none while the locked arrays' are kept */
   int nxf = nverts;
-  if (nxf && has_z && mats_ok) {
+#ifdef MXGL_NO_LOCK
+  lk.valid = 0;
+#endif
+  int kept = lk.on && lk.valid && lk.vptr == (const void *)gl.vptr && lk.vstride == gl.vstride &&
+             lk.vsize == gl.vsize && lk.mser == mat_serial && lk.n == nverts &&
+             lk.vp == (const void *)vp_cache;
+  if (kept) {
+    oand = lk.oand, oor = lk.oor;
+    nxf = 0;
+  } else if (nxf && has_z && mats_ok) {
     oand = vu0_xform(vb, vs, nxf, vp_cache, vo_cache, mats, &oor);
     /* vertices behind the eye: their outcodes from the signed distances */
     if (oor & 0x80) {
@@ -1717,6 +2453,15 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
     vo_cache[i] = (u8)o;
     oand &= o;
     oor |= o;
+  }
+  if (gl.ucp_on && !kept)
+    ucp_outcodes((const float(*)[4])vp_cache, vo_cache, nverts, &oand, &oor);
+  if (!kept) {
+    /* kept for the next draws if the arrays are locked; else what was kept
+       is overwritten */
+    lk.valid = lk.on;
+    lk.vptr = gl.vptr, lk.vstride = gl.vstride, lk.vsize = gl.vsize, lk.n = nverts;
+    lk.vp = vp_cache, lk.mser = mat_serial, lk.oand = oand, lk.oor = oor;
   }
   st_cur.xf_cycles += mx_count() - tx0;
   /* all of it outside one plane: nothing to draw */
@@ -1787,7 +2532,7 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
       GLenum md = multi.mode[p];
       if (c < 3 || f < 0 || f + c > nverts)
         continue;
-      u32 pand = 0x3F, por = 0;
+      u32 pand = 0x7F, por = 0;
       for (int i = f; i < f + c; i++)
         pand &= vo_cache[i], por |= vo_cache[i];
       if (pand)
@@ -1882,6 +2627,21 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
     goto done;
   }
   const struct vsrc src = vsrc_get();
+  /* interleaved arrays (position, texture coordinates, colour in one
+     record): the vertex's words from one place */
+  struct fastv fv;
+  const int fast = fastv_get(&fv);
+#define GPUT(v, adc) (fast ? fast_put(&fv, (v), (adc)) : put_vertex(&src, (v), (adc)))
+  /* room for all of the draw's triangles (three vertices each at most): no
+     check a triangle */
+  int room = o_n + 3u * (u32)(nidx / 3) <= o_cap;
+  /* Each triangle goes on the strip so far when it can: the GS draws a
+     triangle of the last three vertices whichever their order (the facing
+     is tested here). With the last two vertices in it, its third; with the
+     last one, the other end of an edge of it at the last (ADC: no
+     triangle) and its third (a fan's next); else a strip of its own, three.
+     l1, l2: the vertices before the last, and the last. */
+  u32 l1 = ~0u, l2 = ~0u;
   for (int i = 0; i + 2 < nidx; i += 3) {
     u32 i0 = idx[i], i1 = idx[i + 1], i2 = idx[i + 2];
     if ((int)i0 >= nverts || (int)i1 >= nverts || (int)i2 >= nverts)
@@ -1894,14 +2654,34 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
          bytes) */
       if (culled(vp_cache[i0], vp_cache[i1], vp_cache[i2]))
         continue;
-      if (!batch_room(3))
+      if (!room && !batch_room(3))
         continue;
-      /* a strip of three */
-      put_vertex(&src, i0, 1);
-      put_vertex(&src, i1, 1);
-      put_vertex(&src, i2, 0);
+      if (!o_n)
+        l1 = l2 = ~0u; /* a new batch: no strip */
+#ifdef MXGL_NO_CHAIN
+      l1 = l2 = ~0u;
+#endif
+      int h1 = i0 == l1 || i1 == l1 || i2 == l1, h2 = i0 == l2 || i1 == l2 || i2 == l2;
+      if (h1 && h2) {
+        u32 x = i0 != l1 && i0 != l2 ? i0 : i1 != l1 && i1 != l2 ? i1 : i2;
+        GPUT(x, 0);
+        l1 = l2, l2 = x;
+      } else if (h2) {
+        /* y: after l2 in the triangle's order, z the other */
+        u32 y = i0 == l2 ? i1 : i1 == l2 ? i2 : i0, z = i0 == l2 ? i2 : i1 == l2 ? i0 : i1;
+        GPUT(y, 1);
+        GPUT(z, 0);
+        l1 = y, l2 = z;
+      } else {
+        GPUT(i0, 1);
+        GPUT(i1, 1);
+        GPUT(i2, 0);
+        l1 = i1, l2 = i2;
+      }
       st_cur.tris++;
     } else {
+      l1 = l2 = ~0u; /* the clipped one's own strip comes between */
+      room = 0;      /* its vertices were not counted */
       u32 tc0 = mx_count();
       struct cv v0, v1, v2;
       fetch(&v0, (int)i0, m), fetch(&v1, (int)i1, m), fetch(&v2, (int)i2, m);
@@ -1910,8 +2690,139 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
       st_cur.c_clip += mx_count() - tc0;
     }
   }
+#undef GPUT
 done:
   st_cur.tri_cycles += mx_count() - tt0;
+}
+
+/* ---- lines and points --------------------------------------------------------- */
+
+/* GL_LINES, _LINE_STRIP, _LINE_LOOP, GL_POINTS: GS LINE and POINT
+   primitives built on the EE (they are few: debug lines, beams), clipped
+   to the planes there, and sent by DIRECT after the batches before
+   (FLUSH). Vertex k is idx[k] of the GL arrays, or k itself (idx NULL). */
+static int is_lp(GLenum mode) {
+  return mode == GL_LINES || mode == GL_LINE_STRIP || mode == GL_LINE_LOOP || mode == GL_POINTS;
+}
+
+/* vertex i of the arrays, in GS coordinates by m */
+static void lp_fetch(struct cv *v, u32 i) {
+  const float *x = (const float *)((const u8 *)gl.vptr + i * (u32)gl.vstride);
+  v->x[0] = x[0], v->x[1] = x[1], v->x[2] = gl.vsize > 2 ? x[2] : 0;
+  for (int r = 0; r < 4; r++)
+    v->p[r] = m[r] * v->x[0] + m[4 + r] * v->x[1] + m[8 + r] * v->x[2] + m[12 + r];
+  if (gl.ta && gl.tptr) {
+    const float *t = (const float *)((const u8 *)gl.tptr + i * (u32)gl.tstride);
+    v->st[0] = t[0], v->st[1] = t[1];
+  } else {
+    v->st[0] = v->st[1] = 0;
+  }
+  if (gl.ca && gl.cptr) {
+    const u8 *c = gl.cptr + i * (u32)gl.cstride;
+    for (int k = 0; k < 4; k++)
+      v->c[k] = c[k];
+  } else {
+    for (int k = 0; k < 4; k++)
+      v->c[k] = gl.color[k] * 255.0f;
+  }
+}
+
+#define LP_RUN 120 /* vertices a packet (3 quadwords each) */
+static struct {
+  u32 prim, n;
+  float cs[4], tms[4], tmt[4];
+  struct cv v[LP_RUN];
+} lp;
+
+static void lp_send(void) {
+  if (!lp.n)
+    return;
+  u32 qwc = 1 + 3 * lp.n;
+  u64 *c = mx_frame_reserve(qwc + 1);
+  c = mx_e_cnt(c, qwc, mx_vif_flush(), mx_vif_direct(qwc));
+  c = mx_e_giftag(c, lp.n, 1, (s32)lp.prim, MX_GIF_FLG_PACKED, 3,
+                  mx_gif_regs3(MX_GIF_REG_ST, MX_GIF_REG_RGBAQ, MX_GIF_REG_XYZ2));
+  for (u32 k = 0; k < lp.n; k++) {
+    const struct cv *v = &lp.v[k];
+    float q = 1.0f / v->p[3];
+    float s = lp.tms[0] * v->st[0] + lp.tmt[0] * v->st[1] + lp.tms[2];
+    float t = lp.tms[1] * v->st[0] + lp.tmt[1] * v->st[1] + lp.tmt[2];
+    c = mx_e_st(c, s * q, t * q, q);
+    u32 col[4];
+    for (int i = 0; i < 4; i++)
+      col[i] = (u32)(s32)__builtin_fminf(__builtin_fmaxf(v->c[i] * lp.cs[i] + 0.5f, 0.0f), 255.0f);
+    c = mx_e_rgbaq(c, col[0], col[1], col[2], col[3]);
+    c = mx_e_xyz2(c, (u32)(s32)(v->p[0] * q * 16.0f), (u32)(s32)(v->p[1] * q * 16.0f),
+                  (u32)(v->p[2] * q * 16.0f), 0);
+  }
+  mx_frame_commit(c);
+  lp.n = 0;
+}
+
+static void lp_put(const struct cv *v) {
+  if (lp.n == LP_RUN)
+    lp_send();
+  lp.v[lp.n++] = *v;
+}
+
+/* a and b cut to the planes; 0 if nothing is left */
+static int lp_clip(struct cv *a, struct cv *b) {
+  for (int k = 0; k < (gl.ucp_on ? 7 : 6); k++) {
+    float da = plane_d(a->p, k), db = plane_d(b->p, k);
+    if (da < 0 && db < 0)
+      return 0;
+    if (da < 0)
+      lerp(a, b, a, db / (db - da));
+    else if (db < 0)
+      lerp(b, a, b, da / (da - db));
+  }
+  return 1;
+}
+
+static void draw_lp(GLenum mode, const u32 *idx, int n) {
+  pq_flush();
+  if (n < 1 || !gl.va || !gl.vptr || dl_compiling)
+    return;
+  frame_start();
+  update_matrix();
+  flush_out();
+  if (set_state(&lp.prim, lp.cs, 0) < 0)
+    return;
+  int points = mode == GL_POINTS;
+  lp.prim = (lp.prim & ~7u) | (points ? MX_GS_PRIM_POINT : MX_GS_PRIM_LINE);
+  tm_uniforms(lp.tms, lp.tmt);
+  lp.n = 0;
+#define LP_IX(k) (idx ? idx[k] : (u32)(k))
+  if (points) {
+    for (int k = 0; k < n; k++) {
+      struct cv v;
+      lp_fetch(&v, LP_IX(k));
+      int in = 1;
+      for (int p = 0; p < (gl.ucp_on ? 7 : 6) && in; p++)
+        in = plane_d(v.p, p) >= 0;
+      if (in)
+        lp_put(&v);
+    }
+  } else {
+    int step = mode == GL_LINES ? 2 : 1;
+    int nseg = mode == GL_LINES ? n / 2 : mode == GL_LINE_LOOP && n > 2 ? n : n - 1;
+    for (int sg = 0; sg < nseg; sg++) {
+      int ka = sg * step, kb = ka + 1 == n ? 0 : ka + 1;
+      struct cv a, b;
+      lp_fetch(&a, LP_IX(ka));
+      lp_fetch(&b, LP_IX(kb));
+      if (!lp_clip(&a, &b))
+        continue;
+      if (lp.n + 2 > LP_RUN)
+        lp_send();
+      lp_put(&a);
+      lp_put(&b);
+    }
+  }
+#undef LP_IX
+  lp_send();
+  st_cur.calls++;
+  /* the PRIM of the next batch comes with its GIF tag; the registers held */
 }
 
 /* ---- GL entry points ------------------------------------------------------ */
@@ -1943,147 +2854,265 @@ static u32 *idx_room(int n) {
 struct dl_entry {
   struct dl_entry *next;
   struct dl_state st;
-  float (*pos)[4];
+  float (*pos)[4];  /* x, y, z, w 1: no triangle ends here (ADC); maybe the
+                       entry before's (the same vertices and triangles) */
   float (*st2)[2];
   u8 (*col)[4];
-  u32 n;            /* vertices (3 a triangle) */
+  u32 n;            /* vertices: strips of the triangles */
+  u16 *tri;         /* the triangles as three of these vertices each (a call
+                       across a plane draws these, clipped) */
+  u32 ntri;
   struct mx_chain ch;
   float bmin[3], bmax[3];
   v4f center, half; /* the bounds as centre (w 1) and half sizes */
   int planar;       /* the first triangle stands for all (culling) */
-  float log2_density; /* log2 of texels per unit (both ways), for K; -1e9: none */
+  float log2_density; /* log2 of S, T units per unit (both ways), for K; -1e9: none */
 };
 
 #define DL_MAX 4096
 #define DL_POOL_BYTES (2 * 1024 * 1024)
 static struct {
   struct dl_entry *first;
-  u32 used;
+  struct dl_state *end; /* the GL state at its glEndList (its state calls'
+                           effect), in the pool; NULL: none */
+  u8 used;              /* it has been made (glEndList) */
+  u8 named;             /* glGenLists gave its name */
 } dlists[DL_MAX];
-static u8 *dl_pool;
-static u32 dl_pool_pos;
-static int dl_cur, dl_failed, dl_dirty;
+static int dl_cur, dl_failed;
+static u32 dl_called_frame = ~0u; /* the frame (mx_gs.frames) that last called a list */
+static struct dl_state dl_before; /* GL_COMPILE: the state is as before glNewList */
 static struct dl_entry **dl_tail;
+
+/* the pool in chunks, taken as the lists need them: a core heap that
+   textures cut up (beam racing's records in it too) still has room for
+   pieces this size where it has none for 2 MiB in one */
+#define DL_CHUNK (256 * 1024)
+#define DL_NCHUNK (DL_POOL_BYTES / DL_CHUNK)
+static u8 *dl_chunk[DL_NCHUNK];
+static u32 dl_ci, dl_coff; /* the chunk being filled, and the place in it */
 
 static void *dl_take(u32 bytes) {
   bytes = (bytes + 63) & ~63u;
-  if (dl_pool_pos + bytes > DL_POOL_BYTES)
+  if (bytes > DL_CHUNK)
     return NULL;
-  void *p = dl_pool + dl_pool_pos;
+  if (dl_coff + bytes > DL_CHUNK) {
+    if (dl_ci + 1 >= DL_NCHUNK)
+      return NULL;
+    if (!dl_chunk[dl_ci + 1] && !(dl_chunk[dl_ci + 1] = gl_alloc(DL_CHUNK, 64)))
+      return NULL;
+    dl_ci++, dl_coff = 0;
+  }
+  void *p = dl_chunk[dl_ci] + dl_coff;
+  dl_coff += bytes;
   dl_pool_pos += bytes;
   return p;
+}
+
+/* all the pool's lists gone: it is filled again from its start */
+static void dl_pool_reset(void) { dl_pool_pos = 0, dl_ci = 0, dl_coff = 0; }
+
+/* the entry recorded last in the list being made, and what its vertices
+   came from: the next draw of the same arrays and triangles (Quake III's
+   next stage of a surface) takes its positions */
+static struct dl_entry *dl_last;
+static const void *dl_last_vptr;
+static const u32 *dl_last_idx;
+static int dl_last_vstride, dl_last_nidx, dl_last_nverts;
+
+/* the triangles idx[0 .. nidx - 1] (of vertices below nverts) as strips:
+   seq[] the vertices in order (bit 31: no triangle ends there), tri[] each
+   triangle's three places in seq; returns how many in seq (at most 3 a
+   triangle), *ntri the triangles */
+static u32 dl_strips(const u32 *idx, int nidx, int nverts, u32 *seq, u16 *tri, u32 *ntri) {
+  u32 n = 0, t = 0, l1 = ~0u, l2 = ~0u, p1 = 0, p2 = 0;
+  for (int i = 0; i + 2 < nidx; i += 3) {
+    u32 a = idx[i], b = idx[i + 1], c = idx[i + 2];
+    if ((int)a >= nverts || (int)b >= nverts || (int)c >= nverts)
+      continue;
+    int h1 = a == l1 || b == l1 || c == l1, h2 = a == l2 || b == l2 || c == l2;
+#ifdef MXGL_NO_LCHAIN
+    h1 = h2 = 0;
+#endif
+    /* tri: each corner's place, in the triangle's own order (its facing:
+       the EE clips and culls from these) */
+#define PLACE(v, va, pa, vb, pb, pc) ((v) == (va) ? (pa) : (v) == (vb) ? (pb) : (pc))
+    if (h1 && h2 && n) {
+      u32 x = a != l1 && a != l2 ? a : b != l1 && b != l2 ? b : c;
+      tri[3 * t] = (u16)PLACE(a, l1, p1, l2, p2, n);
+      tri[3 * t + 1] = (u16)PLACE(b, l1, p1, l2, p2, n);
+      tri[3 * t + 2] = (u16)PLACE(c, l1, p1, l2, p2, n);
+      seq[n] = x;
+      l1 = l2, p1 = p2, l2 = x, p2 = n++;
+    } else if (h2 && n) {
+      u32 y = a == l2 ? b : b == l2 ? c : a, z = a == l2 ? c : b == l2 ? a : b;
+      tri[3 * t] = (u16)PLACE(a, l2, p2, y, n, n + 1);
+      tri[3 * t + 1] = (u16)PLACE(b, l2, p2, y, n, n + 1);
+      tri[3 * t + 2] = (u16)PLACE(c, l2, p2, y, n, n + 1);
+      seq[n] = y | 0x80000000u, seq[n + 1] = z;
+      l1 = y, p1 = n, l2 = z, p2 = n + 1;
+      n += 2;
+    } else {
+      tri[3 * t] = (u16)n, tri[3 * t + 1] = (u16)(n + 1), tri[3 * t + 2] = (u16)(n + 2);
+      seq[n] = a | 0x80000000u, seq[n + 1] = b | 0x80000000u, seq[n + 2] = c;
+      l1 = b, p1 = n + 1, l2 = c, p2 = n + 2;
+      n += 3;
+    }
+#undef PLACE
+    t++;
+  }
+  *ntri = t;
+  return n;
 }
 
 static void dl_record(const u32 *idx, int nidx, int nverts) {
   if (dl_failed)
     return;
-  u32 n = 0;
+  u32 ntri_max = 0;
   for (int i = 0; i + 2 < nidx; i += 3)
     if ((int)idx[i] < nverts && (int)idx[i + 1] < nverts && (int)idx[i + 2] < nverts)
-      n += 3;
-  if (!n)
+      ntri_max++;
+  if (!ntri_max)
     return;
+  if (3 * ntri_max > 65535) {
+    dl_failed = 1;
+    return;
+  }
+  /* the strips (a scratch list of the vertices in order) */
+  static u32 *seq;
+  static u16 *trs;
+  static u32 seq_cap;
+  if (3 * ntri_max > seq_cap) {
+    free(seq), free(trs);
+    seq_cap = 3 * ntri_max + 1024;
+    seq = malloc(seq_cap * 4), trs = malloc(seq_cap * 2);
+    if (!seq || !trs) {
+      free(seq), free(trs);
+      seq = NULL, trs = NULL, seq_cap = 0;
+      dl_failed = 1;
+      return;
+    }
+  }
   u32 pad = VU_MXGLV_ALIGN;
   u32 prim = MX_GS_PRIM_TRISTRIP;
+  /* the same vertices and triangles as the entry before: its positions */
+#ifdef MXGL_NO_SHARE
+  int share = 0 &&
+#else
+  int share = dl_last && dl_last_vptr == (const void *)gl.vptr &&
+#endif
+              dl_last_vstride == gl.vstride && dl_last_idx == idx && dl_last_nidx == nidx &&
+              dl_last_nverts == nverts;
   struct dl_entry *e = dl_take(sizeof *e);
-  float(*pos)[4] = dl_take((n + pad) * 16);
+  u16 *tri = share ? dl_last->tri : dl_take(ntri_max * 6);
+  if (!e || !tri) {
+    dl_failed = 1;
+    return;
+  }
+  u32 ntri, n = dl_strips(idx, nidx, nverts, seq, trs, &ntri);
+  if (!share)
+    memcpy(tri, trs, ntri * 6);
+  float(*pos)[4] = share ? dl_last->pos : dl_take((n + pad) * 16);
   float(*st2)[2] = dl_take((n + pad) * 8);
   u8(*col)[4] = dl_take((n + pad) * 4);
   u32 chain_bytes = mx_shader_mesh_qw(&shader, prim, n) * 16;
   void *chain_mem = dl_take(chain_bytes);
-  if (!e || !pos || !st2 || !col || !chain_mem) {
+  if (!pos || !st2 || !col || !chain_mem) {
     dl_failed = 1;
     return;
   }
   memset(e, 0, sizeof *e);
   dl_get_state(&e->st);
-  e->pos = pos, e->st2 = st2, e->col = col, e->n = n;
-  for (int k = 0; k < 3; k++)
-    e->bmin[k] = 1e30f, e->bmax[k] = -1e30f;
-  u32 o = 0;
-  for (int i = 0; i + 2 < nidx; i += 3) {
-    if ((int)idx[i] >= nverts || (int)idx[i + 1] >= nverts || (int)idx[i + 2] >= nverts)
-      continue;
-    for (int j = 0; j < 3; j++, o++) {
-      u32 v = idx[i + j];
+  e->pos = pos, e->st2 = st2, e->col = col, e->n = n, e->tri = tri, e->ntri = ntri;
+  for (u32 o = 0; o < n; o++) {
+    u32 v = seq[o] & 0x7FFFFFFFu;
+    if (!share) {
       const float *x = (const float *)((const u8 *)gl.vptr + v * gl.vstride);
-      /* a strip of three a triangle (the first two end none) */
       pos[o][0] = x[0], pos[o][1] = x[1], pos[o][2] = gl.vsize > 2 ? x[2] : 0;
-      pos[o][3] = j < 2 ? 1.0f : 0.0f;
+      pos[o][3] = seq[o] >> 31 ? 1.0f : 0.0f;
+    }
+    if (gl.ta && gl.tptr) {
+      const float *t = (const float *)((const u8 *)gl.tptr + v * gl.tstride);
+      st2[o][0] = t[0], st2[o][1] = t[1];
+    } else {
+      st2[o][0] = st2[o][1] = 0;
+    }
+    if (gl.ca && gl.cptr) {
+      memcpy(col[o], gl.cptr + v * gl.cstride, 4);
+    } else {
+      for (int k = 0; k < 4; k++) {
+        float c = gl.color[k] * 255.0f;
+        col[o][k] = (u8)(c < 0 ? 0 : c > 255 ? 255 : c);
+      }
+    }
+  }
+  if (share) {
+    memcpy(e->bmin, dl_last->bmin, sizeof e->bmin), memcpy(e->bmax, dl_last->bmax, sizeof e->bmax);
+    e->center = dl_last->center, e->half = dl_last->half, e->planar = dl_last->planar;
+  } else {
+    for (int k = 0; k < 3; k++)
+      e->bmin[k] = 1e30f, e->bmax[k] = -1e30f;
+    for (u32 o = 0; o < n; o++)
       for (int k = 0; k < 3; k++) {
         if (pos[o][k] < e->bmin[k])
           e->bmin[k] = pos[o][k];
         if (pos[o][k] > e->bmax[k])
           e->bmax[k] = pos[o][k];
       }
-      if (gl.ta && gl.tptr) {
-        const float *t = (const float *)((const u8 *)gl.tptr + v * gl.tstride);
-        st2[o][0] = t[0], st2[o][1] = t[1];
-      } else {
-        st2[o][0] = st2[o][1] = 0;
-      }
-      if (gl.ca && gl.cptr) {
-        memcpy(col[o], gl.cptr + v * gl.cstride, 4);
-      } else {
-        for (int k = 0; k < 4; k++) {
-          float c = gl.color[k] * 255.0f;
-          col[o][k] = (u8)(c < 0 ? 0 : c > 255 ? 255 : c);
-        }
+    /* one plane, one facing: the triangles' normals all along the first's,
+       their corners on its plane */
+    float nx = 0, ny = 0, nz = 0, d = 0;
+    {
+      const float *a = pos[tri[0]], *b = pos[tri[1]], *c = pos[tri[2]];
+      float ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+      float vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+      nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      float l = sqrtf(nx * nx + ny * ny + nz * nz);
+      e->planar = l > 1e-4f;
+      if (e->planar) {
+        nx /= l, ny /= l, nz /= l;
+        d = nx * a[0] + ny * a[1] + nz * a[2];
       }
     }
-  }
-  /* one plane, one facing: the triangles' normals all along the first's,
-     their corners on its plane */
-  float nx = 0, ny = 0, nz = 0, d = 0;
-  {
-    const float *a = pos[0], *b = pos[1], *c = pos[2];
-    float ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
-    float vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
-    nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    float l = sqrtf(nx * nx + ny * ny + nz * nz);
-    e->planar = l > 1e-4f;
-    if (e->planar) {
-      nx /= l, ny /= l, nz /= l;
-      d = nx * a[0] + ny * a[1] + nz * a[2];
-    }
-  }
-  for (u32 t = 0; t < n && e->planar; t += 3) {
-    const float *a = pos[t], *b = pos[t + 1], *c = pos[t + 2];
-    float ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
-    float vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
-    float mx = uy * vz - uz * vy, my = uz * vx - ux * vz, mz = ux * vy - uy * vx;
-    if (mx * nx + my * ny + mz * nz < 0)
-      e->planar = 0;
-    for (int j = 0; j < 3; j++) {
-      float dist = nx * pos[t + j][0] + ny * pos[t + j][1] + nz * pos[t + j][2] - d;
-      if (dist > 0.5f || dist < -0.5f)
+    for (u32 t = 0; t < ntri && e->planar; t++) {
+      const float *a = pos[tri[3 * t]], *b = pos[tri[3 * t + 1]], *c = pos[tri[3 * t + 2]];
+      float ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
+      float vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
+      float mx = uy * vz - uz * vy, my = uz * vx - ux * vz, mz = ux * vy - uy * vx;
+      if (mx * nx + my * ny + mz * nz < 0)
         e->planar = 0;
+      const float *q[3] = {a, b, c};
+      for (int j = 0; j < 3; j++) {
+        float dist = nx * q[j][0] + ny * q[j][1] + nz * q[j][2] - d;
+        if (dist > 0.5f || dist < -0.5f)
+          e->planar = 0;
+      }
     }
+    for (int k = 0; k < 3; k++) {
+      e->center[k] = (e->bmin[k] + e->bmax[k]) * 0.5f;
+      e->half[k] = (e->bmax[k] - e->bmin[k]) * 0.5f;
+    }
+    e->center[3] = 1, e->half[3] = 0;
   }
-  for (int k = 0; k < 3; k++) {
-    e->center[k] = (e->bmin[k] + e->bmax[k]) * 0.5f;
-    e->half[k] = (e->bmax[k] - e->bmin[k]) * 0.5f;
-  }
-  e->center[3] = 1, e->half[3] = 0;
-  /* texels per unit: sqrt of the texture area over the surface area */
+  /* S, T units per unit: sqrt of the texture area over the surface area */
   e->log2_density = -1e9f;
   {
     struct tex *tx = gl.tex2d && gl.bound && gl.bound < MAX_TEX ? &texs[gl.bound] : NULL;
     float at = 0, ao = 0;
-    for (u32 t = 0; tx && t < n; t += 3) {
-      const float *a = pos[t], *b = pos[t + 1], *c = pos[t + 2];
+    for (u32 t = 0; tx && t < ntri; t++) {
+      const float *a = pos[tri[3 * t]], *b = pos[tri[3 * t + 1]], *c = pos[tri[3 * t + 2]];
       float ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2];
       float vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
       float mx = uy * vz - uz * vy, my = uz * vx - ux * vz, mz = ux * vy - uy * vx;
       ao += sqrtf(mx * mx + my * my + mz * mz);
-      const float *ta = st2[t], *tb = st2[t + 1], *tc = st2[t + 2];
+      const float *ta = st2[tri[3 * t]], *tb = st2[tri[3 * t + 1]], *tc = st2[tri[3 * t + 2]];
       float x = (tb[0] - ta[0]) * (tc[1] - ta[1]) - (tc[0] - ta[0]) * (tb[1] - ta[1]);
-      at += (x < 0 ? -x : x) * (float)tx->w * (float)tx->h;
+      at += x < 0 ? -x : x;
     }
     if (ao > 1e-6f && at > 1e-9f)
       e->log2_density = 0.5f * fast_log2(at / ao);
   }
-  mx_dcache_writeback(pos, (n + pad) * 16);
+  if (!share)
+    mx_dcache_writeback(pos, (n + pad) * 16);
   mx_dcache_writeback(st2, (n + pad) * 8);
   mx_dcache_writeback(col, (n + pad) * 4);
   struct mx_pbuf pb;
@@ -2095,45 +3124,139 @@ static void dl_record(const u32 *idx, int nidx, int nverts) {
   }
   *dl_tail = e;
   dl_tail = &e->next;
+  dl_last = e, dl_last_vptr = gl.vptr, dl_last_vstride = gl.vstride;
+  dl_last_idx = idx, dl_last_nidx = nidx, dl_last_nverts = nverts;
 }
 
-/* Starts list id (1 .. DL_MAX - 1); returns 0 if it cannot. */
-int mxgl_NewList(int id) {
+/* Display lists (GL 1.0): glNewList .. glEndList record the draws (each
+   with the GL state it is drawn in) and the state at the end; glCallList
+   draws them with the matrices of then and leaves the list's end state.
+   State calls between glNewList and glEndList are done at once (the draws
+   recorded take the state from them); with GL_COMPILE the state is put
+   back at glEndList, as GL's lists hold the calls and do not do them.
+   Matrix calls in a list are not recorded. Names 1 .. DL_MAX - 1. A list
+   whose draws do not all fit in the pool is empty (GL_OUT_OF_MEMORY). */
+void APIENTRY glNewList(GLuint id, GLenum mode) {
   static int warned;
-  if (!dl_pool) /* taken by the first list (a game without lists does not pay) */
-    dl_pool = mx_core_alloc(DL_POOL_BYTES, 64); /* the DMAC reads it */
-  if (!dl_pool && !warned++)
-    mx_printf("mxgl: no memory for the display lists (%u KB): drawn without\n",
-              DL_POOL_BYTES / 1024);
-  if (id <= 0 || id >= DL_MAX || !dl_pool || dl_compiling)
-    return 0;
+  if (mode != GL_COMPILE && mode != GL_COMPILE_AND_EXECUTE) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  if (!id || id >= DL_MAX) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  if (dl_compiling) {
+    gl_error(GL_INVALID_OPERATION);
+    return;
+  }
+  pq_flush();
+  if (!dl_chunk[0]) /* taken by the first list (a game without lists does not pay) */
+    dl_chunk[0] = gl_alloc(DL_CHUNK, 64); /* the DMAC reads it */
+  if (!dl_chunk[0] && !warned++)
+    mx_printf("mxgl: no memory for the display lists (%u KB): drawn without\n", DL_CHUNK / 1024);
+  if (dlists[id].used)
+    dl_nused--;
   dlists[id].first = NULL;
+  dlists[id].end = NULL;
+  dlists[id].used = 0;
   dl_tail = &dlists[id].first;
-  dl_cur = id;
-  dl_failed = 0;
+  dl_last = NULL;
+  dl_cur = (int)id;
+  dl_failed = !dl_chunk[0];
+  dl_execute = mode == GL_COMPILE_AND_EXECUTE;
+  dl_get_state(&dl_before);
   dl_compiling = 1;
-  return 1;
 }
 
-/* Ends it; returns 1 if all its draws are in it (else it is empty). */
-int mxgl_EndList(void) {
-  if (!dl_compiling)
-    return 0;
+void APIENTRY glEndList(void) {
+  if (!dl_compiling) {
+    gl_error(GL_INVALID_OPERATION);
+    return;
+  }
+  pq_flush();
   dl_compiling = 0;
-  dlists[dl_cur].used = !dl_failed;
-  if (dl_failed)
+  dlists[dl_cur].end = dl_failed ? NULL : dl_take(sizeof(struct dl_state));
+  if (dlists[dl_cur].end)
+    dl_get_state(dlists[dl_cur].end);
+  dlists[dl_cur].used = 1;
+  dl_nused++;
+  if (dl_failed) {
     dlists[dl_cur].first = NULL;
-  return !dl_failed;
+    dl_nfailed++;
+    gl_error(GL_OUT_OF_MEMORY);
+  }
+  if (!dl_execute)
+    dl_set_state(&dl_before);
 }
 
-/* Every list goes; the pool is empty again (after the frames in flight). */
+GLuint APIENTRY glGenLists(GLsizei range) {
+  if (range <= 0)
+    return 0;
+  for (GLuint b = 1; b + (GLuint)range <= DL_MAX; b++) {
+    GLuint k = 0;
+    while (k < (GLuint)range && !dlists[b + k].named && !dlists[b + k].used)
+      k++;
+    if (k == (GLuint)range) {
+      for (k = 0; k < (GLuint)range; k++)
+        dlists[b + k].named = 1;
+      return b;
+    }
+    b += k;
+  }
+  return 0;
+}
+
+GLboolean APIENTRY glIsList(GLuint id) {
+  return id && id < DL_MAX && (dlists[id].used || dlists[id].named);
+}
+
+/* The lists go; when none is left, the pool is empty again (after the
+   frames in flight, which may call them). */
+void APIENTRY glDeleteLists(GLuint first, GLsizei range) {
+  if (range < 0) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  for (GLuint id = first; id < first + (GLuint)range && id < DL_MAX; id++) {
+    if (!id)
+      continue;
+    if (dlists[id].used)
+      dl_nused--;
+    dlists[id].first = NULL;
+    dlists[id].end = NULL;
+    dlists[id].used = dlists[id].named = 0;
+  }
+  if (!dl_nused && dl_pool_pos && !dl_compiling) {
+    pq_flush();
+    if (in_frame && dl_called_frame == mx_gs.frames)
+      return; /* the frame being made calls them: the pool stays */
+    u32 t0 = mx_count();
+    while (mx_frame_done() < mx_gs.frames && mx_count() - t0 < MX_EE_HZ)
+      ;
+    dl_pool_reset();
+  }
+}
+
+/* deprecated: the standard calls above */
+int mxgl_NewList(int id) {
+  glNewList((GLuint)id, GL_COMPILE);
+  return dl_compiling;
+}
+int mxgl_EndList(void) {
+  int ok = dl_compiling && !dl_failed;
+  glEndList();
+  (void)glGetError();
+  return ok;
+}
 void mxgl_DeleteAllLists(void) {
-  u32 t0 = mx_count();
-  while (mx_frame_done() < mx_gs.frames && mx_count() - t0 < MX_EE_HZ)
-    ;
-  memset(dlists, 0, sizeof dlists);
-  dl_pool_pos = 0;
-  dl_dirty = 0;
+  glDeleteLists(1, DL_MAX - 1);
+  if (!dl_nused) {
+    u32 t0 = mx_count();
+    while (mx_frame_done() < mx_gs.frames && mx_count() - t0 < MX_EE_HZ)
+      ;
+    dl_pool_reset();
+  }
 }
 
 /* K: log2(texels a pixel at w = 1) = log2(texels per unit) - log2(pixels
@@ -2142,33 +3265,47 @@ static s32 dl_lod_k(const struct dl_entry *e, float lpp) {
   struct tex *t = gl.tex2d && gl.bound && gl.bound < MAX_TEX ? &texs[gl.bound] : NULL;
   if (!t || !t->used || t->levels < 2 || e->log2_density < -1e8f)
     return 0;
-  float k = (e->log2_density - lpp) * 16.0f;
+  /* texels per unit: the texture's size now (a name may get another) */
+  float k = (e->log2_density + 0.5f * ((float)t->lw + (float)t->lh + tm_log2_area()) - lpp) * 16.0f;
   s32 ki = (s32)(k + (k < 0 ? -0.5f : 0.5f));
   return ki < -2048 ? -2048 : ki > 2047 ? 2047 : ki;
 }
 
 static u32 *idx_room(int n);
 
-void mxgl_CallList(int id) {
+void APIENTRY glCallList(GLuint id) {
   pq_flush();
-  if (id <= 0 || id >= DL_MAX || !dlists[id].used)
+  if (!id || id >= DL_MAX || !dlists[id].used)
     return;
+  dl_called_frame = mx_gs.frames;
+  if (dl_compiling) {
+    gl_error(GL_INVALID_OPERATION); /* lists in lists: not recorded */
+    return;
+  }
   u32 t0 = mx_count();
   frame_start();
   flush_out();
   /* the matrix of the calls, made again when the matrices, the viewport or
      the depth range change; lpp: log2 of pixels per unit at w = 1 */
-  static float m[16], lpp, key[16 + 16 + 6];
-  /* the six planes (plane_d) as rows: plane k of p = M v is pl[k] . v */
-  static v4f pl[6], pl_abs[6];
-  float nk[16 + 16 + 6];
+  static float m[16], lpp, key[16 + 16 + 6 + 5];
+  /* the planes (plane_d, the user clip plane last) as rows: plane k of
+     p = M v is pl[k] . v */
+  static v4f pl[7], pl_abs[7];
+  float nk[16 + 16 + 6 + 5];
   memcpy(nk, gl.mv[gl.mv_top], 64);
   memcpy(nk + 16, gl.pr[gl.pr_top], 64);
   nk[32] = (float)gl.vp[0], nk[33] = (float)gl.vp[1], nk[34] = (float)gl.vp[2];
   nk[35] = (float)gl.vp[3], nk[36] = gl.dn, nk[37] = gl.df;
+  nk[38] = (float)gl.ucp_on;
+  memcpy(nk + 39, gl.ucp_eye, 16);
+  const int nplanes = gl.ucp_on ? 7 : 6;
   if (memcmp(nk, key, sizeof key)) {
     memcpy(key, nk, sizeof key);
+    /* without the polygon offset: an entry with it is drawn as any draw */
+    int po = gl.poffset;
+    gl.poffset = 0;
     make_mvp(m);
+    gl.poffset = po;
     const float *pr = gl.pr[gl.pr_top];
     float sx = pr[0] * (float)gl.vp[2] * 0.5f * fb_w / gl_w, sy = pr[5] * (float)gl.vp[3] * 0.5f * fb_h / gl_h;
     float a = sx * sy;
@@ -2183,8 +3320,9 @@ void mxgl_CallList(int id) {
       pl[3][c] = GB_HI * col[3] - col[1];
       pl[4][c] = zn * col[3] - col[2];
       pl[5][c] = col[2] - zf * col[3];
+      pl[6][c] = ucp[0] * col[0] + ucp[1] * col[1] + ucp[2] * col[2] + ucp[3] * col[3];
     }
-    for (int k = 0; k < 6; k++)
+    for (int k = 0; k < 7; k++)
       for (int c = 0; c < 4; c++)
         pl_abs[k][c] = c < 3 ? (pl[k][c] < 0 ? -pl[k][c] : pl[k][c]) : 0;
   }
@@ -2197,7 +3335,7 @@ void mxgl_CallList(int id) {
     /* the bounds against each plane: the centre's distance, and how far
        the box reaches along the plane's normal */
     u32 oand = 0, oor = 0;
-    for (int k = 0; k < 6; k++) {
+    for (int k = 0; k < nplanes; k++) {
       v4f dc = pl[k] * e->center, rr = pl_abs[k] * e->half;
       float d = dc[0] + dc[1] + dc[2] + dc[3], r = rr[0] + rr[1] + rr[2];
       if (d + r < 0)
@@ -2208,7 +3346,7 @@ void mxgl_CallList(int id) {
     if (oand)
       continue;
     dl_set_state(&e->st);
-    if (oor) {
+    if (oor || e->st.poffset) {
       /* across a plane: as any draw */
       const float *vp = gl.vptr, *tp = gl.tptr;
       const u8 *cp = gl.cptr;
@@ -2217,10 +3355,10 @@ void mxgl_CallList(int id) {
       gl.vptr = &e->pos[0][0], gl.vsize = 3, gl.vstride = 16, gl.va = 1;
       gl.tptr = &e->st2[0][0], gl.tstride = 8, gl.ta = 1;
       gl.cptr = &e->col[0][0], gl.cstride = 4, gl.ca = 1;
-      u32 *ix = idx_room((int)e->n);
-      for (u32 i = 0; i < e->n; i++)
-        ix[i] = i;
-      draw_tris_(ix, (int)e->n, (int)e->n);
+      u32 *ix = idx_room((int)(3 * e->ntri));
+      for (u32 i = 0; i < 3 * e->ntri; i++)
+        ix[i] = e->tri[i];
+      draw_tris_(ix, (int)(3 * e->ntri), (int)e->n);
       gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
       gl.vsize = vs, gl.vstride = vst, gl.tstride = tst, gl.cstride = cst;
       gl.va = va, gl.ta = ta, gl.ca = ca;
@@ -2243,6 +3381,12 @@ void mxgl_CallList(int id) {
     u32 c1 = mx_count();
     st_cur.c_bounds += c1 - c0;
     s32 k = dl_lod_k(e, lpp);
+    /* its bounds' nearest point: the finest level its texture is sampled at */
+    if (tex_bias_auto) {
+      float wc = m[3] * e->center[0] + m[7] * e->center[1] + m[11] * e->center[2] + m[15];
+      float wr = fabsf(m[3]) * e->half[0] + fabsf(m[7]) * e->half[1] + fabsf(m[11]) * e->half[2];
+      tex_need_note(k, wc - wr);
+    }
     /* the same state as the call before, nothing written since: the
        registers are right */
     if (!(gs_serial == last_serial && vram_gen == last_gen && k == last_k &&
@@ -2252,66 +3396,200 @@ void mxgl_CallList(int id) {
       last_st = e->st, last_k = k, last_gen = vram_gen, last_serial = gs_serial;
     }
     memcpy(uni[VU_MXGLV_MVP], m, 64);
+    tm_uniforms(uni[VU_MXGLV_TMS], uni[VU_MXGLV_TMT]);
     u32 c2 = mx_count();
     st_cur.c_state += c2 - c1;
     flush_out();
     mx_frame_shader_call(&shader, prim, uni, &e->ch);
+    if (cl_batch) { /* a channel a pass (mxgl_color_light) */
+      cl_regs(1);
+      mx_frame_shader_call(&shader, prim, uni, &e->ch);
+      cl_regs(2);
+      mx_frame_shader_call(&shader, prim, uni, &e->ch);
+      cl_regs(0);
+    }
+    gs_drew = 1;
     st_cur.c_call += mx_count() - c2;
     st_cur.draws++;
     st_cur.lists++;
-    st_cur.tris += e->n / 3;
+    st_cur.tris += e->ntri;
     st_cur.verts += e->n;
   }
-  dl_set_state(&keep);
+  /* the list's state calls had their effect */
+  dl_set_state(dlists[id].end ? dlists[id].end : &keep);
   st_cur.gl_cycles += mx_count() - t0;
+}
+void mxgl_CallList(int id) { glCallList((GLuint)id); }
+
+/* the triangles of n vertices of mode (vertex k is in[k], or k if in is
+   NULL) as an index list in its own room; *k its length; NULL for modes
+   without triangles */
+static u32 *tri_buf;
+static int tri_buf_n;
+static const u32 *mode_tris(GLenum mode, const u32 *in, int n, int *k) {
+  int need = mode == GL_QUADS ? n / 4 * 6 : n < 3 ? 0 : mode == GL_TRIANGLES ? n / 3 * 3 : 3 * (n - 2);
+  *k = 0;
+  if (mode != GL_TRIANGLES && mode != GL_TRIANGLE_STRIP && mode != GL_TRIANGLE_FAN &&
+      mode != GL_QUADS && mode != GL_QUAD_STRIP && mode != GL_POLYGON)
+    return NULL;
+  if (need > tri_buf_n) {
+    free(tri_buf);
+    tri_buf_n = need + 1024;
+    tri_buf = malloc((size_t)tri_buf_n * 4);
+    if (!tri_buf) {
+      tri_buf_n = 0;
+      gl_error(GL_OUT_OF_MEMORY);
+      return NULL;
+    }
+  }
+#define V(j) (in ? in[j] : (u32)(j))
+  u32 *o = tri_buf;
+  switch (mode) {
+  case GL_TRIANGLES:
+    for (int j = 0; j < need; j++)
+      *o++ = V(j);
+    break;
+  case GL_TRIANGLE_STRIP:
+  case GL_QUAD_STRIP:
+    for (int j = 0; j + 2 < n; j++) {
+      int odd = j & 1;
+      *o++ = V(j + odd), *o++ = V(j + !odd), *o++ = V(j + 2);
+    }
+    break;
+  case GL_TRIANGLE_FAN:
+  case GL_POLYGON:
+    for (int j = 0; j + 2 < n; j++)
+      *o++ = V(0), *o++ = V(j + 1), *o++ = V(j + 2);
+    break;
+  default: /* GL_QUADS */
+    for (int q = 0; 4 * q + 3 < n; q++) {
+      u32 a = V(4 * q), b = V(4 * q + 1), c = V(4 * q + 2), d = V(4 * q + 3);
+      *o++ = a, *o++ = b, *o++ = c, *o++ = a, *o++ = c, *o++ = d;
+    }
+    break;
+  }
+#undef V
+  *k = need;
+  return tri_buf;
+}
+
+/* maxv: the largest index, or -1 (found here) */
+static void draw_elements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices, int maxv) {
+  if (gl.ebuf)
+    indices = buf_ptr(gl.ebuf, (uintptr_t)indices);
+  if (count < 0 || (type != GL_UNSIGNED_INT && type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_BYTE)) {
+    gl_error(count < 0 ? GL_INVALID_VALUE : GL_INVALID_ENUM);
+    return;
+  }
+  /* 32-bit triangles: the game's list as it is */
+  if (type == GL_UNSIGNED_INT && mode == GL_TRIANGLES) {
+    const u32 *gi = indices;
+    if (maxv < 0) {
+      maxv = 0;
+      for (int i = 0; i < count; i++)
+        if ((int)gi[i] > maxv)
+          maxv = (int)gi[i];
+    }
+    draw_tris(gi, count, maxv + 1);
+    return;
+  }
+  u32 *ix = idx_room(count);
+  if (!ix)
+    return;
+  if (maxv < 0) {
+    maxv = 0;
+    for (int i = 0; i < count; i++) {
+      u32 v = type == GL_UNSIGNED_SHORT ? ((const u16 *)indices)[i]
+              : type == GL_UNSIGNED_BYTE ? ((const u8 *)indices)[i]
+                                        : ((const u32 *)indices)[i];
+      ix[i] = v;
+      if ((int)v > maxv)
+        maxv = (int)v;
+    }
+  } else if (type == GL_UNSIGNED_INT) {
+    memcpy(ix, indices, (size_t)count * 4);
+  } else {
+    for (int i = 0; i < count; i++)
+      ix[i] = type == GL_UNSIGNED_SHORT ? ((const u16 *)indices)[i] : ((const u8 *)indices)[i];
+  }
+  if (is_lp(mode)) {
+    draw_lp(mode, ix, count);
+    return;
+  }
+  if (mode == GL_TRIANGLES) {
+    draw_tris(ix, count, maxv + 1);
+    return;
+  }
+  int k;
+  const u32 *t = mode_tris(mode, ix, count, &k);
+  if (!t) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  draw_tris(t, k, maxv + 1);
 }
 
 void APIENTRY glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) {
-  if (mode != GL_TRIANGLES)
+  draw_elements(mode, count, type, indices, -1);
+}
+/* GL 1.2: the indices are in start .. end: none is looked for */
+void APIENTRY glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
+                                  const GLvoid *indices) {
+  if (end < start) {
+    gl_error(GL_INVALID_VALUE);
     return;
-  u32 *ix = idx_room(count);
-  int maxv = 0;
-  for (int i = 0; i < count; i++) {
-    u32 v = type == GL_UNSIGNED_SHORT ? ((const u16 *)indices)[i]
-            : type == GL_UNSIGNED_BYTE ? ((const u8 *)indices)[i]
-                                      : ((const u32 *)indices)[i];
-    ix[i] = v;
-    if ((int)v > maxv)
-      maxv = (int)v;
   }
-  draw_tris(ix, count, maxv + 1);
+  draw_elements(mode, count, type, indices, (int)end);
+}
+void APIENTRY glDrawRangeElementsEXT(GLenum mode, GLuint start, GLuint end, GLsizei count,
+                                     GLenum type, const GLvoid *indices) {
+  glDrawRangeElements(mode, start, end, count, type, indices);
 }
 
 #define IMM_MAX 4096 /* vertices of a glBegin .. glEnd, glDrawArrays */
 
-/* the index lists of the immediate modes: fixed patterns, made once */
-static u32 ix_tri[3 * IMM_MAX], ix_strip[3 * IMM_MAX], ix_fan[3 * IMM_MAX], ix_quad[3 * IMM_MAX];
-static void ix_make(void) {
-  for (int i = 0; i < 3 * IMM_MAX; i++)
-    ix_tri[i] = (u32)i;
-  for (int i = 0; i + 2 < IMM_MAX; i++) {
-    u32 *s = &ix_strip[3 * i], *f = &ix_fan[3 * i];
-    if (i & 1)
-      s[0] = (u32)i + 1, s[1] = (u32)i, s[2] = (u32)i + 2;
-    else
-      s[0] = (u32)i, s[1] = (u32)i + 1, s[2] = (u32)i + 2;
-    f[0] = 0, f[1] = (u32)i + 1, f[2] = (u32)i + 2;
+/* the index lists of the immediate modes: fixed patterns, made as large as
+   the largest draw so far */
+static u32 *ix_tri, *ix_strip, *ix_fan, *ix_quad;
+static int ix_cap; /* vertices */
+static int ix_make(int n) {
+  int cap = ix_cap ? ix_cap : 256;
+  while (cap < n)
+    cap *= 2;
+  /* core memory: the draws read them (in virtual memory each read of a
+     page not in the TLB is a refill) */
+  u32 *t = gl_alloc((u32)cap * 12, 16), *s = gl_alloc((u32)cap * 12, 16),
+      *f = gl_alloc((u32)cap * 12, 16), *q = gl_alloc((u32)cap * 12, 16);
+  if (!t || !s || !f || !q) {
+    gl_free(t), gl_free(s), gl_free(f), gl_free(q);
+    gl_error(GL_OUT_OF_MEMORY);
+    return 0;
   }
-  for (int q = 0; 4 * q + 3 < IMM_MAX; q++) {
-    u32 *d = &ix_quad[6 * q], b = 4 * (u32)q;
+  gl_free(ix_tri), gl_free(ix_strip), gl_free(ix_fan), gl_free(ix_quad);
+  ix_tri = t, ix_strip = s, ix_fan = f, ix_quad = q, ix_cap = cap;
+  for (int i = 0; i < 3 * cap; i++)
+    t[i] = (u32)i;
+  for (int i = 0; i + 2 < cap; i++) {
+    u32 *a = &s[3 * i], *b = &f[3 * i];
+    if (i & 1)
+      a[0] = (u32)i + 1, a[1] = (u32)i, a[2] = (u32)i + 2;
+    else
+      a[0] = (u32)i, a[1] = (u32)i + 1, a[2] = (u32)i + 2;
+    b[0] = 0, b[1] = (u32)i + 1, b[2] = (u32)i + 2;
+  }
+  for (int k = 0; 4 * k + 3 < cap; k++) {
+    u32 *d = &q[6 * k], b = 4 * (u32)k;
     d[0] = b, d[1] = b + 1, d[2] = b + 2, d[3] = b, d[4] = b + 2, d[5] = b + 3;
   }
+  return 1;
 }
-
 
 /* the index list of a mode (the fixed patterns of glEnd) and its length for
    n vertices; NULL for modes not drawn */
-static inline const u32 *mode_ix(GLenum mode, int n, int *k) {
-  static int made;
-  if (!made) {
-    ix_make();
-    made = 1;
-  }
+static inline __attribute__((always_inline)) const u32 *mode_ix(GLenum mode, int n, int *k) {
+  *k = 0;
+  if (n > ix_cap && !ix_make(n))
+    return NULL;
   switch (mode) {
   case GL_TRIANGLES: *k = n / 3 * 3; return ix_tri;
   case GL_TRIANGLE_STRIP:
@@ -2324,9 +3602,33 @@ static inline const u32 *mode_ix(GLenum mode, int n, int *k) {
 }
 
 void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+  /* a polygon of one buffer object's records (Quake's world): straight
+     into the polygon queue, as a pointer into the buffer */
+  if (mode == GL_POLYGON && gl.vbuf && gl.vbuf == gl.tbuf && gl.va && gl.ta && !gl.ca &&
+      gl.vsize == 3 && gl.vstride == gl.tstride && count >= 3 && count <= CLIP_MAX - 6 &&
+      first >= 0 && !dl_compiling && !(gl.u1.tex2d && gl.u1.ta)) {
+    intptr_t pst = (const u8 *)gl.tptr - (const u8 *)gl.vptr;
+    if (!(gl.vstride & 3) && !(pst & 3) && pst >= 12 && pst + 8 <= gl.vstride) {
+      int stride = gl.vstride / 4, st = (int)(pst / 4);
+      if (pq_n && (pq_stride != stride || pq_st != st || pq_n == PQ_MAX))
+        draw_polys();
+      pq[pq_n].v = (const float *)((const u8 *)gl.vptr + first * gl.vstride), pq[pq_n].n = count;
+      pq_stride = stride, pq_st = st;
+      pq_n++;
+      return;
+    }
+  }
+  if (count < 0 || first < 0) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
   int k;
-  const u32 *ix = mode_ix(mode, count, &k);
-  if (!ix || count < 3 || count > IMM_MAX || !gl.va || !gl.vptr)
+  const u32 *ix = is_lp(mode) ? NULL : mode_ix(mode, count, &k);
+  if (!is_lp(mode) && !ix) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  if (!gl.va || !gl.vptr || count < (mode == GL_POINTS ? 1 : is_lp(mode) ? 2 : 3))
     return;
   /* the arrays from vertex first on */
   const float *vp = gl.vptr, *tp = gl.tptr;
@@ -2336,6 +3638,55 @@ void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     gl.tptr = (const float *)((const u8 *)tp + first * gl.tstride);
   if (cp)
     gl.cptr = cp + first * gl.cstride;
+  if (is_lp(mode)) {
+    draw_lp(mode, NULL, count);
+    gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
+    return;
+  }
+  /* more vertices than the fixed patterns: an index list of its own */
+  if (count > IMM_MAX) {
+    ix = mode_tris(mode, NULL, count, &k);
+    if (ix)
+      draw_tris(ix, k, count);
+    gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
+    return;
+  }
+  /* a textured polygon without colours (Quake's world) goes into the
+     polygon queue, drawn with the next ones of the same state (draw_polys):
+     of one buffer object (position and texture coordinates in one record),
+     as a pointer into it; else copied */
+  intptr_t pst = (const u8 *)gl.tptr - (const u8 *)gl.vptr;
+  if (mode == GL_POLYGON && gl.vsize == 3 && gl.ta && gl.tptr && !gl.ca && !u1_on() &&
+      !dl_compiling && count <= CLIP_MAX - 6 && count <= SPR_VERTS && gl.vbuf &&
+      gl.vbuf == gl.tbuf && gl.vstride == gl.tstride && !(gl.vstride & 3) && !(pst & 3) &&
+      pst >= 12 && pst + 8 <= gl.vstride) {
+    int stride = gl.vstride / 4, st = (int)(pst / 4);
+    if (pq_n && (pq_stride != stride || pq_st != st || pq_n == PQ_MAX))
+      draw_polys();
+    pq[pq_n].v = gl.vptr, pq[pq_n].n = count;
+    pq_stride = stride, pq_st = st;
+    pq_n++;
+    gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
+    return;
+  }
+  if (mode == GL_POLYGON && gl.vsize == 3 && gl.ta && gl.tptr && !gl.ca && !u1_on() &&
+      !dl_compiling && count <= CLIP_MAX - 6 && count <= SPR_VERTS) {
+    if (pq_n && (pq_stride != 5 || pq_st != 3 || pq_n == PQ_MAX ||
+                 pq_buf_n + 5 * count > PQ_BUF_FLOATS))
+      draw_polys();
+    float *d = pq_buf + pq_buf_n;
+    for (int i = 0; i < count; i++, d += 5) {
+      const float *x = (const float *)((const u8 *)gl.vptr + i * gl.vstride);
+      const float *t = (const float *)((const u8 *)gl.tptr + i * gl.tstride);
+      d[0] = x[0], d[1] = x[1], d[2] = x[2], d[3] = t[0], d[4] = t[1];
+    }
+    pq[pq_n].v = pq_buf + pq_buf_n, pq[pq_n].n = count;
+    pq_stride = 5, pq_st = 3;
+    pq_n++;
+    pq_buf_n += 5 * count;
+    gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
+    return;
+  }
   draw_polygon = mode == GL_POLYGON;
   draw_mode = mode;
   draw_tris(ix, k, count);
@@ -2344,18 +3695,93 @@ void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
   gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
 }
 
-void mxgl_MultiDraw(const GLenum *mode, const int *first, const int *count, int n) {
-  int nv = 0;
-  for (int i = 0; i < n; i++)
+/* n primitives of the arrays, primitive i mode[i] (strips, fans, polygons
+   as fans, triangles) of count[i] vertices from first[i]: one draw (the
+   vertices transformed once); other modes, or more vertices than
+   IMM_MAX, one by one */
+static void multi_draw(const GLenum *mode, const GLint *first, const GLsizei *count, int n) {
+  if (n <= 0 || !gl.va || !gl.vptr)
+    return;
+  int nv = 0, ok = 1;
+  for (int i = 0; i < n; i++) {
+    GLenum md = mode[i];
+    if (first[i] < 0 || count[i] < 0)
+      ok = 0;
+    if (md != GL_TRIANGLE_STRIP && md != GL_TRIANGLE_FAN && md != GL_TRIANGLES && md != GL_POLYGON)
+      ok = 0;
     if (first[i] + count[i] > nv)
       nv = first[i] + count[i];
-  if (n <= 0 || nv < 3 || nv > IMM_MAX || !gl.va || !gl.vptr)
+  }
+  if (!ok || nv > IMM_MAX) {
+    for (int i = 0; i < n; i++)
+      glDrawArrays(mode[i], first[i], count[i]);
     return;
-  multi.mode = mode, multi.first = first, multi.count = count, multi.n = n;
+  }
+  if (nv < 3)
+    return;
+  /* polygons are fans (convex: GL's) */
+  static GLenum md[512];
+  const GLenum *mp = mode;
+  for (int i = 0; i < n; i++)
+    if (mode[i] == GL_POLYGON) {
+      for (int b = 0; b < n; b += 512) {
+        int c = n - b < 512 ? n - b : 512;
+        for (int j = 0; j < c; j++)
+          md[j] = mode[b + j] == GL_POLYGON ? GL_TRIANGLE_FAN : mode[b + j];
+        multi_draw(md, first + b, count + b, c);
+      }
+      return;
+    }
+  multi.mode = mp, multi.first = first, multi.count = count, multi.n = n;
   int k;
   const u32 *ix = mode_ix(GL_TRIANGLES, nv, &k); /* for the LOD estimate */
   draw_tris(ix, k, nv);
   multi.n = 0;
+}
+
+void APIENTRY glMultiDrawArrays(GLenum mode, const GLint *first, const GLsizei *count, GLsizei n) {
+  /* polygons: each its own (the polygon queue takes them, many to a draw) */
+  if (mode == GL_POLYGON) {
+    for (int i = 0; i < n; i++)
+      glDrawArrays(mode, first[i], count[i]);
+    return;
+  }
+  static GLenum md[512];
+  for (int b = 0; b < n; b += 512) {
+    int c = n - b < 512 ? n - b : 512;
+    for (int i = 0; i < c; i++)
+      md[i] = mode;
+    multi_draw(md, first + b, count + b, c);
+  }
+}
+void APIENTRY glMultiDrawArraysEXT(GLenum mode, const GLint *first, const GLsizei *count,
+                                   GLsizei n) {
+  glMultiDrawArrays(mode, first, count, n);
+}
+/* GL_IBM_multimode_draw_arrays: a mode each (modestride bytes apart) */
+void APIENTRY glMultiModeDrawArraysIBM(const GLenum *mode, const GLint *first, const GLsizei *count,
+                                       GLsizei n, GLint modestride) {
+  if (modestride == (GLint)sizeof(GLenum) || modestride == 0) {
+    multi_draw(mode, first, count, n);
+    return;
+  }
+  static GLenum md[512];
+  for (int b = 0; b < n; b += 512) {
+    int c = n - b < 512 ? n - b : 512;
+    for (int i = 0; i < c; i++)
+      md[i] = *(const GLenum *)((const u8 *)mode + (b + i) * modestride);
+    multi_draw(md, first + b, count + b, c);
+  }
+}
+void APIENTRY glMultiDrawElements(GLenum mode, const GLsizei *count, GLenum type,
+                                  const void *const *indices, GLsizei n) {
+  for (int i = 0; i < n; i++)
+    glDrawElements(mode, count[i], type, indices[i]);
+}
+
+/* deprecated: glMultiModeDrawArraysIBM */
+void mxgl_MultiDraw(const GLenum *mode, const int *first, const int *count, int n) {
+  multi_draw(mode, first, count, n);
 }
 
 static void draw_polygon_now(const float *v, int n, int stride, int st) {
@@ -2384,6 +3810,7 @@ static void draw_polygon_now(const float *v, int n, int stride, int st) {
 static void draw_polys(void) {
   int np = pq_n;
   pq_n = 0;
+  pq_buf_n = 0;
   if (!np)
     return;
   const float *vp0 = gl.vptr, *tp0 = gl.tptr;
@@ -2398,6 +3825,7 @@ static void draw_polys(void) {
   frame_start();
   update_matrix();
   vp_cache = SPR_VP, vo_cache = SPR_VO;
+  lk.valid = 0;
   int k;
   const u32 *ix = mode_ix(GL_POLYGON, pq[0].n, &k);
   struct fastv fv;
@@ -2447,6 +3875,8 @@ static void draw_polys(void) {
           oand &= o, oor |= o;
         }
       }
+      if (gl.ucp_on)
+        ucp_outcodes((const float(*)[4])vp_cache, vo_cache, n, &oand, &oor);
       if (oand)
         continue;
       st_poly((const float *)vb + pq_st);
@@ -2489,6 +3919,7 @@ static void draw_polys(void) {
    vertices from pos, stride bytes apart); returns the AND, *por the OR */
 static u32 xform_all(const u8 *pos, int stride, int n, u32 *por) {
   u32 oand = 0x3F, oor = 0;
+  lk.valid = 0;
   if (mats_ok) {
     oand = vu0_xform(pos, stride, n, vp_cache, vo_cache, mats, &oor);
     if (oor & 0x80) {
@@ -2519,6 +3950,8 @@ static u32 xform_all(const u8 *pos, int stride, int n, u32 *por) {
       oand &= o, oor |= o;
     }
   }
+  if (gl.ucp_on)
+    ucp_outcodes((const float(*)[4])vp_cache, vo_cache, n, &oand, &oor);
   *por = oor;
   return oand;
 }
@@ -2567,12 +4000,12 @@ void mxgl_DrawGlCmds(const int *cmds, const float *pos, int stride, const unsign
     vp_cache = SPR_VP, vo_cache = SPR_VO;
   } else {
     if ((u32)nv > v_cache_n) {
-      mx_core_free(vp_ram);
-      mx_core_free(vo_ram);
+      gl_free(vp_ram);
+      gl_free(vo_ram);
       v_cache_n = (u32)nv + 256;
       /* core memory: VU0 writes them with interrupts off */
-      vp_ram = mx_core_alloc(v_cache_n * 16, 16);
-      vo_ram = mx_core_alloc((v_cache_n + 15) & ~15u, 16);
+      vp_ram = gl_alloc(v_cache_n * 16, 16);
+      vo_ram = gl_alloc((v_cache_n + 15) & ~15u, 16);
     }
     vp_cache = vp_ram, vo_cache = vo_ram;
   }
@@ -2592,7 +4025,7 @@ void mxgl_DrawGlCmds(const int *cmds, const float *pos, int stride, const unsign
     c += 3 * cnt;
     if (cnt < 3)
       continue;
-    u32 pa = 0x3F, po = 0;
+    u32 pa = 0x7F, po = 0;
     for (int i = 0; i < cnt; i++)
       pa &= vo_cache[e[3 * i + 2]], po |= vo_cache[e[3 * i + 2]];
     if (pa)
@@ -2687,35 +4120,62 @@ static struct {
   /* a vertex's position, texture coordinates and colour together: three
      arrays of power-of-two sizes put the first vertices of each in the same
      cache sets (2 ways), and they took each other's lines */
-  struct {
+  struct imm_v {
     float xyz[3];
     float st[2];
     u32 col;
-  } v[IMM_MAX] MX_ALIGNED(64);
-  float cur_st[2];
+  } *v; /* imm_small, or a larger one taken (core memory: VU0 reads it) */
+  int cap;
+  float cur_st[2], cur_st1[2];
+  float (*st1)[2]; /* texture unit 1's (malloc'ed by its first glMultiTexCoord) */
 } imm;
+
+#define IMM_SMALL 1024
+static struct imm_v imm_small[IMM_SMALL] MX_ALIGNED(64);
 
 void APIENTRY glBegin(GLenum mode) {
   imm.mode = mode;
   imm.n = 0;
+  if (!imm.v)
+    imm.v = imm_small, imm.cap = IMM_SMALL;
+}
+
+/* more vertices than the room: a room twice as large (IMM_MAX at most) */
+static int imm_grow(void) {
+  int cap = imm.cap * 2;
+  if (cap > IMM_MAX)
+    return 0;
+  struct imm_v *v = gl_alloc((u32)cap * sizeof *v, 64);
+  if (!v) {
+    gl_error(GL_OUT_OF_MEMORY);
+    return 0;
+  }
+  memcpy(v, imm.v, (size_t)imm.n * sizeof *v);
+  if (imm.v != imm_small)
+    gl_free(imm.v);
+  imm.v = v, imm.cap = cap;
+  return 1;
 }
 
 static inline void imm_vertex(float x, float y, float z) {
-  if (imm.n >= IMM_MAX)
+  if (imm.n >= imm.cap && !imm_grow())
     return;
   int i = imm.n++;
   imm.v[i].xyz[0] = x, imm.v[i].xyz[1] = y, imm.v[i].xyz[2] = z;
   imm.v[i].st[0] = imm.cur_st[0], imm.v[i].st[1] = imm.cur_st[1];
   imm.v[i].col = gl.col8;
+  if (imm.st1)
+    imm.st1[i][0] = imm.cur_st1[0], imm.st1[i][1] = imm.cur_st1[1];
 }
 
 void APIENTRY glEnd(void) {
   int n = imm.n;
-  if (n < 3)
+  int lp_mode = is_lp(imm.mode);
+  if (n < (lp_mode ? 1 : 3))
     return;
-  int k;
-  const u32 *ix = mode_ix(imm.mode, n, &k);
-  if (!ix)
+  int k = 0;
+  const u32 *ix = lp_mode ? NULL : mode_ix(imm.mode, n, &k);
+  if (!ix && !lp_mode)
     return;
   /* draw from the immediate arrays */
   const float *vp = gl.vptr, *tp = gl.tptr;
@@ -2725,14 +4185,25 @@ void APIENTRY glEnd(void) {
   gl.vptr = imm.v[0].xyz, gl.vsize = 3, gl.vstride = sizeof imm.v[0], gl.va = 1;
   gl.tptr = imm.v[0].st, gl.tstride = sizeof imm.v[0], gl.ta = 1;
   gl.cptr = (const u8 *)&imm.v[0].col, gl.cstride = sizeof imm.v[0], gl.ca = 1;
-  draw_polygon = imm.mode == GL_POLYGON;
-  draw_mode = imm.mode;
-  draw_tris(ix, k, n);
-  draw_polygon = 0;
-  draw_mode = 0;
+  const float *u1p = gl.u1.tptr;
+  int u1s = gl.u1.tstride, u1a = gl.u1.ta;
+  if (imm.st1)
+    gl.u1.tptr = imm.st1[0], gl.u1.tstride = 8, gl.u1.ta = 1;
+  else
+    gl.u1.ta = 0;
+  if (lp_mode) {
+    draw_lp(imm.mode, NULL, n);
+  } else {
+    draw_polygon = imm.mode == GL_POLYGON;
+    draw_mode = imm.mode;
+    draw_tris(ix, k, n);
+    draw_polygon = 0;
+    draw_mode = 0;
+  }
   gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
   gl.vsize = vs, gl.vstride = vst, gl.tstride = tst, gl.cstride = cst;
   gl.va = va, gl.ta = ta, gl.ca = ca;
+  gl.u1.tptr = u1p, gl.u1.tstride = u1s, gl.u1.ta = u1a;
 }
 
 void APIENTRY glVertex3f(GLfloat x, GLfloat y, GLfloat z) { imm_vertex(x, y, z); }
@@ -2787,15 +4258,34 @@ static void set_cap(GLenum cap, int on) {
   st_serial++;
   switch (cap) {
   case GL_TEXTURE_2D:
-    if (gl.cunit == 0)
+    if (gl.cunit)
+      gl.u1.tex2d = on;
+    else
       gl.tex2d = on;
     break;
+  case GL_SHARED_TEXTURE_PALETTE_EXT: gl.shared_pal = on; break;
   case GL_BLEND: gl.blend = on; break;
   case GL_ALPHA_TEST: gl.atest = on; break;
   case GL_DEPTH_TEST: gl.dtest = on; break;
   case GL_CULL_FACE: gl.cull = on; break;
   case GL_SCISSOR_TEST: gl.scissor = on; break;
-  default: break;
+  case GL_POLYGON_OFFSET_FILL:
+    if (gl.poffset != on)
+      mat_serial++;
+    gl.poffset = on;
+    break;
+  case GL_CLIP_PLANE0:
+    if (gl.ucp_on != on)
+      mat_serial++;
+    gl.ucp_on = on;
+    break;
+  /* state the GS has not, or that changes no picture here */
+  case GL_DITHER: case GL_FOG: case GL_LIGHTING: case GL_NORMALIZE: case GL_LINE_SMOOTH:
+  case GL_POINT_SMOOTH: case GL_POLYGON_SMOOTH: case GL_STENCIL_TEST: case GL_COLOR_MATERIAL:
+  case GL_TEXTURE_GEN_S: case GL_TEXTURE_GEN_T: case GL_POLYGON_OFFSET_LINE:
+  case GL_POLYGON_OFFSET_POINT: case GL_TEXTURE_1D: case GL_LIGHT0:
+    break;
+  default: gl_error(GL_INVALID_ENUM); break;
   }
 }
 void APIENTRY glEnable(GLenum cap) { set_cap(cap, 1); }
@@ -2804,6 +4294,8 @@ void APIENTRY glDisable(GLenum cap) { set_cap(cap, 0); }
 static void set_client(GLenum cap, int on) {
   if (cap == GL_VERTEX_ARRAY)
     gl.va = on;
+  else if (cap == GL_TEXTURE_COORD_ARRAY && gl.ccunit)
+    gl.u1.ta = on;
   else if (cap == GL_TEXTURE_COORD_ARRAY)
     gl.ta = on;
   else if (cap == GL_COLOR_ARRAY)
@@ -2812,36 +4304,175 @@ static void set_client(GLenum cap, int on) {
 void APIENTRY glEnableClientState(GLenum cap) { set_client(cap, 1); }
 void APIENTRY glDisableClientState(GLenum cap) { set_client(cap, 0); }
 
-void APIENTRY glVertexPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr) {
-  gl.vptr = ptr, gl.vsize = size, gl.vstride = stride ? stride : size * 4;
+/* ---- buffer objects (GL 1.5, OpenGL ES 1.1) ------------------------------- */
+
+/* A buffer's data is core memory (VU0 reads the vertices with interrupts
+   off). It changes only by glBufferData and glBufferSubData, which draw
+   the polygons queued first: draws of buffer data are queued as pointers
+   into it, not copied (Quake's world). */
+#define MAX_BUF 256
+static struct {
+  u8 used;
+  u8 *data;
+  u32 size;
+} bufs[MAX_BUF];
+
+/* where an array's pointer points: its buffer's data + offset, or the pointer */
+static const void *buf_ptr(GLuint b, uintptr_t off) {
+  return b && b < MAX_BUF && bufs[b].data ? (const void *)(bufs[b].data + off) : (const void *)off;
 }
-void APIENTRY glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr) {
-  gl.tptr = ptr, gl.tstride = stride ? stride : size * 4;
-}
-void APIENTRY glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr) {
-  gl.cptr = ptr, gl.cstride = stride ? stride : size;
+/* the arrays' pointers again (a buffer's data moved) */
+static void buf_arrays(void) {
+  if (gl.vbuf)
+    gl.vptr = buf_ptr(gl.vbuf, gl.voff);
+  if (gl.tbuf)
+    gl.tptr = buf_ptr(gl.tbuf, gl.toff);
+  if (gl.cbuf)
+    gl.cptr = buf_ptr(gl.cbuf, gl.coff);
+  if (gl.u1buf)
+    gl.u1.tptr = buf_ptr(gl.u1buf, gl.u1off);
 }
 
-void APIENTRY glMatrixMode(GLenum mode) { gl.mode = mode; }
-void APIENTRY glLoadIdentity(void) { mat_ident(cur_mat()); }
-void APIENTRY glLoadMatrixf(const GLfloat *m) { memcpy(cur_mat(), m, 64); }
-void APIENTRY glPushMatrix(void) {
-  if (gl.mode == GL_PROJECTION) {
-    if (gl.pr_top < 3)
-      memcpy(gl.pr[gl.pr_top + 1], gl.pr[gl.pr_top], 64), gl.pr_top++;
-  } else if (gl.mv_top < 7) {
-    memcpy(gl.mv[gl.mv_top + 1], gl.mv[gl.mv_top], 64), gl.mv_top++;
+void APIENTRY glGenBuffers(GLsizei n, GLuint *b) {
+  for (int i = 0; i < n; i++) {
+    b[i] = 0;
+    for (GLuint k = 1; k < MAX_BUF; k++)
+      if (!bufs[k].used) {
+        bufs[k].used = 1, bufs[k].data = NULL, bufs[k].size = 0;
+        b[i] = k;
+        break;
+      }
+    if (!b[i])
+      gl_error(GL_OUT_OF_MEMORY);
   }
 }
+void APIENTRY glBindBuffer(GLenum target, GLuint b) {
+  if (b >= MAX_BUF) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  if (b && !bufs[b].used)
+    bufs[b].used = 1; /* a name not from glGenBuffers is made by binding it */
+  if (target == GL_ARRAY_BUFFER)
+    gl.abuf = b;
+  else if (target == GL_ELEMENT_ARRAY_BUFFER)
+    gl.ebuf = b;
+  else
+    gl_error(GL_INVALID_ENUM);
+}
+static GLuint *buf_target(GLenum target) {
+  return target == GL_ARRAY_BUFFER ? &gl.abuf : target == GL_ELEMENT_ARRAY_BUFFER ? &gl.ebuf : NULL;
+}
+void APIENTRY glBufferData(GLenum target, GLsizeiptr size, const GLvoid *data, GLenum usage) {
+  GLuint *bp = buf_target(target);
+  if (!bp || !*bp || size < 0) {
+    gl_error(!bp ? GL_INVALID_ENUM : *bp ? GL_INVALID_VALUE : GL_INVALID_OPERATION);
+    return;
+  }
+  pq_flush(); /* queued polygons may point into it */
+  GLuint b = *bp;
+  u8 *d = size ? gl_alloc(((u32)size + 63) & ~63u, 64) : NULL;
+  if (size && !d) {
+    gl_error(GL_OUT_OF_MEMORY);
+    return;
+  }
+  if (d && data)
+    memcpy(d, data, (size_t)size);
+  defer_free(bufs[b].data);
+  bufs[b].data = d, bufs[b].size = (u32)size;
+  buf_arrays();
+}
+void APIENTRY glBufferSubData(GLenum target, GLintptr off, GLsizeiptr size, const GLvoid *data) {
+  GLuint *bp = buf_target(target);
+  if (!bp || !*bp || off < 0 || size < 0 || (u32)(off + size) > bufs[*bp].size) {
+    gl_error(!bp ? GL_INVALID_ENUM : GL_INVALID_VALUE);
+    return;
+  }
+  pq_flush();
+  memcpy(bufs[*bp].data + off, data, (size_t)size);
+}
+void APIENTRY glDeleteBuffers(GLsizei n, const GLuint *b) {
+  pq_flush();
+  for (int i = 0; i < n; i++) {
+    GLuint k = b[i];
+    if (!k || k >= MAX_BUF)
+      continue;
+    defer_free(bufs[k].data);
+    bufs[k].used = 0, bufs[k].data = NULL, bufs[k].size = 0;
+    if (gl.abuf == k)
+      gl.abuf = 0;
+    if (gl.ebuf == k)
+      gl.ebuf = 0;
+  }
+}
+GLboolean APIENTRY glIsBuffer(GLuint b) { return b && b < MAX_BUF && bufs[b].used; }
+void APIENTRY glGenBuffersARB(GLsizei n, GLuint *b) { glGenBuffers(n, b); }
+void APIENTRY glBindBufferARB(GLenum t, GLuint b) { glBindBuffer(t, b); }
+void APIENTRY glBufferDataARB(GLenum t, GLsizeiptr s, const GLvoid *d, GLenum u) {
+  glBufferData(t, s, d, u);
+}
+void APIENTRY glBufferSubDataARB(GLenum t, GLintptr o, GLsizeiptr s, const GLvoid *d) {
+  glBufferSubData(t, o, s, d);
+}
+void APIENTRY glDeleteBuffersARB(GLsizei n, const GLuint *b) { glDeleteBuffers(n, b); }
+GLboolean APIENTRY glIsBufferARB(GLuint b) { return glIsBuffer(b); }
+
+/* the array pointers: offsets into the bound GL_ARRAY_BUFFER, if one is */
+void APIENTRY glVertexPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr) {
+  gl.vbuf = gl.abuf, gl.voff = (uintptr_t)ptr;
+  gl.vptr = buf_ptr(gl.vbuf, gl.voff), gl.vsize = size, gl.vstride = stride ? stride : size * 4;
+}
+void APIENTRY glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr) {
+  if (gl.ccunit) {
+    gl.u1buf = gl.abuf, gl.u1off = (uintptr_t)ptr;
+    gl.u1.tptr = buf_ptr(gl.u1buf, gl.u1off), gl.u1.tstride = stride ? stride : size * 4;
+  } else {
+    gl.tbuf = gl.abuf, gl.toff = (uintptr_t)ptr;
+    gl.tptr = buf_ptr(gl.tbuf, gl.toff), gl.tstride = stride ? stride : size * 4;
+  }
+}
+void APIENTRY glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *ptr) {
+  gl.cbuf = gl.abuf, gl.coff = (uintptr_t)ptr;
+  gl.cptr = buf_ptr(gl.cbuf, gl.coff), gl.cstride = stride ? stride : size;
+}
+
+void APIENTRY glMatrixMode(GLenum mode) {
+  if (mode != GL_MODELVIEW && mode != GL_PROJECTION && mode != GL_TEXTURE) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  gl.mode = mode;
+}
+void APIENTRY glLoadIdentity(void) { mat_ident(cur_mat()); }
+void APIENTRY glLoadMatrixf(const GLfloat *m) { memcpy(cur_mat(), m, 64); }
+/* the current mode's stack: its matrices, top and depth */
+static float (*mat_stack(int **top, int *depth))[16] {
+  if (gl.mode == GL_PROJECTION)
+    return *top = &gl.pr_top, *depth = PR_DEPTH, gl.pr;
+  if (gl.mode == GL_TEXTURE)
+    return *top = &gl.tm_top, *depth = TM_DEPTH, gl.tm;
+  return *top = &gl.mv_top, *depth = MV_DEPTH, gl.mv;
+}
+void APIENTRY glPushMatrix(void) {
+  int *top, depth;
+  float(*st)[16] = mat_stack(&top, &depth);
+  if (*top + 1 >= depth) {
+    gl_error(GL_STACK_OVERFLOW);
+    return;
+  }
+  memcpy(st[*top + 1], st[*top], 64);
+  (*top)++;
+}
 void APIENTRY glPopMatrix(void) {
+  int *top, depth;
+  mat_stack(&top, &depth);
+  if (!*top) {
+    gl_error(GL_STACK_UNDERFLOW);
+    return;
+  }
   pq_flush();
   mat_serial++;
-  if (gl.mode == GL_PROJECTION) {
-    if (gl.pr_top)
-      gl.pr_top--;
-  } else if (gl.mv_top) {
-    gl.mv_top--;
-  }
+  (*top)--;
 }
 void APIENTRY glTranslatef(GLfloat x, GLfloat y, GLfloat z) {
   float t[16];
@@ -2920,11 +4551,42 @@ void APIENTRY glAlphaFunc(GLenum f, GLclampf r) { pq_flush(), gl.afunc = f, gl.a
 void APIENTRY glDepthFunc(GLenum f) { pq_flush(), gl.dfunc = f, st_serial++; }
 void APIENTRY glDepthMask(GLboolean m) { pq_flush(), gl.dmask = m, st_serial++; }
 void APIENTRY glCullFace(GLenum m) { pq_flush(), gl.cullface = m, st_serial++; }
+/* each unit's GL_COMBINE, COMBINE_RGB, RGB_SCALE (0: 1, 1: 2), and unit 0's
+   mxgl_ColorShift */
+static int env_combine[2], env_scale[2], env_legacy;
+static GLenum env_combine_rgb[2] = {GL_MODULATE, GL_MODULATE};
+/* the colour shift of each unit's draws: RGB_SCALE in COMBINE mode (GL
+   takes it only there), else mxgl_ColorShift's */
+static void env_shifts(void) {
+  gl.cshift = env_combine[0] ? env_scale[0] : env_legacy;
+  gl.u1.cshift = env_combine[1] ? env_scale[1] : 0;
+}
+
+/* The texture environment of the active unit: MODULATE, REPLACE, DECAL,
+   and COMBINE as one of them (COMBINE_RGB MODULATE or REPLACE; the GS has
+   no others); RGB_SCALE 1 or 2 (4 is 2): the GS's modulate takes the
+   colour up to 2x (0x80 is 1.0). */
 void APIENTRY glTexEnvf(GLenum t, GLenum p, GLfloat v) {
   pq_flush();
   st_serial++;
-  if (p == GL_TEXTURE_ENV_MODE && gl.cunit == 0)
-    gl.texenv = (GLenum)v;
+  GLenum *env = gl.cunit ? &gl.u1.texenv : &gl.texenv;
+  int u = gl.cunit;
+  switch (p) {
+  case GL_TEXTURE_ENV_MODE:
+    env_combine[u] = (GLenum)v == GL_COMBINE;
+    *env = env_combine[u] ? env_combine_rgb[u] : (GLenum)v;
+    break;
+  case GL_COMBINE_RGB:
+    env_combine_rgb[u] = (GLenum)v == GL_REPLACE ? GL_REPLACE : GL_MODULATE;
+    if (env_combine[u])
+      *env = env_combine_rgb[u];
+    break;
+  case GL_RGB_SCALE: env_scale[u] = v > 1.5f; break;
+  case GL_COMBINE_ALPHA: case GL_ALPHA_SCALE: case GL_SOURCE0_RGB: case GL_SOURCE1_RGB:
+  case GL_OPERAND0_RGB: case GL_OPERAND1_RGB: case GL_TEXTURE_ENV_COLOR: break;
+  default: gl_error(GL_INVALID_ENUM); break;
+  }
+  env_shifts();
 }
 void APIENTRY glTexEnvi(GLenum t, GLenum p, GLint v) { glTexEnvf(t, p, (GLfloat)v); }
 void APIENTRY glClearColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) {
@@ -2940,7 +4602,7 @@ void APIENTRY glClear(GLbitfield mask) {
     return; /* mx_frame_begin cleared colour and Z */
   if (!(mask & (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)))
     return;
-  if (hires) {
+  if (beam) {
   /* a sprite over the scissor area (or all) in the passes' window: Z 0
      with context 1, without (ZMSK) with context 2; colour, or the
      destination's colour again (blend Cd) when only Z is cleared */
@@ -2975,9 +4637,11 @@ void APIENTRY glClear(GLbitfield mask) {
   c = mx_e_cnt(c, 9, mx_vif_flush(), mx_vif_direct(9));
   c = mx_e_ad_tag(c, 8, 1);
   c = mx_e_ad(c, MX_GS_REG_TEST_1, mx_gs_test(0, 0, 0, 0, 0, 0, 1, 1));
-  c = mx_e_ad(c, MX_GS_REG_ZBUF_1, mx_gs_zbuf(t->zbp, t->zpsm, !(mask & GL_DEPTH_BUFFER_BIT)));
+  /* the write masks hold for glClear too (glColorMask, glDepthMask) */
+  c = mx_e_ad(c, MX_GS_REG_ZBUF_1,
+              mx_gs_zbuf(t->zbp, t->zpsm, !(mask & GL_DEPTH_BUFFER_BIT) || !gl.dmask));
   c = mx_e_ad(c, MX_GS_REG_FRAME_1,
-              mx_gs_frame(t->fbp, t->fbw, t->psm, (mask & GL_COLOR_BUFFER_BIT) ? 0 : ~0u));
+              mx_gs_frame(t->fbp, t->fbw, t->psm, (mask & GL_COLOR_BUFFER_BIT) ? gl.cmask : ~0u));
   c = mx_e_ad(c, MX_GS_REG_SCISSOR_1, mx_gs_scissor(0, fb_w - 1, 0, fb_h - 1));
   c = mx_e_ad(c, MX_GS_REG_PRIM, mx_gs_prim(MX_GS_PRIM_SPRITE, 0, 0, 0, 0, 0, 0, 0, 0));
   c = mx_e_ad(c, MX_GS_REG_RGBAQ,
@@ -3011,20 +4675,35 @@ void APIENTRY glGenTextures(GLsizei n, GLuint *t) {
 }
 
 /* data still read by frames in flight is freed two frames later */
-#define DEFER_MAX 256
-/* hires: a record is played until a later one replaces it, which may be
+/* beam: a record is played until a later one replaces it, which may be
    MX_HIRES_SLOTS frames later */
 #define NDEFER (MX_HIRES_SLOTS + 1)
-static void *deferred[NDEFER][DEFER_MAX];
-static int ndeferred[NDEFER];
+static void **deferred[NDEFER];
+static int ndeferred[NDEFER], cdeferred[NDEFER];
 static u32 defer_frame;
 static void defer_free(void *p) {
   if (!p)
     return;
   int k = (int)(mx_gs.frames % NDEFER);
-  if (ndeferred[k] < DEFER_MAX)
-    deferred[k][ndeferred[k]++] = p;
-  /* else: leaked */
+  if (ndeferred[k] == cdeferred[k]) {
+    /* a list that grows (a level's textures go in one frame) */
+    int c = cdeferred[k] ? 2 * cdeferred[k] : 256;
+    void **d = realloc(deferred[k], (size_t)c * sizeof *d);
+    if (!d) {
+      /* no room to keep it: free it once no frame reads anything */
+      u32 t0 = mx_count();
+      while (mx_frame_done() < mx_gs.frames && mx_count() - t0 < MX_EE_HZ)
+        ;
+      if (!in_frame) {
+        gl_free(p);
+        return;
+      }
+      gl_error(GL_OUT_OF_MEMORY);
+      return; /* leaked: the frame being made may read it */
+    }
+    deferred[k] = d, cdeferred[k] = c;
+  }
+  deferred[k][ndeferred[k]++] = p;
 }
 static void defer_collect(void) {
   int k = (int)((mx_gs.frames + 1) % NDEFER); /* filled NDEFER - 1 frames ago */
@@ -3032,34 +4711,41 @@ static void defer_collect(void) {
     return;
   defer_frame = mx_gs.frames;
   for (int i = 0; i < ndeferred[k]; i++)
-    mx_core_free(deferred[k][i]);
+    gl_free(deferred[k][i]);
   ndeferred[k] = 0;
 }
 
 /* the lists name textures: when textures go, so do the lists (the renderer
    asks, mxgl_ListsDirty, and makes them again) */
-int mxgl_ListsDirty(void) { return dl_dirty; }
+int mxgl_ListsDirty(void) { return 0; }
 
 void APIENTRY glDeleteTextures(GLsizei n, const GLuint *t) {
   pq_flush();
   tex_serial++;
-  dl_dirty = 1;
   for (int i = 0; i < n; i++)
     if (t[i] && t[i] < MAX_TEX) {
-      defer_free(texs[t[i]].data);
+      if (texs[t[i]].gen)
+        tex_drop(&texs[t[i]]);
+      tex_free_mem(&texs[t[i]]);
+      free(texs[t[i]].ipal);
       texs[t[i]].data = NULL;
+      texs[t[i]].oclut = NULL;
+      texs[t[i]].ipal = NULL;
       tex_drop_twin(&texs[t[i]]);
       texs[t[i]].used = 0;
     }
 }
 void APIENTRY glBindTexture(GLenum target, GLuint t) {
-  if (gl.cunit != 0)
+  if (target != GL_TEXTURE_2D) {
+    gl_error(GL_INVALID_ENUM);
     return;
-  if (gl.bound != t) {
+  }
+  GLuint *b = gl.cunit ? &gl.u1.bound : &gl.bound;
+  if (*b != t) {
     pq_flush();
     st_serial++;
   }
-  gl.bound = t;
+  *b = t;
   /* a name not from glGenTextures is made by binding it (GL 1.1; GLQuake
      numbers its textures itself) */
   if (t && t < MAX_TEX && !texs[t].used) {
@@ -3080,7 +4766,7 @@ static u32 ilog2(u32 v) {
 /* RGBA8 (GL) into level lv of texture t at (x, y) */
 static void convert(struct tex *t, u32 lv, int x0, int y0, int w, int h, const u8 *src) {
   u32 lw = t->w >> lv;
-  u8 *dst = (u8 *)t->data + t->off[lv];
+  u8 *dst = TLV(t, lv);
   for (int y = 0; y < h; y++)
     for (int x = 0; x < w; x++) {
       const u8 *s = src + (y * w + x) * 4;
@@ -3136,11 +4822,10 @@ void mxgl_TexBrightness(void) { tex_brightness = 1; }
 /* the colour of the draws after is scaled by 1 << s (s 0 or 1), the
    overbright range of hardware gamma, done by the GS's modulate */
 void mxgl_ColorShift(int s) {
-  if (gl.cshift != s) {
-    pq_flush();
-    st_serial++;
-  }
-  gl.cshift = s;
+  pq_flush();
+  st_serial++;
+  env_legacy = s;
+  env_shifts();
 }
 
 /* texels of format (GL_RGB, GL_LUMINANCE, ...) as RGBA8 (malloc'ed), or
@@ -3168,56 +4853,109 @@ static u8 *to_rgba(GLenum format, GLsizei w, GLsizei h, const GLvoid *px) {
 
 static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
                          GLint border, GLenum format, GLenum type, const GLvoid *px);
+
+/* the texels of a GL_COLOR_INDEX texture (bytes) as RGBA8 (malloc'ed), by
+   the shared palette when it is on or the texture has none, else by the
+   texture's; NULL without texels */
+static u8 *index_rgba(GLsizei w, GLsizei h, const GLvoid *px) {
+  if (!px)
+    return NULL;
+  u8 *o = malloc((size_t)w * (size_t)h * 4);
+  if (!o)
+    return NULL;
+  GLuint b = TBOUND;
+  const u8(*pal)[4] = !gl.shared_pal && b < MAX_TEX && texs[b].ipal ? (const u8(*)[4])texs[b].ipal
+                                                                    : (const u8(*)[4])pal_rgba;
+  const u8 *s = px;
+  for (int i = 0; i < w * h; i++)
+    memcpy(o + 4 * i, pal[s[i]], 4);
+  return o;
+}
 static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const GLvoid *px);
 
 static void tex_drop_twin(struct tex *t) {
-  if (!t->twin)
-    return;
-  struct tex *c = &twins[t->twin - 1];
-  defer_free(c->data);
-  memset(c, 0, sizeof *c);
-  t->twin = 0;
+  for (int ch = 0; ch < 4; ch++) {
+    if (!t->twin[ch])
+      continue;
+    struct tex *c = &twins[t->twin[ch] - 1];
+    tex_free_mem(c);
+    if (c->gen)
+      tex_drop(c);
+    memset(c, 0, sizeof *c);
+    t->twin[ch] = 0;
+  }
+}
+
+/* texel i of t's level 0 as RGB */
+static void tex_rgb(const struct tex *t, u32 i, u8 *o) {
+  const u8 *src = TLV(t, 0);
+  if (t->oclut) {
+    u32 c = t->oclut[csm1(src[i])];
+    o[0] = (u8)c, o[1] = (u8)(c >> 8), o[2] = (u8)(c >> 16);
+  } else if (t->pal) {
+    o[0] = pal_rgb[src[i]][0], o[1] = pal_rgb[src[i]][1], o[2] = pal_rgb[src[i]][2];
+  } else if (t->psm == MX_GS_PSM_CT32) {
+    o[0] = src[i * 4], o[1] = src[i * 4 + 1], o[2] = src[i * 4 + 2];
+  } else {
+    u32 c = ((const u16 *)src)[i];
+    o[0] = (u8)((c & 31) << 3), o[1] = (u8)((c >> 5 & 31) << 3), o[2] = (u8)((c >> 10 & 31) << 3);
+  }
 }
 
 /* t's brightness copy (T8, the largest of R, G and B; for blendFunc
    products, blend_product), made from its level 0 when first asked for;
    NULL if there is no room */
-static struct tex *tex_twin(struct tex *t) {
-  if (!t->twin) {
-    int k = 0;
-    while (k < MAX_TWIN && twins[k].used)
-      k++;
-    if (k == MAX_TWIN)
-      return NULL;
+static int tex_one_level; /* tex_set_image: level 0 only (planar textures, their copies) */
+
+/* t's copy ch made from rgba (t's size, RGBA8): the brightness, or a
+   channel's value (which the brightness, the max, then keeps) */
+static struct tex *twin_make(struct tex *t, int ch, u8 *rgba) {
+  int k = 0;
+  while (k < MAX_TWIN && twins[k].used)
+    k++;
+  if (k == MAX_TWIN)
+    return NULL;
+  if (ch)
+    for (u32 i = 0; i < t->w * t->h; i++)
+      rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = rgba[i * 4 + ch - 1];
+  struct tex *c = &twins[k];
+  memset(c, 0, sizeof *c);
+  c->used = 1;
+  tex_brightness = 1;
+  tex_one_level = ch != 0; /* the channels': drawn without MIPMAP filtering (cl_src) */
+  tex_set_image(c, GL_RGB, (GLsizei)t->w, (GLsizei)t->h, rgba);
+  if (!c->data) {
+    c->used = 0;
+    return NULL;
+  }
+  t->twin[ch] = (u16)(k + 1);
+  return c;
+}
+
+static struct tex *tex_twin(struct tex *t, int ch) {
+  if (t->planar && ch == 1)
+    return t; /* its own texels */
+  if (!t->twin[ch]) {
+    if (t->planar && ch > 1)
+      return NULL; /* made with it (tex_set_image) */
     u8 *rgba = malloc(t->w * t->h * 4);
     if (!rgba)
       return NULL;
-    const u8 *src = (const u8 *)t->data + t->off[0];
     for (u32 i = 0; i < t->w * t->h; i++) {
       u8 *o = rgba + i * 4;
-      if (t->pal) {
-        o[0] = pal_rgb[src[i]][0], o[1] = pal_rgb[src[i]][1], o[2] = pal_rgb[src[i]][2];
-      } else if (t->psm == MX_GS_PSM_CT32) {
-        o[0] = src[i * 4], o[1] = src[i * 4 + 1], o[2] = src[i * 4 + 2];
-      } else {
-        u32 c = ((const u16 *)src)[i];
-        o[0] = (u8)((c & 31) << 3), o[1] = (u8)((c >> 5 & 31) << 3), o[2] = (u8)((c >> 10 & 31) << 3);
-      }
+      if (t->planar) { /* the brightness of its planes */
+        const struct tex *g = &twins[t->twin[2] - 1], *b = &twins[t->twin[3] - 1];
+        o[0] = TLV(t, 0)[i], o[1] = TLV(g, 0)[i], o[2] = TLV(b, 0)[i];
+      } else
+        tex_rgb(t, i, o);
       o[3] = 255;
     }
-    struct tex *c = &twins[k];
-    memset(c, 0, sizeof *c);
-    c->used = 1;
-    tex_brightness = 1;
-    tex_set_image(c, GL_RGB, (GLsizei)t->w, (GLsizei)t->h, rgba);
+    struct tex *c = twin_make(t, ch, rgba);
     free(rgba);
-    if (!c->data) {
-      c->used = 0;
+    if (!c)
       return NULL;
-    }
-    t->twin = k + 1;
   }
-  struct tex *c = &twins[t->twin - 1];
+  struct tex *c = &twins[t->twin[ch] - 1];
   c->clamp_s = t->clamp_s, c->clamp_t = t->clamp_t;
   c->lin_mag = t->lin_mag, c->lin_min = t->lin_min, c->mip = t->mip;
   return c;
@@ -3230,24 +4968,42 @@ void APIENTRY glTexImage2D(GLenum target, GLint level, GLint ifmt, GLsizei w, GL
 }
 static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsizei h,
                                   GLint border, GLenum format, GLenum type, const GLvoid *px) {
-  if (!gl.bound || gl.bound >= MAX_TEX)
+  GLuint bound = TBOUND;
+  if (!bound || bound >= MAX_TEX)
     return;
-  u8 *rgba = level == 0 ? to_rgba(format, w, h, px) : NULL;
+  if (target != GL_TEXTURE_2D || w < 0 || h < 0 || border) {
+    gl_error(target != GL_TEXTURE_2D ? GL_INVALID_ENUM : GL_INVALID_VALUE);
+    return;
+  }
+  /* luminance and intensity textures are kept as their brightness (T8, a
+     CLUT that puts it in alpha too: the lightmaps, for the products with
+     the destination colour), whatever the format of the texels given */
+  if (ifmt == GL_LUMINANCE || ifmt == GL_LUMINANCE8 || ifmt == 1 || ifmt == GL_INTENSITY ||
+      ifmt == GL_INTENSITY8 || (format == GL_LUMINANCE && (ifmt == 3 || ifmt == GL_RGB)))
+    tex_brightness = 1;
+  u8 *rgba = level == 0 ? (format == GL_COLOR_INDEX ? index_rgba(w, h, px) : to_rgba(format, w, h, px))
+                        : NULL;
   if (rgba) {
-    /* a luminance texture is a brightness texture (the lightmaps of Quake) */
-    if (format == GL_LUMINANCE)
-      tex_brightness = 1;
-    glTexImage2D(target, level, format == GL_RGB ? GL_RGB : GL_RGBA, w, h, border, GL_RGBA, type,
-                 rgba);
+    tex_image_2d(target, level, ifmt == GL_COLOR_INDEX8_EXT ? GL_RGBA : ifmt, w, h, border, GL_RGBA,
+                 GL_UNSIGNED_BYTE, rgba);
     free(rgba);
     return;
   }
-  struct tex *t = &texs[gl.bound];
+  if (format != GL_RGBA || type != GL_UNSIGNED_BYTE) {
+    tex_brightness = 0;
+    if (px)
+      gl_error(GL_INVALID_ENUM);
+    if (px)
+      return;
+  }
+  struct tex *t = &texs[bound];
   if (level > 0)
     return; /* made from level 0 */
-  /* at least 8 x 8 (an IMAGE transfer of whole quadwords): scaled up */
-  if (px && (w < 8 || h < 8)) {
-    int nw = w < 8 ? 8 : w, nh = h < 8 ? 8 : h;
+  /* at least 8 x 8 (an IMAGE transfer of whole quadwords), sides of powers
+     of two (the GS's): scaled */
+  int pw = (int)pow2_ceil((u32)(w < 8 ? 8 : w)), ph = (int)pow2_ceil((u32)(h < 8 ? 8 : h));
+  if (px && (w != pw || h != ph)) {
+    int nw = pw, nh = ph;
     u8 *big = malloc((size_t)nw * nh * 4);
     if (!big)
       return;
@@ -3258,10 +5014,7 @@ static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsi
     free(big);
     return;
   }
-  if (w < 8)
-    w = 8;
-  if (h < 8)
-    h = 8;
+  w = pw, h = ph;
   tex_drop_twin(t);
   tex_set_image(t, ifmt, w, h, px);
 }
@@ -3281,10 +5034,17 @@ static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const
           break;
         }
       }
-  defer_free(t->data);
+  tex_free_mem(t);
   t->w = (u32)w, t->h = (u32)h;
   t->lw = ilog2((u32)w), t->lh = ilog2((u32)h);
   t->alpha = alpha;
+  /* mxgl_color_light: a GL_RGB8 texture without MIPMAP filtering (a
+     lightmap) as its channels' brightness, each 8 bits: the red one its
+     own texels, the green and blue ones copies (twin[2], twin[3]) */
+  int planar = cl_enabled && (ifmt == GL_RGB8 || ifmt == GL_RGBA8) && !t->mip && s;
+  if (planar)
+    tex_brightness = 1, tex_one_level = 1;
+  t->planar = (u8)planar;
   /* opaque texels all of the game's palette: its indices (T8, exact), else
      16 bits */
   int pal = 0;
@@ -3296,58 +5056,121 @@ static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const
   }
   t->bright = tex_brightness;
   t->pal = pal;
+  t->alpha_fmt = tex_brightness || ifmt == GL_RGBA || ifmt == 4 || ifmt == GL_RGBA8 ||
+                 ifmt == GL_RGBA4 || ifmt == GL_RGB5_A1 || ifmt == GL_RGBA2 || ifmt == GL_ALPHA ||
+                 ifmt == GL_ALPHA8 || ifmt == GL_LUMINANCE_ALPHA || ifmt == 2 ||
+                 ifmt == GL_LUMINANCE8_ALPHA8 || ifmt == GL_INTENSITY || ifmt == GL_INTENSITY8;
   t->psm = tex_brightness || pal ? MX_GS_PSM_T8 : alpha8 ? MX_GS_PSM_CT32 : MX_GS_PSM_CT16;
   tex_brightness = 0;
-  t->max_levels = mx_tex_max_levels(t->lw, t->lh, 8);
+  t->max_levels = tex_one_level ? 1 : mx_tex_max_levels(t->lw, t->lh, 8);
+  tex_one_level = 0;
   t->levels = 1;
-  t->bytes = 0;
-  for (u32 lv = 0; lv < t->max_levels; lv++) {
-    t->off[lv] = t->bytes;
-    t->bytes += (((t->w >> lv) * (t->h >> lv) * tex_bpp(t)) + 63) & ~63u;
-  }
-  t->data = mx_core_alloc((t->bytes + 63) & ~63u, 64); /* IMAGE reads it by DMA */
-  t->gen = 0;
+  tex_alloc_mem(t, 0); /* the DMAC reads it (IMAGE) */
+  tex_new_gen(t); /* new texels: a new key */
   if (!t->data)
     return;
-  if (s) {
+  if (planar) {
+    /* its red plane, then the copies of green and blue */
+    u8 *one = malloc((size_t)(w * h * 4));
+    int ok = one != NULL;
+    for (int ch = 1; ch <= 3 && ok; ch++) {
+      memcpy(one, s, (size_t)(w * h * 4));
+      if (ch == 1) {
+        for (int i = 0; i < w * h; i++)
+          one[i * 4 + 1] = one[i * 4 + 2] = one[i * 4];
+        convert(t, 0, 0, 0, w, h, one);
+      } else
+        ok = twin_make(t, ch, one) != NULL;
+    }
+    free(one);
+    if (!ok)
+      gl_error(GL_OUT_OF_MEMORY);
+  } else if (s) {
     convert(t, 0, 0, 0, w, h, s);
     make_levels(t, s);
   } else {
-    memset(t->data, 0, t->bytes);
+    for (u32 lv = 0; lv < t->max_levels; lv++)
+      memset(TLV(t, lv), 0, mx_tex_level_bytes(t->psm, t->lw, t->lh, lv));
   }
-  mx_dcache_writeback(t->data, t->bytes);
+  tex_writeback(t);
 }
 
+static void tex_sub(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const GLvoid *px);
 void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w,
                                      GLsizei h, GLenum format, GLenum type, const GLvoid *px) {
   pq_flush();
-  if (level != 0 || !gl.bound || gl.bound >= MAX_TEX)
+  GLuint bound = TBOUND;
+  if (level != 0 || !bound || bound >= MAX_TEX)
     return;
-  struct tex *t = &texs[gl.bound];
+  struct tex *t = &texs[bound];
   if (!t->data)
     return;
-  tex_drop_twin(t);
   u8 *rgba = to_rgba(format, w, h, px);
   if (rgba) {
     glTexSubImage2D(target, level, x, y, w, h, GL_RGBA, type, rgba);
     free(rgba);
     return;
   }
+  if (t->oclut) {
+    gl_error(GL_INVALID_OPERATION); /* a compressed (paletted) texture */
+    return;
+  }
+  if (x < 0 || y < 0 || w < 0 || h < 0 || (u32)(x + w) > t->w || (u32)(y + h) > t->h) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  if (!w || !h)
+    return;
   /* changed in place, level 0 only: an upload of a frame in flight may take
      the new texels, a frame early (a copy each time: Quake's lightmaps
-     change every frame) */
+     change every frame). Only its lines go back from the cache, and to GS
+     memory (tex_place) */
+  /* its texels (planar: the red plane), its brightness and channel copies */
+  u8 *one = NULL;
+  for (int ch = -1; ch < 4; ch++) {
+    if (ch < 0) {
+      if (!t->planar)
+        tex_sub(t, x, y, w, h, px);
+      continue;
+    }
+    if (!t->twin[ch] && !(t->planar && ch == 1))
+      continue;
+    struct tex *c = t->planar && ch == 1 ? t : &twins[t->twin[ch] - 1];
+    const u8 *src = px;
+    if (ch && (one || (one = malloc((size_t)(w * h * 4))))) {
+      for (int i = 0; i < w * h; i++)
+        one[i * 4] = one[i * 4 + 1] = one[i * 4 + 2] = ((const u8 *)px)[i * 4 + ch - 1];
+      src = one;
+    } else if (ch) {
+      tex_drop_twin(t); /* no memory to convert: made again when drawn */
+      break;
+    }
+    tex_sub(c, x, y, w, h, src);
+  }
+  free(one);
+}
+
+/* RGBA8 texels px into t's level 0 at (x, y), its lines marked changed
+   (tex_place uploads them alone); level 0 only from now on */
+static void tex_sub(struct tex *t, GLint x, GLint y, GLsizei w, GLsizei h, const GLvoid *px) {
   t->levels = 1;
   convert(t, 0, x, y, w, h, px);
-  mx_dcache_writeback(t->data, t->bytes);
+  u32 rb = t->w * tex_bpp(t);
+  mx_dcache_writeback(TLV(t, 0) + (u32)y * rb, (u32)h * rb);
+  if (!t->dirty)
+    t->dy0 = (u32)y, t->dy1 = (u32)(y + h);
+  else
+    t->dy0 = (u32)y < t->dy0 ? (u32)y : t->dy0, t->dy1 = (u32)(y + h) > t->dy1 ? (u32)(y + h) : t->dy1;
   t->dirty = 1;
 }
 
 void APIENTRY glTexParameterf(GLenum target, GLenum p, GLfloat v) {
   pq_flush();
   tex_serial++;
-  if (!gl.bound || gl.bound >= MAX_TEX)
+  GLuint bound = TBOUND;
+  if (!bound || bound >= MAX_TEX)
     return;
-  struct tex *t = &texs[gl.bound];
+  struct tex *t = &texs[bound];
   GLenum e = (GLenum)v;
   switch (p) {
   case GL_TEXTURE_WRAP_S: t->clamp_s = e != GL_REPEAT; break;
@@ -3361,7 +5184,11 @@ void APIENTRY glTexParameterf(GLenum target, GLenum p, GLfloat v) {
     t->mip = mip;
     break;
   }
-  default: break;
+  /* the levels are made here from level 0 anyway */
+  case GL_GENERATE_MIPMAP: break;
+  case GL_TEXTURE_MIN_LOD: case GL_TEXTURE_MAX_LOD: case GL_TEXTURE_BASE_LEVEL:
+  case GL_TEXTURE_MAX_LEVEL: case GL_TEXTURE_PRIORITY: break;
+  default: gl_error(GL_INVALID_ENUM); break;
   }
 }
 void APIENTRY glTexParameteri(GLenum target, GLenum p, GLint v) {
@@ -3369,11 +5196,36 @@ void APIENTRY glTexParameteri(GLenum target, GLenum p, GLint v) {
 }
 
 /* queries and the rest */
-GLenum APIENTRY glGetError(void) { return GL_NO_ERROR; }
+GLenum APIENTRY glGetError(void) {
+  GLenum e = gl.err;
+  gl.err = GL_NO_ERROR;
+  return e;
+}
 void APIENTRY glGetIntegerv(GLenum p, GLint *v) {
   switch (p) {
   case GL_MAX_TEXTURE_SIZE: *v = MXGL_MAX_TEXTURE; break;
-  default: *v = 0; break;
+  case GL_VIEWPORT: v[0] = gl.vp[0], v[1] = gl.vp[1], v[2] = gl.vp[2], v[3] = gl.vp[3]; break;
+  case GL_SCISSOR_BOX: v[0] = gl.sc[0], v[1] = gl.sc[1], v[2] = gl.sc[2], v[3] = gl.sc[3]; break;
+  case GL_MATRIX_MODE: *v = (GLint)gl.mode; break;
+  case GL_MAX_MODELVIEW_STACK_DEPTH: *v = MV_DEPTH; break;
+  case GL_MAX_PROJECTION_STACK_DEPTH: *v = PR_DEPTH; break;
+  case GL_MAX_TEXTURE_STACK_DEPTH: *v = TM_DEPTH; break;
+  case GL_MODELVIEW_STACK_DEPTH: *v = gl.mv_top + 1; break;
+  case GL_PROJECTION_STACK_DEPTH: *v = gl.pr_top + 1; break;
+  case GL_TEXTURE_STACK_DEPTH: *v = gl.tm_top + 1; break;
+  case GL_MAX_CLIP_PLANES: *v = 1; break;
+  case GL_MAX_TEXTURE_UNITS: *v = 2; break;
+  case GL_PACK_ALIGNMENT: *v = gl.pack_align; break;
+  case GL_UNPACK_ALIGNMENT: *v = 4; break;
+  case GL_TEXTURE_BINDING_2D: *v = (GLint)TBOUND; break;
+  case GL_ACTIVE_TEXTURE: *v = (GLint)(GL_TEXTURE0 + gl.cunit); break;
+  case GL_CLIENT_ACTIVE_TEXTURE: *v = (GLint)(GL_TEXTURE0 + gl.ccunit); break;
+  case GL_RED_BITS: case GL_GREEN_BITS: case GL_BLUE_BITS: *v = rgb24 ? 8 : 5; break;
+  case GL_ALPHA_BITS: case GL_STENCIL_BITS: *v = 0; break;
+  case GL_DEPTH_BITS: *v = zmax == ZMAX_Z16 ? 16 : 24; break;
+  case GL_MAX_LIST_NESTING: *v = 1; break;
+  case GL_MAX_VIEWPORT_DIMS: v[0] = 2048, v[1] = 2048; break;
+  default: *v = 0; gl_error(GL_INVALID_ENUM); break;
   }
 }
 void APIENTRY glGetBooleanv(GLenum p, GLboolean *v) { *v = 0; }
@@ -3386,12 +5238,15 @@ void APIENTRY glGetFloatv(GLenum p, GLfloat *v) {
 }
 GLboolean APIENTRY glIsEnabled(GLenum cap) {
   switch (cap) {
-  case GL_TEXTURE_2D: return (GLboolean)gl.tex2d;
+  case GL_TEXTURE_2D: return (GLboolean)(gl.cunit ? gl.u1.tex2d : gl.tex2d);
+  case GL_SHARED_TEXTURE_PALETTE_EXT: return (GLboolean)gl.shared_pal;
   case GL_BLEND: return (GLboolean)gl.blend;
   case GL_ALPHA_TEST: return (GLboolean)gl.atest;
   case GL_DEPTH_TEST: return (GLboolean)gl.dtest;
   case GL_CULL_FACE: return (GLboolean)gl.cull;
   case GL_SCISSOR_TEST: return (GLboolean)gl.scissor;
+  case GL_POLYGON_OFFSET_FILL: return (GLboolean)gl.poffset;
+  case GL_CLIP_PLANE0: return (GLboolean)gl.ucp_on;
   default: return 0;
   }
 }
@@ -3400,7 +5255,15 @@ const GLubyte *APIENTRY glGetString(GLenum name) {
   case GL_VENDOR: return (const GLubyte *)"maxsdk";
   case GL_RENDERER: return (const GLubyte *)"PS2 GS + VU1 (HLSL)";
   case GL_VERSION: return (const GLubyte *)"1.1";
-  default: return (const GLubyte *)"";
+  case GL_EXTENSIONS:
+    return (const GLubyte *)"GL_ARB_multitexture GL_ARB_texture_env_combine GL_EXT_texture_env_combine "
+                            "GL_EXT_compiled_vertex_array GL_EXT_draw_range_elements "
+                            "GL_EXT_multi_draw_arrays GL_IBM_multimode_draw_arrays "
+                            "GL_EXT_paletted_texture GL_EXT_shared_texture_palette "
+                            "GL_OES_compressed_paletted_texture GL_SGIS_generate_mipmap "
+                            "GL_EXT_texture_edge_clamp GL_SGIS_texture_edge_clamp "
+                            "GL_ARB_vertex_buffer_object";
+  default: gl_error(GL_INVALID_ENUM); return (const GLubyte *)"";
   }
 }
 void APIENTRY glFinish(void) {}
@@ -3412,43 +5275,423 @@ void APIENTRY glPolygonMode(GLenum f, GLenum m) {}
 void APIENTRY glLineWidth(GLfloat w) {}
 void APIENTRY glPointSize(GLfloat s) {}
 void APIENTRY glHint(GLenum t, GLenum m) {}
-void APIENTRY glPixelStorei(GLenum p, GLint v) {}
-void APIENTRY glTexParameteriv(GLenum t, GLenum p, const GLint *v) {}
-void APIENTRY glTexParameterfv(GLenum t, GLenum p, const GLfloat *v) {}
-void APIENTRY glFlush(void) {}
-void APIENTRY glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum t,
-                                  GLvoid *px) {
-  memset(px, 0, (size_t)w * (size_t)h * (f == GL_RGB ? 3 : 4));
+void APIENTRY glPixelStorei(GLenum p, GLint v) {
+  if (p == GL_PACK_ALIGNMENT && (v == 1 || v == 2 || v == 4 || v == 8))
+    gl.pack_align = v;
 }
-void APIENTRY glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {}
+void APIENTRY glTexParameteriv(GLenum t, GLenum p, const GLint *v) {
+  if (p != GL_TEXTURE_BORDER_COLOR)
+    glTexParameteri(t, p, v[0]);
+}
+void APIENTRY glTexParameterfv(GLenum t, GLenum p, const GLfloat *v) {
+  if (p != GL_TEXTURE_BORDER_COLOR)
+    glTexParameterf(t, p, v[0]);
+}
+void APIENTRY glTexEnvfv(GLenum t, GLenum p, const GLfloat *v) {
+  if (p != GL_TEXTURE_ENV_COLOR)
+    glTexEnvf(t, p, v[0]);
+}
+void APIENTRY glTexEnviv(GLenum t, GLenum p, const GLint *v) {
+  if (p != GL_TEXTURE_ENV_COLOR)
+    glTexEnvf(t, p, (GLfloat)v[0]);
+}
+GLboolean APIENTRY glIsTexture(GLuint t) { return t && t < MAX_TEX && texs[t].used; }
+/* OpenGL ES 1.1's float forms */
+void APIENTRY glOrthof(GLfloat l, GLfloat r, GLfloat b, GLfloat t, GLfloat n, GLfloat f) {
+  glOrtho(l, r, b, t, n, f);
+}
+void APIENTRY glFrustumf(GLfloat l, GLfloat r, GLfloat b, GLfloat t, GLfloat n, GLfloat f) {
+  glFrustum(l, r, b, t, n, f);
+}
+void APIENTRY glDepthRangef(GLclampf n, GLclampf f) { glDepthRange(n, f); }
+void APIENTRY glClearDepthf(GLclampf d) {}
+void APIENTRY glTexCoord2i(GLint s, GLint t) { glTexCoord2f((GLfloat)s, (GLfloat)t); }
+void APIENTRY glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w) {
+  glVertex3f(x / w, y / w, z / w);
+}
+void APIENTRY glLoadMatrixd(const GLdouble *m) {
+  float f[16];
+  for (int i = 0; i < 16; i++)
+    f[i] = (float)m[i];
+  glLoadMatrixf(f);
+}
+void APIENTRY glMultMatrixd(const GLdouble *m) {
+  float f[16];
+  for (int i = 0; i < 16; i++)
+    f[i] = (float)m[i];
+  glMultMatrixf(f);
+}
+void APIENTRY glFlush(void) {}
+/* The pixels of the frame being drawn (or the last one, between frames):
+   what the stream has so far is drawn first (mx_frame_sync; slow: the EE
+   waits for the GS), then read back line by line. GL_RGB, GL_RGBA (bytes)
+   and GL_DEPTH_COMPONENT (GL_FLOAT, GL_UNSIGNED_INT, _SHORT, _BYTE), in the
+   window's coordinates (mxgl_window), lines GL_PACK_ALIGNMENT apart.
+   Not in 1080i (the passes own the buffer): zeros. */
+static u32 rp_line[1920] MX_ALIGNED(64);
+void APIENTRY glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum t,
+                           GLvoid *px) {
+  int depth = f == GL_DEPTH_COMPONENT;
+  int nc = f == GL_RGB ? 3 : f == GL_RGBA ? 4 : 1;
+  int bpc = !depth || t == GL_UNSIGNED_BYTE ? 1 : t == GL_UNSIGNED_SHORT ? 2 : 4;
+  if ((!depth && f != GL_RGB && f != GL_RGBA) || (!depth && t != GL_UNSIGNED_BYTE) || w < 0 || h < 0) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  u32 line = ((u32)(w * nc * bpc) + (u32)gl.pack_align - 1) & ~((u32)gl.pack_align - 1);
+  memset(px, 0, line * (u32)h);
+  if (beam || !w || !h)
+    return;
+  pq_flush();
+  if (in_frame)
+    flush_out();
+  if (mx_frame_sync() < 0)
+    return;
+  /* the frame's colour buffer (between frames: the last one's), the Z buffer */
+  const struct mx_rt *rtb = &rt[buf];
+  u32 bp = depth ? MX_GS_PAGE(rtb->zbp) : MX_GS_PAGE(rtb->fbp);
+  /* Z24 read as Z32 (the same layout): a 24-bit transfer sends 3 bytes a pixel */
+  u32 psm = depth ? (rtb->zpsm == MX_GS_PSM_Z24 ? MX_GS_PSM_Z32 : rtb->zpsm) : rtb->psm;
+  int last_fy = -1;
+  for (int j = 0; j < h; j++) {
+    /* GL's y is up from the bottom of the window */
+    int gy = y + j, fy = (gl_h - 1 - gy) * fb_h / gl_h;
+    if (gy < 0 || gy >= gl_h || fy < 0 || fy >= fb_h)
+      continue;
+    if (fy != last_fy && mx_gs_download(rp_line, bp, rtb->fbw, psm, 0, (u32)fy, (u32)fb_w, 1) < 0)
+      break;
+    last_fy = fy;
+    u8 *d = (u8 *)px + (u32)j * line;
+    for (int i = 0; i < w; i++) {
+      int gx = x + i, fx = gx * fb_w / gl_w;
+      if (gx < 0 || gx >= gl_w || fx < 0 || fx >= fb_w)
+        continue;
+      if (depth) {
+        /* GS Z is (1 - depth) of its range (make_mvp) */
+        u32 z = rp_line[fx] & (psm == MX_GS_PSM_Z24 || psm == MX_GS_PSM_Z32 ? 0xFFFFFFu : 0xFFFFu);
+        float zm = zmax * 16.0f + 15.0f, dv = 1.0f - (float)z / zm;
+        if (t == GL_FLOAT)
+          memcpy(d + 4 * i, &dv, 4);
+        else if (t == GL_UNSIGNED_INT)
+          ((u32 *)d)[i] = (u32)(dv * 4294967295.0f);
+        else if (t == GL_UNSIGNED_SHORT)
+          ((u16 *)d)[i] = (u16)(dv * 65535.0f);
+        else
+          d[i] = (u8)(dv * 255.0f);
+      } else {
+        u32 p = ((const u16 *)rp_line)[fx];
+        u8 *o = d + nc * i;
+        u32 r = p & 31, g = p >> 5 & 31, b = p >> 10 & 31;
+        o[0] = (u8)(r << 3 | r >> 2), o[1] = (u8)(g << 3 | g >> 2), o[2] = (u8)(b << 3 | b >> 2);
+        if (nc == 4)
+          o[3] = 255;
+      }
+    }
+  }
+}
+void APIENTRY glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+  /* FBMSK: the bits not written, of the colour before it is made 16 bits */
+  u32 m = (r ? 0 : 0xFFu) | (g ? 0 : 0xFF00u) | (b ? 0 : 0xFF0000u) | (a ? 0 : 0xFF000000u);
+  if (m != gl.cmask) {
+    pq_flush();
+    st_serial++;
+  }
+  gl.cmask = m;
+}
 void APIENTRY glStencilFunc(GLenum f, GLint r, GLuint m) {}
 void APIENTRY glStencilOp(GLenum a, GLenum b, GLenum c) {}
 void APIENTRY glStencilMask(GLuint m) {}
 void APIENTRY glClearStencil(GLint s) {}
 void APIENTRY glClearDepth(GLclampd d) {}
-void APIENTRY glPolygonOffset(GLfloat a, GLfloat b) {}
-void APIENTRY glClipPlane(GLenum p, const GLdouble *e) {}
-void APIENTRY glLockArraysEXT(GLint first, GLsizei count) {}
-void APIENTRY glUnlockArraysEXT(void) {}
-void APIENTRY glActiveTextureARB(GLenum t) { gl.cunit = t == GL_TEXTURE0_ARB ? 0 : 1; }
-void APIENTRY glClientActiveTextureARB(GLenum t) {}
-void APIENTRY glMultiTexCoord2fARB(GLenum t, GLfloat s, GLfloat tt) {}
+void APIENTRY glPolygonOffset(GLfloat factor, GLfloat units) {
+  if (factor != gl.pofactor || units != gl.pounits) {
+    pq_flush();
+    mat_serial++;
+  }
+  gl.pofactor = factor, gl.pounits = units;
+}
+/* the plane in eye space: e times the inverse of the modelview of now */
+static void clip_plane(GLenum p, const float *e) {
+  if (p != GL_CLIP_PLANE0) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  pq_flush();
+  mat_serial++;
+  float inv[16];
+  if (!mat_inverse(inv, gl.mv[gl.mv_top]))
+    return;
+  for (int c = 0; c < 4; c++)
+    gl.ucp_eye[c] = e[0] * inv[4 * c] + e[1] * inv[4 * c + 1] + e[2] * inv[4 * c + 2] + e[3] * inv[4 * c + 3];
+}
+void APIENTRY glClipPlane(GLenum p, const GLdouble *e) {
+  float f[4] = {(float)e[0], (float)e[1], (float)e[2], (float)e[3]};
+  clip_plane(p, f);
+}
+void APIENTRY glClipPlanef(GLenum p, const GLfloat *e) { clip_plane(p, e); }
+void APIENTRY glLockArraysEXT(GLint first, GLsizei count) {
+  lk.on = 1;
+  lk.valid = 0;
+}
+void APIENTRY glUnlockArraysEXT(void) { lk.on = lk.valid = 0; }
+/* GL_EXT_paletted_texture, GL_EXT_shared_texture_palette: a palette of up
+   to 256 colours (GL_RGB, GL_RGBA bytes) for GL_COLOR_INDEX textures: the
+   shared one (whose RGB textures are also kept as its indices: 8 bits,
+   exact), or the bound texture's (for its next GL_COLOR_INDEX texels) */
+void APIENTRY glColorTableEXT(GLenum target, GLenum ifmt, GLsizei width, GLenum format, GLenum type,
+                              const GLvoid *table) {
+  int nc = format == GL_RGBA ? 4 : format == GL_RGB ? 3 : 0;
+  if (!nc || type != GL_UNSIGNED_BYTE || width <= 0 || width > 256 || !table) {
+    gl_error(!nc || type != GL_UNSIGNED_BYTE ? GL_INVALID_ENUM : GL_INVALID_VALUE);
+    return;
+  }
+  const u8 *c = table;
+  u8 rgba[256][4];
+  memset(rgba, 0, sizeof rgba);
+  for (int i = 0; i < width; i++, c += nc)
+    rgba[i][0] = c[0], rgba[i][1] = c[1], rgba[i][2] = c[2], rgba[i][3] = nc == 4 ? c[3] : 255;
+  if (target == GL_SHARED_TEXTURE_PALETTE_EXT) {
+    u8 rgb[256 * 3];
+    for (int i = 0; i < 256; i++)
+      memcpy(rgb + 3 * i, rgba[i], 3);
+    pq_flush();
+    mxgl_Palette(rgb);
+    memcpy(pal_rgba, rgba, sizeof rgba);
+    return;
+  }
+  GLuint b = TBOUND;
+  if (target != GL_TEXTURE_2D || !b || b >= MAX_TEX) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  if (!texs[b].ipal && !(texs[b].ipal = malloc(1024))) {
+    gl_error(GL_OUT_OF_MEMORY);
+    return;
+  }
+  memcpy(texs[b].ipal, rgba, sizeof rgba);
+}
+void APIENTRY glColorTable(GLenum target, GLenum ifmt, GLsizei width, GLenum format, GLenum type,
+                           const GLvoid *table) {
+  glColorTableEXT(target, ifmt, width, format, type, table);
+}
+
+/* GL_OES_compressed_paletted_texture: a palette (16 or 256 colours) and the
+   texels' indices (4 or 8 bits; two a byte, the first in the high bits),
+   level 0 and, for a level of -n, n levels after it, each half the size.
+   Kept as they are: T8 with the texture's own CLUT (as GS memory takes it,
+   a 4-bit texture's indices made bytes), the levels given (none made). */
+static int oes_pal(GLenum f, int *bits, int *eb) {
+  if (f < GL_PALETTE4_RGB8_OES || f > GL_PALETTE8_RGB5_A1_OES)
+    return 0;
+  int k = (int)(f - GL_PALETTE4_RGB8_OES);
+  *bits = k < 5 ? 4 : 8;
+  static const int ebytes[5] = {3, 4, 2, 2, 2};
+  *eb = ebytes[k % 5];
+  return 1;
+}
+static void oes_entry(GLenum f, const u8 *e, u8 *o) {
+  u32 v = (u32)e[0] | (u32)e[1] << 8;
+  switch ((f - GL_PALETTE4_RGB8_OES) % 5) {
+  case 0: o[0] = e[0], o[1] = e[1], o[2] = e[2], o[3] = 255; break;
+  case 1: o[0] = e[0], o[1] = e[1], o[2] = e[2], o[3] = e[3]; break;
+  case 2: /* R5 G6 B5 */
+    o[0] = (u8)((v >> 11) * 255 / 31), o[1] = (u8)((v >> 5 & 63) * 255 / 63), o[2] = (u8)((v & 31) * 255 / 31);
+    o[3] = 255;
+    break;
+  case 3: /* R4 G4 B4 A4 */
+    o[0] = (u8)((v >> 12) * 17), o[1] = (u8)((v >> 8 & 15) * 17), o[2] = (u8)((v >> 4 & 15) * 17);
+    o[3] = (u8)((v & 15) * 17);
+    break;
+  default: /* R5 G5 B5 A1 */
+    o[0] = (u8)((v >> 11) * 255 / 31), o[1] = (u8)((v >> 6 & 31) * 255 / 31), o[2] = (u8)((v >> 1 & 31) * 255 / 31);
+    o[3] = v & 1 ? 255 : 0;
+    break;
+  }
+}
+
+void APIENTRY glCompressedTexImage2D(GLenum target, GLint level, GLenum ifmt, GLsizei w, GLsizei h,
+                                     GLint border, GLsizei bytes, const GLvoid *data) {
+  pq_flush();
+  tex_serial++;
+  int bits, eb;
+  GLuint b = TBOUND;
+  if (target != GL_TEXTURE_2D || !oes_pal(ifmt, &bits, &eb)) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  if (level > 0 || border || w <= 0 || h <= 0 || !data) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  if (!b || b >= MAX_TEX)
+    return;
+  int npal = bits == 4 ? 16 : 256, nlev = 1 - level;
+  const u8 *p = data, *end = p + bytes;
+  u8 pal[256][4];
+  memset(pal, 0, sizeof pal);
+  if (p + npal * eb > end) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  int alpha = 0;
+  for (int i = 0; i < npal; i++, p += eb) {
+    oes_entry(ifmt, p, pal[i]);
+    alpha |= pal[i][3] != 255;
+  }
+  struct tex *t = &texs[b];
+  /* sides that are not powers of two, or below 8: as RGBA (scaled) */
+  if (w < 8 || h < 8 || (w & (w - 1)) || (h & (h - 1))) {
+    u8 *rgba = malloc((size_t)w * (size_t)h * 4);
+    if (!rgba)
+      return;
+    for (int i = 0; i < w * h; i++) {
+      int ix = bits == 8 ? p[i] : (p[i / 2] >> (i & 1 ? 0 : 4)) & 15;
+      memcpy(rgba + 4 * i, pal[ix], 4);
+    }
+    tex_image_2d(GL_TEXTURE_2D, 0, alpha ? GL_RGBA : GL_RGB, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    free(rgba);
+    return;
+  }
+  tex_drop_twin(t);
+  tex_brightness = 0;
+  tex_set_image(t, GL_COLOR_INDEX8_EXT, w, h, NULL); /* frees the old texels and CLUT */
+  tex_free_mem(t);
+  t->psm = MX_GS_PSM_T8;
+  t->pal = 0, t->bright = 0;
+  t->alpha = alpha;
+  t->alpha_fmt = ifmt == GL_PALETTE4_RGBA8_OES || ifmt == GL_PALETTE8_RGBA8_OES ||
+                 ifmt == GL_PALETTE4_RGBA4_OES || ifmt == GL_PALETTE8_RGBA4_OES ||
+                 ifmt == GL_PALETTE4_RGB5_A1_OES || ifmt == GL_PALETTE8_RGB5_A1_OES;
+  /* the levels given, down to 8 x 8 */
+  u32 nl = 0;
+  while ((int)nl < nlev && nl < t->max_levels)
+    nl++;
+  u32 max = t->max_levels;
+  t->max_levels = (u8)(nl ? nl : 1);
+  int bad = tex_alloc_mem(t, 1024) < 0;
+  t->max_levels = (u8)max;
+  if (bad) {
+    gl_error(GL_OUT_OF_MEMORY);
+    return;
+  }
+  for (u32 lv = 0; lv < nl; lv++) {
+    u32 n = (t->w >> lv) * (t->h >> lv), nb = bits == 8 ? n : (n + 1) / 2;
+    if (p + nb > end) {
+      nl = lv;
+      break;
+    }
+    u8 *d = TLV(t, lv);
+    for (u32 i = 0; i < n; i++)
+      d[i] = bits == 8 ? p[i] : (u8)((p[i / 2] >> (i & 1 ? 0 : 4)) & 15);
+    p += nb;
+  }
+  t->levels = nl ? nl : 1;
+  for (u32 i = 0; i < 256; i++)
+    t->oclut[csm1(i)] = (u32)pal[i][0] | (u32)pal[i][1] << 8 | (u32)pal[i][2] << 16 |
+                        (u32)((pal[i][3] + 1u) >> 1) << 24;
+  tex_writeback(t);
+  tex_new_gen(t); /* new texels: a new key */
+}
+void APIENTRY glCompressedTexImage2DARB(GLenum target, GLint level, GLenum ifmt, GLsizei w,
+                                        GLsizei h, GLint border, GLsizei bytes, const GLvoid *data) {
+  glCompressedTexImage2D(target, level, ifmt, w, h, border, bytes, data);
+}
+
+/* glPushAttrib .. glPopAttrib: the state of the draws (what display lists
+   keep: enables, blend, alpha and depth tests, culling, the bound texture
+   and its environment, colour mask, polygon offset), the scissor, the clip
+   plane's enable, unit 1's texture; the mask is not looked at (all of it) */
+#define ATTRIB_DEPTH 8
+static struct {
+  struct dl_state st;
+  int scissor, sc[4], ucp_on, env_combine[2], env_scale[2], env_legacy;
+  GLenum env_combine_rgb[2];
+  int u1_tex2d;
+  GLuint u1_bound;
+  GLenum u1_texenv;
+} attrib[ATTRIB_DEPTH];
+static int attrib_n;
+void APIENTRY glPushAttrib(GLbitfield mask) {
+  (void)mask;
+  if (attrib_n == ATTRIB_DEPTH) {
+    gl_error(GL_STACK_OVERFLOW);
+    return;
+  }
+  typeof(attrib[0]) *a = &attrib[attrib_n++];
+  dl_get_state(&a->st);
+  a->scissor = gl.scissor, memcpy(a->sc, gl.sc, sizeof a->sc), a->ucp_on = gl.ucp_on;
+  memcpy(a->env_combine, env_combine, sizeof env_combine);
+  memcpy(a->env_scale, env_scale, sizeof env_scale);
+  memcpy(a->env_combine_rgb, env_combine_rgb, sizeof env_combine_rgb);
+  a->env_legacy = env_legacy;
+  a->u1_tex2d = gl.u1.tex2d, a->u1_bound = gl.u1.bound, a->u1_texenv = gl.u1.texenv;
+}
+void APIENTRY glPopAttrib(void) {
+  if (!attrib_n) {
+    gl_error(GL_STACK_UNDERFLOW);
+    return;
+  }
+  typeof(attrib[0]) *a = &attrib[--attrib_n];
+  dl_set_state(&a->st);
+  if (gl.scissor != a->scissor || memcmp(gl.sc, a->sc, sizeof a->sc))
+    st_serial++;
+  gl.scissor = a->scissor, memcpy(gl.sc, a->sc, sizeof a->sc);
+  if (gl.ucp_on != a->ucp_on)
+    mat_serial++;
+  gl.ucp_on = a->ucp_on;
+  memcpy(env_combine, a->env_combine, sizeof env_combine);
+  memcpy(env_scale, a->env_scale, sizeof env_scale);
+  memcpy(env_combine_rgb, a->env_combine_rgb, sizeof env_combine_rgb);
+  env_legacy = a->env_legacy;
+  gl.u1.tex2d = a->u1_tex2d, gl.u1.bound = a->u1_bound, gl.u1.texenv = a->u1_texenv;
+  /* the shift as it was (dl_set_state's), not made again from the env */
+}
+
+/* GL_ARB_multitexture: two units */
+void APIENTRY glActiveTexture(GLenum t) {
+  if (t != GL_TEXTURE0 && t != GL_TEXTURE1) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  gl.cunit = t == GL_TEXTURE1;
+}
+void APIENTRY glActiveTextureARB(GLenum t) { glActiveTexture(t); }
+void APIENTRY glClientActiveTexture(GLenum t) {
+  if (t != GL_TEXTURE0 && t != GL_TEXTURE1) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  gl.ccunit = t == GL_TEXTURE1;
+}
+void APIENTRY glClientActiveTextureARB(GLenum t) { glClientActiveTexture(t); }
+void APIENTRY glMultiTexCoord2f(GLenum t, GLfloat s, GLfloat tt) {
+  if (t == GL_TEXTURE1 && !imm.st1 && !(imm.st1 = malloc(IMM_MAX * sizeof *imm.st1))) {
+    gl_error(GL_OUT_OF_MEMORY);
+    return;
+  }
+  float *c = t == GL_TEXTURE1 ? imm.cur_st1 : imm.cur_st;
+  c[0] = s, c[1] = tt;
+}
+void APIENTRY glMultiTexCoord2fARB(GLenum t, GLfloat s, GLfloat tt) { glMultiTexCoord2f(t, s, tt); }
+void APIENTRY glMultiTexCoord2fv(GLenum t, const GLfloat *v) { glMultiTexCoord2f(t, v[0], v[1]); }
+void APIENTRY glMultiTexCoord2fvARB(GLenum t, const GLfloat *v) { glMultiTexCoord2f(t, v[0], v[1]); }
 
 /* ---- set-up ----------------------------------------------------------- */
 
 
 static int mode_set = -1; /* mxgl_mode: none yet */
+static int mode_want;     /* the flags asked for with it */
 
-/* the frame pipeline in SD: NTSC or PAL interlaced FIELD mode, two CT16S
-   buffers and a Z24 */
-static int start_sd(int pal) {
-  if (mx_gs_init_video(pal ? &mx_video_pal : &mx_video_ntsc) < 0)
+/* without beam racing: video mode m, two CT16S buffers of w x h and a Z
+   buffer of zpsm */
+static int start_buffers(const struct mx_video_mode *m, int w, int h, u32 zpsm) {
+  if (mx_gs_init_video(m) < 0)
     return -1;
-  fb_w = 640, fb_h = pal ? 512 : 448;
-  u32 zbp = mx_vram_alloc(mx_rt_pages(fb_w, fb_h, MX_GS_PSM_Z24));
+  fb_w = w, fb_h = h;
+  u32 zbp = mx_vram_alloc(mx_rt_pages((u32)w, (u32)h, zpsm));
   for (int j = 0; j < 2; j++) {
-    u32 fbp = mx_vram_alloc(mx_rt_pages(fb_w, fb_h, MX_GS_PSM_CT16S));
-    mx_rt_init(&rt[j], fbp, fb_w, fb_h, MX_GS_PSM_CT16S, zbp, MX_GS_PSM_Z24);
+    u32 fbp = mx_vram_alloc(mx_rt_pages((u32)w, (u32)h, MX_GS_PSM_CT16S));
+    mx_rt_init(&rt[j], fbp, (u32)w, (u32)h, MX_GS_PSM_CT16S, zbp, zpsm);
     mx_display_init(&disp[j], &rt[j]);
   }
   mx_gs_displays(disp, 2);
@@ -3457,99 +5700,150 @@ static int start_sd(int pal) {
   mx_frame_init_chain(ring, sizeof ring, (void *)0x70002000, 0x2000);
   /* frames as fast as they are made (the screen tears): the real rate */
   mx_frame_vsync(0);
-  hires = 0;
-  zmax = ZMAX_SD;
+  beam = rgb24 = 0;
+  zmax = zpsm == MX_GS_PSM_Z16S || zpsm == MX_GS_PSM_Z16 ? ZMAX_Z16 : ZMAX_Z24;
   return 0;
 }
 
-/* hires: the records of the frame stream (each played every field until
-   the next replaces it) and arenas 2, 3, taken while it is on */
-static int start_hires(void) {
+/* beam racing (maxsdk's passes, <mx/hires.h>): video mode m in interlaced
+   FRAME mode, one buffer of w x h (a field: both fields' lines, half a line
+   apart) in psm, Z (16 bits; Z32 for 32-bit colour) in the passes' strips;
+   the records of the frame stream (each played every field until the next
+   replaces it) and arenas 2, 3 are taken while it is on */
+static int start_beam(const struct mx_video_mode *m, int w, int h, u32 psm) {
   if (!hires_mem)
-    hires_mem = mx_core_alloc(REC_BYTES + 2 * ARENA_BYTES, 64);
+    hires_mem = mx_heap_alloc(gl_stream, REC_BYTES + 2 * ARENA_BYTES, 64);
   if (!hires_mem)
     return -1;
   mx_vu_reset(2);
-  if (mx_hires_init(&mx_video_1080i, 1920, 540, MX_GS_PSM_CT16S, hires_mem, REC_BYTES,
-                    (void *)0x70002000, 0x2000) < 0)
+  if (mx_hires_init(m, (u32)w, (u32)h, psm, hires_mem, REC_BYTES, (void *)0x70002000, 0x2000) < 0)
     return -1;
-  fb_w = 1920, fb_h = 540;
+  fb_w = w, fb_h = h;
   for (int i = 2; i < NARENA; i++) {
     arena[i] = hires_mem + REC_BYTES + (u32)(i - 2) * ARENA_BYTES;
     mx_dcache_invalidate(arena[i], ARENA_BYTES);
   }
-  hires = 1;
-  zmax = ZMAX_HIRES;
+  beam = 1;
+  rgb24 = psm == MX_GS_PSM_CT32 || psm == MX_GS_PSM_CT24;
+  zmax = rgb24 ? ZMAX_Z24 : ZMAX_Z16;
   return 0;
 }
 
 static void hires_free(void) {
-  mx_core_free(hires_mem);
+  mx_heap_free(gl_stream, hires_mem);
   hires_mem = NULL;
   arena[2] = arena[3] = NULL;
 }
 
+/* 1080i without beam racing: 640 x 540 shown by both fields (FRAME mode),
+   stretched to 1920 x 1080 */
+static struct mx_video_mode video_1080i_frame;
+
+static int mode_flags; /* MXGL_BEAM, MXGL_RGB24 in effect */
+
+/* the mode's picture: with beam racing if asked (and memory allows), else
+   two buffers; returns 0, or -1 for beam racing not set */
+static int start_mode(int mode, int flags) {
+  int pal = mode == MXGL_PAL, hd = mode == MXGL_1080I;
+  if (flags & MXGL_BEAM) {
+    /* SD: 640 x 224 / 256 a field; 32-bit colour fits only there */
+    int ok = hd ? start_beam(&mx_video_1080i, 1920, 540, MX_GS_PSM_CT16S)
+                : start_beam(pal ? &mx_video_pal : &mx_video_ntsc, 640, pal ? 256 : 224,
+                             flags & MXGL_RGB24 ? MX_GS_PSM_CT24 : MX_GS_PSM_CT16S);
+    if (ok == 0) {
+      mode_flags = MXGL_BEAM | (rgb24 ? MXGL_RGB24 : 0);
+      scr_w = hd ? 1920 : 640, scr_h = 2 * fb_h;
+      return 0;
+    }
+    mx_printf("mxgl: no beam racing (memory %p)\n", hires_mem);
+  }
+  hires_free();
+  mode_flags = 0;
+  if (hd) {
+    video_1080i_frame = mx_video_1080i;
+    video_1080i_frame.ffmd = 1;
+    /* Z16: the room for textures as with beam racing (Z24: 1.3 MiB) */
+    start_buffers(&video_1080i_frame, 640, 540, MX_GS_PSM_Z16S);
+    scr_w = 1920, scr_h = 1080;
+  } else {
+    start_buffers(pal ? &mx_video_pal : &mx_video_ntsc, 640, pal ? 512 : 448, MX_GS_PSM_Z24);
+    scr_w = fb_w, scr_h = fb_h;
+  }
+  return flags & MXGL_BEAM ? -1 : 0;
+}
+
 int mxgl_set_mode(int mode) {
+  int flags = mode & (MXGL_BEAM | MXGL_RGB24);
+  mode &= 0xFF;
   if (mode == MXGL_SD)
     mode = mx_video_default() == &mx_video_pal ? MXGL_PAL : MXGL_NTSC;
-  if (mode == mode_set)
+  if (mode == mode_set && flags == mode_want)
     return 0;
   if (mode_set >= 0) {
-    /* the frames sent are shown (SD) or the passes stopped (hires), then
-       the pipeline starts again in the new mode */
+    /* the frames sent are shown (two buffers) or the passes stopped (beam
+       racing), then the pipeline starts again in the new mode */
     pq_flush();
     if (in_frame)
       mxgl_end_frame();
     u32 t0 = mx_count();
-    while (!hires && mx_gs.shown != mx_gs.frames && mx_count() - t0 < MX_EE_HZ)
+    while (!beam && mx_gs.shown != mx_gs.frames && mx_count() - t0 < MX_EE_HZ)
       ;
     mx_frame_stop();
     /* no frame reads anything now: what was freed goes (the room for
-       1080i, after a game freed its textures for a mode change) */
+       beam racing, after a game freed its textures for a mode change) */
     for (int k = 0; k < NDEFER; k++) {
       for (int i = 0; i < ndeferred[k]; i++)
-        mx_core_free(deferred[k][i]);
+        gl_free(deferred[k][i]);
       ndeferred[k] = 0;
     }
   }
-  int r = 0;
-  if (mode == MXGL_1080I) {
-    if (start_hires() < 0) {
-      mx_printf("mxgl: no 1080i (memory %p)\n", hires_mem);
-      hires_free();
-      r = -1;
-      mode = mode_set == MXGL_PAL ? MXGL_PAL : MXGL_NTSC;
-    }
-  }
-  if (mode != MXGL_1080I) {
-    hires_free();
-    start_sd(mode == MXGL_PAL);
-  }
-  mode_set = mode;
+  int r = start_mode(mode, flags);
+  mode_set = mode, mode_want = flags;
   frame_par = 0;
-  mx_printf("mxgl: %s %ux%u\n", mode == MXGL_1080I ? "1080i" : mode == MXGL_PAL ? "PAL" : "NTSC", fb_w,
-            fb_h);
+  mx_printf("mxgl: %s %ux%u%s%s, buffer %ux%u\n",
+            mode == MXGL_1080I ? "1080i" : mode == MXGL_PAL ? "PAL" : "NTSC", scr_w, scr_h,
+            beam ? ", beam racing" : "", rgb24 ? ", 24-bit colour" : "", fb_w, fb_h);
   /* the HUD's font (256 x 8) in the first page after the buffers, the
-     CLUTs after it, then the textures: all copied in again */
+     CLUTs after it (pages of libgl's own), then the textures (the cache,
+     in the pages left): all copied in again */
   mx_gs.w = (u32)fb_w, mx_gs.h = (u32)fb_h; /* the HUD's coordinates */
   mx_hud_init(mx_gs.tbp, (u32)fb_h);
   clut_cbp = mx_gs.tbp + mx_tex_blocks(256, 8, MX_GS_PSM_CT32);
-  vram_lo = vram_pos = clut_cbp + 4 * (NCLUT + 1); /* and the palette's */
+  vram_lo = clut_cbp + 4 * (NCLUT + 1); /* and the palette's */
+  u32 p0 = mx_gs.tbp / 32, p1 = (vram_lo + 31) / 32;
+  if (mx_vram_take(p0, p1 - p0, MX_VRAM_APP) < 0)
+    mx_printf("mxgl: GS memory for the font and CLUTs taken\n");
+  vram_lo = p1 * 32;
+  /* beam racing: uploads go in the once records (PATH3), ahead of the
+     passes of the frames before: only what the GS is done with goes */
+#ifndef MXGL_VCACHE_POLICY
+#define MXGL_VCACHE_POLICY MX_VCACHE_AUTO
+#endif
+  mx_vcache_init(0, beam ? MX_VCACHE_ASYNC : MX_VCACHE_STREAM, MXGL_VCACHE_POLICY);
+  /* the top bytes no drawing writes (24-bit colour strips, a Z24 buffer):
+     8-bit textures as T8H (the cache gives mt.psm) */
+  u32 hp = 0, hn = 0;
+  if (beam)
+    hn = mx_hires_hbyte(&hp);
+  else if (rt[0].zpsm == MX_GS_PSM_Z24)
+    hp = rt[0].zbp, hn = mx_rt_pages((u32)fb_w, (u32)fb_h, MX_GS_PSM_Z24);
+  mx_vcache_hpages(hp, hn);
+  h_blocks = hn * 32;
   vram_gen++;
   gs.valid = 0, gs_serial++;
-  /* the lists' draws have the state of the mode they were made in */
-  dl_dirty = 1;
-  mxgl_window(fb_w, hires ? 1080 : fb_h);
+  mxgl_window(scr_w, scr_h);
   return r;
 }
+
+int mxgl_mode_flags(void) { return mode_flags; }
 
 int mxgl_mode(void) { return mode_set; }
 
 
 
 void mxgl_screen(int *w, int *h) {
-  *w = fb_w;
-  *h = hires ? 1080 : fb_h;
+  *w = scr_w;
+  *h = scr_h;
 }
 
 void mxgl_init(void) {
@@ -3557,9 +5851,13 @@ void mxgl_init(void) {
   if (done)
     return;
   done = 1;
+  gl_heap = mx_heap_create("gl", MX_MEM_PINNED, 0);
+  gl_stream = mx_heap_create("gl.stream", MX_MEM_STREAM, 0);
+  if (mx_vm_active())
+    gl_assets = mx_heap_create("gl.textures", MX_MEM_ASSET, GL_ASSET_BYTES);
   shader = MX_VU_SHADER(MXGLV, mxglv_vu, mxglv_vu_end);
   for (int i = 0; i < 2; i++) {
-    arena[i] = mx_core_alloc(ARENA_BYTES, 64);
+    arena[i] = mx_heap_alloc(gl_stream, ARENA_BYTES, 64);
     /* written through UCAB only: no line of them may be in the cache */
     if (arena[i])
       mx_dcache_invalidate(arena[i], ARENA_BYTES);
@@ -3569,10 +5867,13 @@ void mxgl_init(void) {
   clut_make();
   mxgl_set_mode(MXGL_SD);
   memset(&gl, 0, sizeof gl);
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < MV_DEPTH; i++)
     mat_ident(gl.mv[i]);
-  for (int i = 0; i < 4; i++)
+  for (int i = 0; i < PR_DEPTH; i++)
     mat_ident(gl.pr[i]);
+  for (int i = 0; i < TM_DEPTH; i++)
+    mat_ident(gl.tm[i]);
+  gl.pack_align = 4;
   gl.mode = GL_MODELVIEW;
   gl.vp[2] = gl_w, gl.vp[3] = gl_h; /* the window of mxgl_set_mode */
   gl.df = 1;
@@ -3600,8 +5901,8 @@ void mxgl_frame_done(void) {
 }
 
 int mxgl_screenshot(const char *path) {
-  /* hires: both fields, 1920 x 1080 */
-  if (hires)
+  /* beam racing: both fields (1920 x 1080, 640 x 448 / 512) */
+  if (beam)
     return mx_hires_save_tga(path);
   /* the last frame on the screen, then the pipeline stopped (as the
      tutorials' tut_screenshot); its CT16S buffer as a 24-bit TGA */
@@ -3631,4 +5932,164 @@ int mxgl_screenshot(const char *path) {
   }
   mx_fio_close(fd);
   return 0;
+}
+
+/* ---- mxglGetProcAddress ---------------------------------------------------- */
+
+/* every GL call of libgl by name (the extensions' too), in strcmp order */
+static const struct {
+  const char *name;
+  void (*fn)(void);
+} procs[] = {
+    {"glActiveTexture", (void (*)(void))glActiveTexture},
+    {"glActiveTextureARB", (void (*)(void))glActiveTextureARB},
+    {"glAlphaFunc", (void (*)(void))glAlphaFunc},
+    {"glArrayElement", (void (*)(void))glArrayElement},
+    {"glBegin", (void (*)(void))glBegin},
+    {"glBindBuffer", (void (*)(void))glBindBuffer},
+    {"glBindBufferARB", (void (*)(void))glBindBufferARB},
+    {"glBindTexture", (void (*)(void))glBindTexture},
+    {"glBlendFunc", (void (*)(void))glBlendFunc},
+    {"glBufferData", (void (*)(void))glBufferData},
+    {"glBufferDataARB", (void (*)(void))glBufferDataARB},
+    {"glBufferSubData", (void (*)(void))glBufferSubData},
+    {"glBufferSubDataARB", (void (*)(void))glBufferSubDataARB},
+    {"glCallList", (void (*)(void))glCallList},
+    {"glClear", (void (*)(void))glClear},
+    {"glClearColor", (void (*)(void))glClearColor},
+    {"glClearDepth", (void (*)(void))glClearDepth},
+    {"glClearDepthf", (void (*)(void))glClearDepthf},
+    {"glClearStencil", (void (*)(void))glClearStencil},
+    {"glClientActiveTexture", (void (*)(void))glClientActiveTexture},
+    {"glClientActiveTextureARB", (void (*)(void))glClientActiveTextureARB},
+    {"glClipPlane", (void (*)(void))glClipPlane},
+    {"glClipPlanef", (void (*)(void))glClipPlanef},
+    {"glColor3f", (void (*)(void))glColor3f},
+    {"glColor3fv", (void (*)(void))glColor3fv},
+    {"glColor3ub", (void (*)(void))glColor3ub},
+    {"glColor3ubv", (void (*)(void))glColor3ubv},
+    {"glColor4f", (void (*)(void))glColor4f},
+    {"glColor4fv", (void (*)(void))glColor4fv},
+    {"glColor4ub", (void (*)(void))glColor4ub},
+    {"glColor4ubv", (void (*)(void))glColor4ubv},
+    {"glColorMask", (void (*)(void))glColorMask},
+    {"glColorPointer", (void (*)(void))glColorPointer},
+    {"glColorTable", (void (*)(void))glColorTable},
+    {"glColorTableEXT", (void (*)(void))glColorTableEXT},
+    {"glCompressedTexImage2D", (void (*)(void))glCompressedTexImage2D},
+    {"glCompressedTexImage2DARB", (void (*)(void))glCompressedTexImage2DARB},
+    {"glCullFace", (void (*)(void))glCullFace},
+    {"glDeleteBuffers", (void (*)(void))glDeleteBuffers},
+    {"glDeleteBuffersARB", (void (*)(void))glDeleteBuffersARB},
+    {"glDeleteLists", (void (*)(void))glDeleteLists},
+    {"glDeleteTextures", (void (*)(void))glDeleteTextures},
+    {"glDepthFunc", (void (*)(void))glDepthFunc},
+    {"glDepthMask", (void (*)(void))glDepthMask},
+    {"glDepthRange", (void (*)(void))glDepthRange},
+    {"glDepthRangef", (void (*)(void))glDepthRangef},
+    {"glDisable", (void (*)(void))glDisable},
+    {"glDisableClientState", (void (*)(void))glDisableClientState},
+    {"glDrawArrays", (void (*)(void))glDrawArrays},
+    {"glDrawBuffer", (void (*)(void))glDrawBuffer},
+    {"glDrawElements", (void (*)(void))glDrawElements},
+    {"glDrawRangeElements", (void (*)(void))glDrawRangeElements},
+    {"glDrawRangeElementsEXT", (void (*)(void))glDrawRangeElementsEXT},
+    {"glEnable", (void (*)(void))glEnable},
+    {"glEnableClientState", (void (*)(void))glEnableClientState},
+    {"glEnd", (void (*)(void))glEnd},
+    {"glEndList", (void (*)(void))glEndList},
+    {"glFinish", (void (*)(void))glFinish},
+    {"glFlush", (void (*)(void))glFlush},
+    {"glFrustum", (void (*)(void))glFrustum},
+    {"glFrustumf", (void (*)(void))glFrustumf},
+    {"glGenBuffers", (void (*)(void))glGenBuffers},
+    {"glGenBuffersARB", (void (*)(void))glGenBuffersARB},
+    {"glGenLists", (void (*)(void))glGenLists},
+    {"glGenTextures", (void (*)(void))glGenTextures},
+    {"glGetBooleanv", (void (*)(void))glGetBooleanv},
+    {"glGetError", (void (*)(void))glGetError},
+    {"glGetFloatv", (void (*)(void))glGetFloatv},
+    {"glGetIntegerv", (void (*)(void))glGetIntegerv},
+    {"glGetString", (void (*)(void))glGetString},
+    {"glHint", (void (*)(void))glHint},
+    {"glIsBuffer", (void (*)(void))glIsBuffer},
+    {"glIsBufferARB", (void (*)(void))glIsBufferARB},
+    {"glIsEnabled", (void (*)(void))glIsEnabled},
+    {"glIsList", (void (*)(void))glIsList},
+    {"glIsTexture", (void (*)(void))glIsTexture},
+    {"glLineWidth", (void (*)(void))glLineWidth},
+    {"glLoadIdentity", (void (*)(void))glLoadIdentity},
+    {"glLoadMatrixd", (void (*)(void))glLoadMatrixd},
+    {"glLoadMatrixf", (void (*)(void))glLoadMatrixf},
+    {"glLockArraysEXT", (void (*)(void))glLockArraysEXT},
+    {"glMatrixMode", (void (*)(void))glMatrixMode},
+    {"glMultMatrixd", (void (*)(void))glMultMatrixd},
+    {"glMultMatrixf", (void (*)(void))glMultMatrixf},
+    {"glMultiDrawArrays", (void (*)(void))glMultiDrawArrays},
+    {"glMultiDrawArraysEXT", (void (*)(void))glMultiDrawArraysEXT},
+    {"glMultiDrawElements", (void (*)(void))glMultiDrawElements},
+    {"glMultiModeDrawArraysIBM", (void (*)(void))glMultiModeDrawArraysIBM},
+    {"glMultiTexCoord2f", (void (*)(void))glMultiTexCoord2f},
+    {"glMultiTexCoord2fARB", (void (*)(void))glMultiTexCoord2fARB},
+    {"glMultiTexCoord2fv", (void (*)(void))glMultiTexCoord2fv},
+    {"glMultiTexCoord2fvARB", (void (*)(void))glMultiTexCoord2fvARB},
+    {"glNewList", (void (*)(void))glNewList},
+    {"glOrtho", (void (*)(void))glOrtho},
+    {"glOrthof", (void (*)(void))glOrthof},
+    {"glPixelStorei", (void (*)(void))glPixelStorei},
+    {"glPointSize", (void (*)(void))glPointSize},
+    {"glPolygonMode", (void (*)(void))glPolygonMode},
+    {"glPolygonOffset", (void (*)(void))glPolygonOffset},
+    {"glPopAttrib", (void (*)(void))glPopAttrib},
+    {"glPopMatrix", (void (*)(void))glPopMatrix},
+    {"glPushAttrib", (void (*)(void))glPushAttrib},
+    {"glPushMatrix", (void (*)(void))glPushMatrix},
+    {"glReadBuffer", (void (*)(void))glReadBuffer},
+    {"glReadPixels", (void (*)(void))glReadPixels},
+    {"glRotatef", (void (*)(void))glRotatef},
+    {"glScalef", (void (*)(void))glScalef},
+    {"glScissor", (void (*)(void))glScissor},
+    {"glShadeModel", (void (*)(void))glShadeModel},
+    {"glStencilFunc", (void (*)(void))glStencilFunc},
+    {"glStencilMask", (void (*)(void))glStencilMask},
+    {"glStencilOp", (void (*)(void))glStencilOp},
+    {"glTexCoord2f", (void (*)(void))glTexCoord2f},
+    {"glTexCoord2fv", (void (*)(void))glTexCoord2fv},
+    {"glTexCoord2i", (void (*)(void))glTexCoord2i},
+    {"glTexCoordPointer", (void (*)(void))glTexCoordPointer},
+    {"glTexEnvf", (void (*)(void))glTexEnvf},
+    {"glTexEnvfv", (void (*)(void))glTexEnvfv},
+    {"glTexEnvi", (void (*)(void))glTexEnvi},
+    {"glTexEnviv", (void (*)(void))glTexEnviv},
+    {"glTexImage2D", (void (*)(void))glTexImage2D},
+    {"glTexParameterf", (void (*)(void))glTexParameterf},
+    {"glTexParameterfv", (void (*)(void))glTexParameterfv},
+    {"glTexParameteri", (void (*)(void))glTexParameteri},
+    {"glTexParameteriv", (void (*)(void))glTexParameteriv},
+    {"glTexSubImage2D", (void (*)(void))glTexSubImage2D},
+    {"glTranslatef", (void (*)(void))glTranslatef},
+    {"glUnlockArraysEXT", (void (*)(void))glUnlockArraysEXT},
+    {"glVertex2f", (void (*)(void))glVertex2f},
+    {"glVertex2fv", (void (*)(void))glVertex2fv},
+    {"glVertex2i", (void (*)(void))glVertex2i},
+    {"glVertex3f", (void (*)(void))glVertex3f},
+    {"glVertex3fv", (void (*)(void))glVertex3fv},
+    {"glVertex3i", (void (*)(void))glVertex3i},
+    {"glVertex4f", (void (*)(void))glVertex4f},
+    {"glVertexPointer", (void (*)(void))glVertexPointer},
+    {"glViewport", (void (*)(void))glViewport},
+};
+
+void (*mxglGetProcAddress(const char *name))(void) {
+  int lo = 0, hi = (int)(sizeof procs / sizeof procs[0]) - 1;
+  while (lo <= hi) {
+    int mid = (lo + hi) / 2, c = strcmp(name, procs[mid].name);
+    if (!c)
+      return procs[mid].fn;
+    if (c < 0)
+      hi = mid - 1;
+    else
+      lo = mid + 1;
+  }
+  return NULL;
 }
