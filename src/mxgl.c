@@ -56,6 +56,7 @@
 #include <math.h>
 #include <mx/mx.h>
 #include <mx/hud.h>
+#include <mx/pad.h>
 #include <mx/sif.h>
 #include <mx/tex.h>
 #include <mx/vcache.h>
@@ -162,7 +163,7 @@ struct mxgl_stats {
   u32 refused;                   /* draws set_state could not do */
 };
 static struct mxgl_stats st_cur, st_last;
-int mxgl_show_stats = 1;
+int mxgl_show_stats = 0;
 
 /* ---- textures ---------------------------------------------------------------- */
 
@@ -768,6 +769,12 @@ static void draw_stats(void) {
 
 static void tex_auto(u32 up_kb);
 void mxgl_end_frame(void) {
+  /* L3 + R3 (both sticks pressed): the counters on and off, in every program */
+  static int sticks_held;
+  int sticks = (mx_pad_buttons(0) & (MX_PAD_L3 | MX_PAD_R3)) == (MX_PAD_L3 | MX_PAD_R3);
+  if (sticks && !sticks_held)
+    mxgl_show_stats = !mxgl_show_stats;
+  sticks_held = sticks;
   pq_flush();
   if (!in_frame)
     frame_start();
