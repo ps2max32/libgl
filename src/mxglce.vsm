@@ -1,0 +1,64 @@
+; mxglc.vsm with GL_EXP or GL_EXP2 fog, as mxglve.hlsl: tms.w the density (vf1.w), tmt.w 0
+; for GL_EXP, 1 for GL_EXP2 (vf3.w); e^-x as (1 + x/32)^-32
+	.section .vutext, "ax", @progbits
+	.set MXGLC_COLOUR, 0
+	.set MXGLC_FOG, 1
+	.macro mxglc_fog
+	mulw.w vf26, vf1, vf12w		loi 0x3d000000
+	nop				nop
+	nop				nop
+	nop				nop
+	mul.w vf27, vf26, vf26		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	sub.w vf27, vf27, vf26		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	mulaw.w acc, vf26, vf0w		nop
+	mul.w vf27, vf3, vf27		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	maddw.w vf26, vf27, vf0w	nop
+	nop				nop
+	nop				nop
+	nop				nop
+	muli.w vf26, vf26, i		nop
+	nop				loi 0x437f0000
+	nop				nop
+	nop				nop
+	addw.w vf26, vf26, vf0w		nop
+	muli.w vf27, vf0, i		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	mul.w vf26, vf26, vf26		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	mul.w vf26, vf26, vf26		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	mul.w vf26, vf26, vf26		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	mul.w vf26, vf26, vf26		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	mul.w vf26, vf26, vf26		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	nop				div q, vf27w, vf26w
+	nop				waitq
+	mulq.w vf26, vf0, q		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	.endm
+	.include "mxglc.i"

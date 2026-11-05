@@ -7,7 +7,9 @@
 
 /* the largest texture side the games should make (they scale larger ones
    down: GL_MAX_TEXTURE_SIZE) */
+#ifndef MXGL_MAX_TEXTURE
 #define MXGL_MAX_TEXTURE 128
+#endif
 /* pinned memory besides the textures (<mx/mem.h>, taken as needed): two
    arenas, beam racing's 2 MiB while it is on, the display lists' pool (up
    to 2 MiB). For sizing; nothing is reserved. */

@@ -48,6 +48,13 @@ static void quad(float x0, float y0, float x1, float y1, float z) {
 }
 
 /* a new frame, cleared to black, 2D in window pixels, all off */
+static void persp(void) {
+  glMatrixMode(GL_PROJECTION);
+  glLoadIdentity();
+  glFrustum(-1, 1, -1, 1, 1, 100);
+  glMatrixMode(GL_MODELVIEW);
+}
+
 static void frame(void) {
   mxgl_end_frame();
   mxgl_frame_done();
@@ -109,6 +116,66 @@ int main(void) {
   glColor4f(1, 1, 1, 0.75f);
   quad(100, 100, 200, 200, 0);
   CHECK_PIX(150, 150, 0xFFFFFF);
+
+  /* fog: the GS's, by the eye distance (the vertices' w): a white quad at
+     distance 5, blue fog */
+  frame();
+  persp();
+  {
+    static const float blue[4] = {0, 0, 1, 1};
+    glEnable(GL_FOG);
+    CHECK(glIsEnabled(GL_FOG));
+    glFogfv(GL_FOG_COLOR, blue);
+    glFogi(GL_FOG_MODE, GL_LINEAR);
+    glFogf(GL_FOG_START, 0);
+    glFogf(GL_FOG_END, 10);
+    quad(-5, -5, 5, 5, -5); /* (10 - 5) / 10: half fog */
+    CHECK_PIX(W / 2, H / 2, 0xFF8080);
+    glFogf(GL_FOG_END, 4); /* beyond the end: the fog colour alone */
+    quad(-5, -5, 5, 5, -5);
+    CHECK_PIX(W / 2, H / 2, 0xFF0000);
+    glFogf(GL_FOG_END, 1000); /* nearly none */
+    quad(-5, -5, 5, 5, -5);
+    CHECK_PIX(W / 2, H / 2, 0xFFFFFF);
+    glFogi(GL_FOG_MODE, GL_EXP); /* e^-(0.2 * 5) = 0.37 */
+    glFogf(GL_FOG_DENSITY, 0.2f);
+    quad(-5, -5, 5, 5, -5);
+    CHECK_PIX(W / 2, H / 2, 0xFF5E5E);
+    glFogi(GL_FOG_MODE, GL_EXP2); /* e^-(0.1 * 5)^2 = 0.78 */
+    glFogf(GL_FOG_DENSITY, 0.1f);
+    quad(-5, -5, 5, 5, -5);
+    CHECK_PIX(W / 2, H / 2, 0xFFC7C7);
+    glDisable(GL_FOG);
+    quad(-5, -5, 5, 5, -5);
+    CHECK_PIX(W / 2, H / 2, 0xFFFFFF);
+  }
+
+  /* the shared palette, with a transparent entry: bytes kept as its indices */
+  frame();
+  {
+    static u8 pal[256][4], idx[16 * 16];
+    GLuint tx;
+    pal[1][0] = 255, pal[1][3] = 255; /* red */
+    pal[2][1] = 255, pal[2][3] = 255; /* green */
+    for (int i = 0; i < 16 * 16; i++)
+      idx[i] = i < 8 * 16 ? 1 : 255; /* its lower half red, its upper transparent */
+    pal[255][3] = 0;
+    glColorTableEXT(GL_SHARED_TEXTURE_PALETTE_EXT, GL_RGBA, 256, GL_RGBA, GL_UNSIGNED_BYTE, pal);
+    glEnable(GL_SHARED_TEXTURE_PALETTE_EXT);
+    glGenTextures(1, &tx);
+    glBindTexture(GL_TEXTURE_2D, tx);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 16, 16, 0, GL_COLOR_INDEX, GL_UNSIGNED_BYTE, idx);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glEnable(GL_TEXTURE_2D);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    quad(100, 100, 200, 200, 0);
+    CHECK_PIX(150, 120, 0x0000FF); /* the first rows are at the bottom */
+    CHECK_PIX(150, 180, 0x000000); /* the key: not drawn */
+    glDisable(GL_SHARED_TEXTURE_PALETTE_EXT);
+    glDeleteTextures(1, &tx);
+  }
 
   /* depth: nearer (z 0.5: depth 0.25) stays */
   frame();

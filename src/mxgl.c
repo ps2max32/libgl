@@ -46,7 +46,7 @@
      the GS's buffers back (mx_frame_sync first); one user clip plane is a
      seventh plane of the clipping; polygon offset is a Z bias in the
      matrix; the colour mask is FRAME's FBMSK; the texture matrix is on VU1.
-   Not done: stencil, destination alpha, the other blends with the
+   Not done: a counting stencil, destination alpha, the other blends with the
    destination colour (the draw is skipped). */
 
 #include <stdlib.h>
@@ -67,10 +67,49 @@
 #include <GL/gl.h>
 #include <GL/glext.h>
 #include "mxglv.h"
+/* MXGL_VU1CLIP: clipping and culling on VU1 (src/mxglc.vsm): the EE sends a draw's
+   vertices without looking at them. A game's own programs without mxglc.i's clipping
+   and user clip planes keep the EE's clipper (vu1_clips). */
+/* the buffers in the TV's mode without beam racing: 512 wide is the video clock's 2560 / 5,
+   as exact as 640; smaller buffers leave more GS memory for textures, 16-bit Z most
+   (but no top bytes for 8-bit textures) */
+#ifndef MXGL_FB_W
+#define MXGL_FB_W 640
+#endif
+#ifndef MXGL_FB_Z
+#define MXGL_FB_Z MX_GS_PSM_Z24
+#endif
+#ifndef MXGL_VU1CLIP
+#define MXGL_VU1CLIP 0
+#endif
+#if MXGL_VU1CLIP
+#include "mxglc.h"
+#include "mxglcf.h"
+#include "mxglce.h"
+extern const u8 mxglc_vu[], mxglc_vu_end[], mxglcf_vu[], mxglcf_vu_end[], mxglce_vu[], mxglce_vu_end[];
+#define MXGL_UNI_QW VU_MXGLC_UNI_QW
+#define MXGL_ADC_W 0x3F808000u /* mxglc.vsm reads the low half, XYZ2's ADC; about 1.0 */
+#define MXGL_REV_W 0x00004000u /* closes a triangle in the reverse of its order; about 0 */
+#else
+#define MXGL_UNI_QW VU_MXGLV_UNI_QW
+#define MXGL_ADC_W 0x3F800000u
+#define MXGL_REV_W 0u
+#endif
+/* a vertex's pos.w: 0 it closes a triangle, 1 it closes none (ADC), 2 it closes one
+   and the last three vertices have the triangle's reverse order (for mxglc.vsm's
+   culling) */
+#define MXGL_W(a) ((a) == 1 ? MXGL_ADC_W : (a) == 2 ? MXGL_REV_W : 0)
+#include "mxglvf.h"
+#include "mxglve.h"
 
 #include "mxgl.h"
 
 extern const u8 mxglv_vu[], mxglv_vu_end[];
+extern const u8 mxglvf_vu[], mxglvf_vu_end[], mxglve_vu[], mxglve_vu_end[];
+/* the fog programs have mxglv's data layout: o_uni is theirs too */
+_Static_assert(VU_MXGLVF_UNI_QW == VU_MXGLV_UNI_QW && VU_MXGLVE_UNI_QW == VU_MXGLV_UNI_QW &&
+               VU_MXGLVF_TMS == VU_MXGLV_TMS && VU_MXGLVE_TMS == VU_MXGLV_TMS &&
+               VU_MXGLVF_TMT == VU_MXGLV_TMT && VU_MXGLVE_TMT == VU_MXGLV_TMT, "fog layout");
 
 #include <mx/hires.h>
 /* the picture (mxgl_set_mode): the buffer drawn into, fb_w x fb_h (beam
@@ -142,6 +181,9 @@ static struct mx_shader shader;
    batch is drawn with, the one in use; the program the stream has set up */
 struct vprog;
 static struct vprog *o_prog, *cur_prog;
+static int cur_prog_clips; /* cur_prog has mxglc.i's clipping */
+static struct vprog *fog_prog[2]; /* GL_LINEAR; GL_EXP and GL_EXP2 */
+static void fog_program(int i, const struct mx_shader *s);
 static const struct mx_shader *vu_cur;
 static const struct mx_shader *vprog_use(struct vprog *p);
 static const void *vprog_uni(struct vprog *p, const float (*fixed)[4]);
@@ -163,6 +205,41 @@ struct mxgl_stats {
   u32 refused;                   /* draws set_state could not do */
 };
 static struct mxgl_stats st_cur, st_last;
+/* MXGL_STATS_WINDOW: every so many frames, one line of the units' busy shares
+   (per 1000, of mx_trace_sample) and the cycles and counts of a frame */
+#ifdef MXGL_STATS_WINDOW
+#include <mx/trace.h>
+static void stats_window(void) {
+  static u64 sum[sizeof(struct mxgl_stats) / 4], cyc;
+  static u32 n, last, started, b0[MX_TS_N], n0, wb0, wr0, qw0, win;
+  u32 now = mx_count();
+  if (!started) {
+    started = 1, last = now;
+    mx_trace_sample(1000);
+    return;
+  }
+  cyc += now - last, last = now;
+  const u32 *a = (const u32 *)&st_cur;
+  for (u32 i = 0; i < sizeof st_cur / 4; i++)
+    sum[i] += a[i];
+  if (++n < MXGL_STATS_WINDOW)
+    return;
+  u32 b[MX_TS_N], ns = mx_trace_busy(b), d = ns - n0 ? ns - n0 : 1;
+#define PM(i) ((b[i] - b0[i]) * 1000 / d)
+#define AV(f) (u32)(sum[__builtin_offsetof(struct mxgl_stats, f) / 4] / n)
+  u32 wb = mx_frame_stats.wait_buffer, wr = mx_frame_stats.wait_ring, q = mx_frame_stats.qw;
+  mx_printf("EXP %u cyc %u VIF1 %u VU1 %u GW %u PATH %u GS %u VU0 %u wb %u wr %u qw %u | calls %u "
+            "draws %u tris %u verts %u clip %u up %u gl %u xf %u tri %u fl %u set %u lod %u mvp %u\n",
+            win++, (u32)(cyc / n), PM(1), PM(6), PM(9), PM(7), PM(8), PM(5), (wb - wb0) / n,
+            (wr - wr0) / n, (q - qw0) / n, AV(calls), AV(draws), AV(tris), AV(verts), AV(clipped),
+            AV(upload_kb), AV(gl_cycles), AV(xf_cycles), AV(tri_cycles), AV(flush_cycles),
+            AV(c_set), AV(c_lod), AV(c_mvp));
+#undef PM
+#undef AV
+  memcpy(b0, b, sizeof b), n0 = ns, wb0 = wb, wr0 = wr, qw0 = q;
+  memset(sum, 0, sizeof sum), cyc = 0, n = 0;
+}
+#endif
 int mxgl_show_stats = 0;
 
 /* ---- textures ---------------------------------------------------------------- */
@@ -298,6 +375,14 @@ static struct {
   float pofactor, pounits;
   /* glColorMask as FRAME's FBMSK (bits of the colour before it is made 16 bits) */
   u32 cmask;
+  /* the stencil: one bit, the frame buffer's alpha bit (CT16S), tested with TEST's
+     DATE and DATM. Bit 0 is the value st_va (the last clear), bit 1 st_vb, the first
+     other value a draw wrote (-1: none yet); a third value is taken for st_vb.
+     GL's stencil and depth-fail operations are not done (the GS writes no pixel
+     that fails) */
+  int st_on, st_ref, st_va, st_vb;
+  u32 st_mask, st_wmask, st_clear;
+  GLenum st_func, st_op;
   /* GL_CLIP_PLANE0: the plane in eye space (glClipPlane) */
   int ucp_on;
   float ucp_eye[4];
@@ -306,6 +391,11 @@ static struct {
   int vp[4], sc[4];
   float dn, df;
   int tex2d, blend, atest, dtest, cull, scissor;
+  /* glFog's state; a, b of the fog programs (fog_update); the GS's FOGCOL */
+  int fog;
+  GLenum fog_mode;
+  float fog_density, fog_start, fog_end, fog_a, fog_b;
+  u32 fog_col;
   GLenum sf, dfac, afunc, dfunc, cullface, texenv;
   float aref;
   int dmask;
@@ -358,7 +448,7 @@ static int in_once;
 #endif
 /* GS registers last written in this frame */
 static struct {
-  u64 tex0, tex1, clamp, alpha, test, zbuf, scissor, mip1, mip2, frame;
+  u64 tex0, tex1, clamp, alpha, test, zbuf, scissor, mip1, mip2, frame, fogcol, fba;
   int valid;
 } gs;
 
@@ -790,6 +880,9 @@ void mxgl_end_frame(void) {
     evicted = vs.evicted;
   }
   tex_auto(st_cur.upload_kb);
+#ifdef MXGL_STATS_WINDOW
+  stats_window();
+#endif
   st_last = st_cur;
   memset(&st_cur, 0, sizeof st_cur);
   mx_frame_end();
@@ -902,6 +995,9 @@ static int pal_on;
 static u8 pal_rgb[256][3];
 /* the shared palette with alpha (GL_COLOR_INDEX textures) */
 static u8 pal_rgba[256][4];
+/* the entry of a shared palette that is transparent (glColorTableEXT: its
+   alpha 0), or -1: textures keyed with it are 8 bits too */
+static int pal_transp = -1;
 /* exact RGB -> index (open addressing, key RGB + 1), and the nearest index
    of a 15-bit colour (for the averaged colours of mipmap levels) */
 static u32 pal_key[1024];
@@ -929,6 +1025,8 @@ static u8 pal_nearest(const u8 *c) {
       u32 best = ~0u;
       u8 bi = 0;
       for (int i = 0; i < 256; i++) {
+        if (i == pal_transp)
+          continue;
         int dr = r - pal_rgb[i][0], dg = g - pal_rgb[i][1], db = b - pal_rgb[i][2];
         u32 d = (u32)(dr * dr * 3 + dg * dg * 4 + db * db * 2);
         if (d < best)
@@ -951,7 +1049,7 @@ void mxgl_Palette(const unsigned char *rgb) {
     memcpy(pal_rgba[i], c, 3);
     pal_rgba[i][3] = 255;
     u32 key = (u32)c[0] | (u32)c[1] << 8 | (u32)c[2] << 16;
-    if (pal_find(key) < 0) {
+    if (i != pal_transp && pal_find(key) < 0) {
       u32 h = (key * 2654435761u) >> 22;
       while (pal_key[h])
         h = (h + 1) & 1023;
@@ -960,7 +1058,7 @@ void mxgl_Palette(const unsigned char *rgb) {
     }
     /* CSM1's order: bits 3 and 4 of the index swapped */
     u32 at = ((u32)i & 0xE7) | ((u32)i & 8) << 1 | ((u32)i & 16) >> 1;
-    clut_pal[at] = key | 0x80u << 24;
+    clut_pal[at] = key | (i == pal_transp ? 0 : 0x80u << 24);
   }
   mx_dcache_writeback(clut_pal, sizeof clut_pal);
   pal_on = 1;
@@ -1306,7 +1404,7 @@ static struct tex *tex_twin(struct tex *t, int ch);
 /* mxgl_color_light: products with the destination of colour textures (the
    lightmaps of Quake 2) per channel: three passes of each batch, one
    channel written in each (FRAME's FBMSK), its texture the channel's copy;
-   not with beam racing (FRAME is the passes'): the brightness then */
+   also with beam racing (FRAME is in the stream) */
 static int cl_enabled;
 static int cl_batch;          /* the batch being gathered is drawn so */
 static u64 cl_tex0[3], cl_frame[3];
@@ -1381,6 +1479,42 @@ static int blend_mode(u64 *alpha, const struct tex *t) {
 
 /* Brings the GS registers up to the GL state; returns PRIM's ABE and TME
    in *prim and 0, or -1 if the draw cannot be done. */
+/* the stencil: the alpha bit of 16-bit colour; CT24 has none */
+static inline int st_there(void) { return !(beam && rgb24); }
+/* FRAME of the buffer being drawn into, with FBMSK mask */
+static inline u64 frame_reg(u32 mask) {
+  return beam ? mx_hires_frame(mask) : mx_gs_frame(rt[buf].fbp, rt[buf].fbw, rt[buf].psm, mask);
+}
+
+/* the stencil's test and operations on a value */
+static int st_pass(int v) {
+  u32 a = (u32)gl.st_ref & gl.st_mask, b = (u32)v & gl.st_mask;
+  switch (gl.st_func) {
+  case GL_NEVER: return 0;
+  case GL_LESS: return a < b;
+  case GL_LEQUAL: return a <= b;
+  case GL_GREATER: return a > b;
+  case GL_GEQUAL: return a >= b;
+  case GL_EQUAL: return a == b;
+  case GL_NOTEQUAL: return a != b;
+  default: return 1;
+  }
+}
+static int st_new(int v) {
+  int n = v;
+  switch (gl.st_op) {
+  case GL_ZERO: n = 0; break;
+  case GL_REPLACE: n = gl.st_ref; break;
+  case GL_INCR: n = v < 255 ? v + 1 : 255; break;
+  case GL_DECR: n = v > 0 ? v - 1 : 0; break;
+  case GL_INVERT: n = ~v & 255; break;
+  case GL_INCR_WRAP: n = (v + 1) & 255; break;
+  case GL_DECR_WRAP: n = (v - 1) & 255; break;
+  default: break;
+  }
+  return (int)(((u32)v & ~gl.st_wmask) | ((u32)n & gl.st_wmask));
+}
+
 static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   struct tex *t = NULL;
   /* the per channel passes' TEX0 and FRAME (mxgl_color_light): kept for
@@ -1392,7 +1526,7 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
      per channel (mxgl_color_light) */
   struct tex *cl_src = NULL;
   if (t && (!t->bright || t->planar) && gl.blend && blend_product()) {
-    if (cl_enabled && !beam && !(t->mip && t->levels > 1))
+    if (cl_enabled && !(t->mip && t->levels > 1))
       cl_src = t;
     if (!(t = tex_twin(t, cl_src ? 1 : 0)))
       return -1;
@@ -1481,6 +1615,31 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   if (abe && (!gs.valid || alpha != gs.alpha))
     reg[n] = MX_GS_REG_ALPHA_1, val[n++] = gs.alpha = alpha;
 
+  /* the stencil: the alpha bit is not written unless a draw does */
+  int st_date = 0, st_datm = 0, st_never = 0, st_half = 0;
+  u32 st_fba = 0, amask = 0x80000000u;
+  if (gl.st_on && st_there()) {
+    /* the other value, before the test: this draw's pixels may overlap, and the
+       draws after it have this state without passing here */
+    int na = st_new(gl.st_va);
+    if (gl.st_vb < 0 && st_pass(gl.st_va) && na != gl.st_va)
+      gl.st_vb = na;
+    int b = gl.st_vb < 0 ? gl.st_va : gl.st_vb;
+    int pa = st_pass(gl.st_va), pb = st_pass(b);
+    st_date = pa != pb, st_datm = pb, st_never = !pa && !pb;
+    int nb = st_new(b);
+    if ((pa && na != gl.st_va) || (pb && nb != b)) {
+      /* the bit of what the pixels that pass become */
+      int w = (pa && na != gl.st_va) || (pb && nb != gl.st_va);
+      if (w) {
+        st_fba = 1, amask = 0;
+      } else if ((gl.cmask & 0x00FFFFFFu) == 0x00FFFFFFu) {
+        /* bit 7 of the source alpha, with FBA 0: half the alpha, and the alpha
+           test's reference with it; only without colour, which it would change */
+        st_half = 1, amask = 0;
+      }
+    }
+  }
   u32 ate = 0, atst = 1, aref = 0;
   if (gl.atest) {
     ate = 1;
@@ -1506,7 +1665,11 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
            : gl.dfunc == GL_LESS                        ? 3
            : gl.dfunc == GL_LEQUAL || gl.dfunc == GL_EQUAL ? 2
                                                         : 1;
-  u64 test = mx_gs_test((int)ate, atst, aref, 0, 0, 0, 1, ztst);
+  if (st_half)
+    aref /= 2;
+  if (st_never)
+    ate = 1, atst = 0, aref = 0;
+  u64 test = mx_gs_test((int)ate, atst, aref, 0, st_date, st_datm, 1, ztst);
   if (!gs.valid || test != gs.test)
     reg[n] = MX_GS_REG_TEST_1, val[n++] = gs.test = test;
 
@@ -1516,15 +1679,15 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
     u64 zbuf = mx_gs_zbuf(target->zbp, target->zpsm, (u32)zmsk);
     if (!gs.valid || zbuf != gs.zbuf)
       reg[n] = MX_GS_REG_ZBUF_1, val[n++] = gs.zbuf = zbuf;
-    /* glColorMask (beam: FRAME is the passes'; not kept); per channel:
-       red first (flush_out draws green and blue) */
-    for (int k = 0; k < 3; k++)
-      nframe[k] = mx_gs_frame(target->fbp, target->fbw, target->psm,
-                              gl.cmask | (0x00FFFFFFu & ~(0xFFu << (8 * k))));
-    u64 frame = cl_src ? nframe[0] : mx_gs_frame(target->fbp, target->fbw, target->psm, gl.cmask);
-    if (!gs.valid || frame != gs.frame)
-      reg[n] = MX_GS_REG_FRAME_1, val[n++] = gs.frame = frame;
   }
+  /* glColorMask; per channel: red first (flush_out draws green and blue) */
+  for (int k = 0; k < 3; k++)
+    nframe[k] = frame_reg((gl.cmask & 0x00FFFFFFu) | amask | (0x00FFFFFFu & ~(0xFFu << (8 * k))));
+  u64 frame = cl_src ? nframe[0] : frame_reg((gl.cmask & 0x00FFFFFFu) | amask);
+  if (!gs.valid || frame != gs.frame)
+    reg[n] = MX_GS_REG_FRAME_1, val[n++] = gs.frame = frame;
+  if (!gs.valid || st_fba != gs.fba)
+    reg[n] = MX_GS_REG_FBA_1, val[n++] = gs.fba = st_fba;
 
   int x0 = 0, x1 = fb_w - 1, y0 = 0, y1 = fb_h - 1;
   if (gl.scissor) {
@@ -1541,6 +1704,9 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
       reg[n] = MX_GS_REG_SCISSOR_1, val[n++] = gs.scissor = sc;
   }
 
+  if (gl.fog && (!gs.valid || gl.fog_col != gs.fogcol))
+    reg[n] = MX_GS_REG_FOGCOL, val[n++] = gs.fogcol = gl.fog_col;
+
   write_regs(reg, val, n); /* the batch before drawn first */
   gs.valid = 1;
   cl_batch = cl_src != NULL;
@@ -1549,15 +1715,17 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
     memcpy(cl_frame, nframe, sizeof cl_frame);
   }
 
-  /* beam: context 2 for no Z writes (SD: ZBUF's ZMSK) */
-  *prim = (u32)mx_gs_prim(MX_GS_PRIM_TRISTRIP, 1, t != NULL, 0, abe, 0, 0, beam && zmsk, 0);
+  /* beam: context 2 for no Z writes (SD: ZBUF's ZMSK); fog only with the
+     fog programs (a program of the game's writes no F) */
+  *prim = (u32)mx_gs_prim(MX_GS_PRIM_TRISTRIP, 1, t != NULL, gl.fog && !cur_prog, abe, 0, 0,
+                          beam && zmsk, 0);
   if (t) {
     /* 0x80 is 1.0 when modulated: up to 2x with a colour shift */
     cscale[0] = cscale[1] = cscale[2] = gl.cshift ? 1.0f : 0.5f;
   } else {
     cscale[0] = cscale[1] = cscale[2] = 1.0f;
   }
-  cscale[3] = 128.0f / 255.0f;
+  cscale[3] = st_half ? 64.0f / 255.0f : 128.0f / 255.0f;
   return 0;
 }
 
@@ -1751,7 +1919,7 @@ static void st_poly(const float *st0) {
 
 /* s_at: the parts' used bytes */
 static u32 o_prim;
-static float o_uni[VU_MXGLV_UNI_QW][4] MX_ALIGNED(16) = {
+static float o_uni[MXGL_UNI_QW][4] MX_ALIGNED(16) = {
     [VU_MXGLV_CMUL] = {1, 1, 1, 1}}; /* the colour as it is (cadd 0) */
 
 /* the next batch's place: after the batches of this frame */
@@ -1769,6 +1937,12 @@ static void batch_place(void) {
 
 /* room for k more vertices in the batch (it is drawn first if needed); 0:
    the arena is full (the triangle is dropped) */
+/* the draw's clipping and culling are VU1's (mxglc.vsm) */
+static inline int vu1_clips(void) {
+  return MXGL_VU1CLIP && (!cur_prog || cur_prog_clips) && !gl.ucp_on && zn > zf &&
+         gl.cullface != GL_FRONT_AND_BACK;
+}
+
 static int batch_room(u32 k) {
   if (o_n + k <= o_cap)
     return 1;
@@ -1782,11 +1956,17 @@ static int batch_room(u32 k) {
 /* mxgl_color_light: channel j's texture and colour mask (after a FLUSH:
    the batch before drawn with the channel before) */
 static void cl_regs(int j) {
-  u64 *c = mx_frame_reserve(2 + 2);
-  c = mx_e_cnt(c, 3, mx_vif_flush(), mx_vif_direct(3));
-  c = mx_e_ad_tag(c, 2, 1);
+  /* beam: the draws without Z writes are context 2's */
+  u32 n = beam ? 4 : 2;
+  u64 *c = mx_frame_reserve(2 + n);
+  c = mx_e_cnt(c, n + 1, mx_vif_flush(), mx_vif_direct(n + 1));
+  c = mx_e_ad_tag(c, n, 1);
   c = mx_e_ad(c, MX_GS_REG_TEX0_1, cl_tex0[j]);
   c = mx_e_ad(c, MX_GS_REG_FRAME_1, cl_frame[j]);
+  if (beam) {
+    c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_TEX0_1, 1), cl_tex0[j]);
+    c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_FRAME_1, 1), cl_frame[j]);
+  }
   mx_frame_commit(c);
 }
 
@@ -1825,7 +2005,7 @@ static void flush_out(void) {
 }
 
 static void out_vertex(const struct cv *v, int adc) {
-  o_put_pos(o_n, v->x, adc ? 0x3F800000u : 0);
+  o_put_pos(o_n, v->x, MXGL_W(adc));
   o_put_st(o_n, v->st);
   u32 c = 0;
   for (int i = 0; i < 4; i++)
@@ -1847,7 +2027,7 @@ static void lerp(struct cv *r, const struct cv *a, const struct cv *b, float t) 
 
 /* 1: the triangle is culled (window-space winding) */
 static int culled(const float *a, const float *b, const float *c) {
-  if (!gl.cull)
+  if (!gl.cull || vu1_clips())
     return 0;
   /* the area's sign from (x, y, w) without dividing (all w > 0): the
      determinant of the three; GS y points down, so counter-clockwise in GL
@@ -1864,7 +2044,7 @@ static int culled(const float *a, const float *b, const float *c) {
    sum of its fan triangles' determinants), not one triangle's (the first
    ones can be about collinear: a tiny area of either sign) */
 static int culled_poly(const float *const *p, int n) {
-  if (!gl.cull)
+  if (!gl.cull || vu1_clips())
     return 0;
   if (gl.cullface == GL_FRONT_AND_BACK)
     return 1;
@@ -2229,7 +2409,7 @@ static inline __attribute__((always_inline)) struct vsrc vsrc_get(void) {
 static inline __attribute__((always_inline)) void put_vertex(const struct vsrc *s, u32 v, int adc) {
   const float *x = (const float *)(s->vb + v * s->vs);
   if (s->has_z) {
-    o_put_pos(o_n, x, adc ? 0x3F800000u : 0);
+    o_put_pos(o_n, x, MXGL_W(adc));
   } else {
     float *d = o_pos[o_n];
     d[0] = x[0], d[1] = x[1], d[2] = 0, d[3] = adc ? 1.0f : 0.0f;
@@ -2277,14 +2457,14 @@ static inline int fastv_get(struct fastv *f) {
 static inline __attribute__((always_inline)) void fast_put(const struct fastv *f, u32 v, int adc) {
   const u8 *r = f->vb + v * (u32)f->vs;
   const u32 *x = (const u32 *)r, *t = (const u32 *)(r + f->toff);
-  o_put_pos(o_n, x, adc ? 0x3F800000u : 0);
+  o_put_pos(o_n, x, MXGL_W(adc));
   o_put_st(o_n, t);
   o_col[o_n] = f->coff >= 0 ? *(const u32 *)(r + f->coff) : f->col;
   o_n++;
 }
 static inline __attribute__((always_inline)) int fast_culled(const struct fastv *f, const float *a,
                                                              const float *b, const float *c) {
-  if (!f->cmode)
+  if (!f->cmode || vu1_clips())
     return 0;
   if (f->cmode == 3)
     return 1;
@@ -2441,10 +2621,44 @@ have:
   }
   /* gathered with the triangles before if they are drawn the same way */
   float *ocs = o_uni[VU_MXGLV_CSCALE];
+  int fog = gl.fog && !cur_prog;
+  struct vprog *want = fog ? fog_prog[gl.fog_mode != GL_LINEAR] : cur_prog;
+  float fa = fog ? gl.fog_a : 0, fb = fog ? gl.fog_b : 0;
+#if MXGL_VU1CLIP
+  /* mxglc.vsm's uniforms, when what they depend on has changed */
+  static float cz[2];
+  static u32 ck = ~0u;
+  int vc = vu1_clips() && (k_prim & 7) == MX_GS_PRIM_TRISTRIP;
+  u32 key = (u32)vc | (u32)(vc && gl.cull) << 1 | (u32)(gl.cullface == GL_FRONT) << 2;
+  int cchange = key != ck || (vc && (cz[0] != zn || cz[1] != zf));
+#endif
   if (o_n && (k_prim != o_prim || o_mser != m_serial || k_cs[0] != ocs[0] || k_cs[1] != ocs[1] ||
-              k_cs[2] != ocs[2] || k_cs[3] != ocs[3] || o_prog != cur_prog))
+              k_cs[2] != ocs[2] || k_cs[3] != ocs[3] || o_prog != want ||
+              fa != o_uni[VU_MXGLV_TMS][3] || fb != o_uni[VU_MXGLV_TMT][3]
+#if MXGL_VU1CLIP
+              || cchange
+#endif
+                  ))
     flush_out();
-  o_prog = cur_prog;
+#if MXGL_VU1CLIP
+  if (cchange) {
+    union {
+      float f;
+      u32 u;
+    } on = {.u = key & 2 ? 0x20 : 0}, sense = {.u = key & 4 ? 0 : 0x20};
+    float hz = (zn - zf) * 0.5f, cc = (zn + zf) * 0.5f;
+    float ih = vc ? 1.0f / hz : 0, g = vc ? 2.0f / (GB_HI - GB_LO) : 0;
+    const float gc = (GB_LO + GB_HI) * 0.5f;
+    const float pl[6][4] = {{0, 0, -1, zn},    {0, 0, 1, -zf},   {-1, 0, 0, GB_HI},
+                            {1, 0, 0, -GB_LO}, {0, -1, 0, GB_HI}, {0, 1, 0, -GB_LO}};
+    float(*cu)[4] = &o_uni[VU_MXGLV_UNI_QW];
+    cu[0][0] = g, cu[0][1] = g, cu[0][2] = ih, cu[0][3] = on.f;
+    cu[1][0] = -gc * g, cu[1][1] = -gc * g, cu[1][2] = -cc * ih, cu[1][3] = sense.f;
+    memcpy(cu[2], pl, sizeof pl);
+    ck = key, cz[0] = zn, cz[1] = zf;
+  }
+#endif
+  o_prog = want;
   o_prim = k_prim;
   ocs[0] = k_cs[0], ocs[1] = k_cs[1], ocs[2] = k_cs[2], ocs[3] = k_cs[3];
   if (o_mser != m_serial) {
@@ -2452,6 +2666,7 @@ have:
     tm_uniforms(o_uni[VU_MXGLV_TMS], o_uni[VU_MXGLV_TMT]);
     o_mser = m_serial;
   }
+  o_uni[VU_MXGLV_TMS][3] = fa, o_uni[VU_MXGLV_TMT][3] = fb;
   return 1;
 }
 
@@ -2462,6 +2677,7 @@ have:
 static struct {
   int on, valid, n, vstride, vsize;
   const void *vptr, *vp;
+  int count; /* the locked range's end: the draws transform it all, once */
   u32 mser, oand, oor;
 } lk;
 
@@ -2469,6 +2685,9 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
   pq_flush();
   if (nidx < 3 || !gl.va || !gl.vptr)
     return;
+  /* draws of a locked range that each use part of it: one transform for all */
+  if (lk.on && lk.count > nverts)
+    nverts = lk.count;
   if (dl_compiling) {
     dl_record(idx, nidx, nverts);
     if (!dl_execute)
@@ -2501,6 +2720,13 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
               m7 = m[7], m8 = m[8], m9 = m[9], m10 = m[10], m11 = m[11], m12 = m[12],
               m13 = m[13], m14 = m[14], m15 = m[15];
   u32 oand = 0x3F, oor = 0;
+  if (vu1_clips()) {
+    /* not looked at: nothing outside any plane for the code below */
+    memset(vo_cache, 0, (u32)nverts);
+    oand = 0;
+    lk.valid = 0;
+    goto vu1_clipped;
+  }
   /* the transform and the outcodes (bit k: outside plane k, plane_d < 0):
      on VU0 (vu0_xform), else in FPU registers, the outcodes as the sign
      bits of the distances; none while the locked arrays' are kept */
@@ -2562,6 +2788,7 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
     lk.vptr = gl.vptr, lk.vstride = gl.vstride, lk.vsize = gl.vsize, lk.n = nverts;
     lk.vp = vp_cache, lk.mser = mat_serial, lk.oand = oand, lk.oor = oor;
   }
+vu1_clipped:
   st_cur.xf_cycles += mx_count() - tx0;
   /* all of it outside one plane: nothing to draw */
   if (oand)
@@ -2590,12 +2817,12 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
       if (fastv_get(&fv)) {
         fast_put(&fv, 0, 1);
         for (int k = 1, lo = 1, hi = nverts - 1; k < nverts; k++)
-          fast_put(&fv, (u32)((k & 1) ? lo++ : hi--), k < 2);
+          fast_put(&fv, (u32)((k & 1) ? lo++ : hi--), k < 2 ? 1 : (k & 1) * 2);
       } else {
         const struct vsrc src = vsrc_get();
         for (int k = 0, lo = 1, hi = nverts - 1; k < nverts; k++) {
           int v = k == 0 ? 0 : (k & 1) ? lo++ : hi--;
-          put_vertex(&src, (u32)v, k < 2);
+          put_vertex(&src, (u32)v, k < 2 ? 1 : (k & 1) * 2);
         }
       }
       st_cur.tris += (u32)nverts - 2;
@@ -2651,7 +2878,7 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
           drawn += !cl;
           if (fan && (t & 1))
             fast_put(&fv, (u32)f, 1);
-          fast_put(&fv, (u32)ic, cl);
+          fast_put(&fv, (u32)ic, cl ? 1 : (t & 1) * 2);
         }
         continue;
       }
@@ -2668,7 +2895,7 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
           drawn += !cl;
           if (fan && (t & 1))
             put_vertex(&src, (u32)f, 1);
-          put_vertex(&src, (u32)f + (u32)t + 2, cl);
+          put_vertex(&src, (u32)f + (u32)t + 2, cl ? 1 : (t & 1) * 2);
         }
         continue;
       }
@@ -2719,7 +2946,7 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
       drawn += !c;
       if (fan && (t & 1))
         put_vertex(&src, 0, 1);
-      put_vertex(&src, (u32)t + 2, c);
+      put_vertex(&src, (u32)t + 2, c ? 1 : (t & 1) * 2);
     }
 #undef TRI_CULLED
     st_cur.tris += drawn;
@@ -2763,7 +2990,8 @@ static void draw_tris_(const u32 *idx, int nidx, int nverts) {
       int h1 = i0 == l1 || i1 == l1 || i2 == l1, h2 = i0 == l2 || i1 == l2 || i2 == l2;
       if (h1 && h2) {
         u32 x = i0 != l1 && i0 != l2 ? i0 : i1 != l1 && i1 != l2 ? i1 : i2;
-        GPUT(x, 0);
+        /* the window (l1, l2, x) in the triangle's order, or the reverse */
+        GPUT(x, (i0 == l1 && i1 == l2) || (i1 == l1 && i2 == l2) || (i2 == l1 && i0 == l2) ? 0 : 2);
         l1 = l2, l2 = x;
       } else if (h2) {
         /* y: after l2 in the triangle's order, z the other */
@@ -2888,7 +3116,9 @@ static void draw_lp(GLenum mode, const u32 *idx, int n) {
   if (set_state(&lp.prim, lp.cs, 0) < 0)
     return;
   int points = mode == GL_POINTS;
-  lp.prim = (lp.prim & ~7u) | (points ? MX_GS_PRIM_POINT : MX_GS_PRIM_LINE);
+  /* built here with XYZ2: not fogged */
+  lp.prim = (lp.prim & ~(7u | 1u << MX_GS_PRIM_FGE_SHIFT)) |
+            (points ? MX_GS_PRIM_POINT : MX_GS_PRIM_LINE);
   tm_uniforms(lp.tms, lp.tmt);
   lp.n = 0;
 #define LP_IX(k) (idx ? idx[k] : (u32)(k))
@@ -3127,7 +3357,10 @@ static void dl_record(const u32 *idx, int nidx, int nverts) {
     if (!share) {
       const float *x = (const float *)((const u8 *)gl.vptr + v * gl.vstride);
       pos[o][0] = x[0], pos[o][1] = x[1], pos[o][2] = gl.vsize > 2 ? x[2] : 0;
-      pos[o][3] = seq[o] >> 31 ? 1.0f : 0.0f;
+      {
+        u32 w = seq[o] >> 31 ? MXGL_ADC_W : 0;
+        memcpy(&pos[o][3], &w, 4);
+      }
     }
     if (gl.ta && gl.tptr) {
       const float *t = (const float *)((const u8 *)gl.tptr + v * gl.tstride);
@@ -3473,7 +3706,7 @@ void APIENTRY glCallList(GLuint id) {
         continue;
     }
     static u32 prim;
-    static float uni[VU_MXGLV_UNI_QW][4] MX_ALIGNED(16) = {
+    static float uni[MXGL_UNI_QW][4] MX_ALIGNED(16) = {
         [VU_MXGLV_CMUL] = {1, 1, 1, 1}}; /* the colour as it is */
     static struct dl_state last_st;
     static s32 last_k;
@@ -3494,6 +3727,7 @@ void APIENTRY glCallList(GLuint id) {
       if (set_state(&prim, uni[VU_MXGLV_CSCALE], k) < 0)
         continue;
       last_st = e->st, last_k = k, last_gen = vram_gen, last_serial = gs_serial;
+      prim &= ~(1u << MX_GS_PRIM_FGE_SHIFT); /* libgl's own program: no F */
     }
     memcpy(uni[VU_MXGLV_MVP], m, 64);
     tm_uniforms(uni[VU_MXGLV_TMS], uni[VU_MXGLV_TMT]);
@@ -3941,6 +4175,7 @@ static void draw_polys(void) {
   /* the nearest vertex of the polygons drawn, noted once (they share the
      texture and its LOD) */
   float wmin = 3.4e38f, wpoly;
+  const int vc = vu1_clips();
   if (prepare_state(ix, k, pq[0].n) && fastv_get(&fv)) {
     for (int i = 0; i < np; i++) {
       const u8 *vb = (const u8 *)pq[i].v;
@@ -3957,7 +4192,9 @@ static void draw_polys(void) {
       st_cur.calls++;
       st_cur.verts += (u32)n;
       wpoly = 3.4e38f;
-      if (mats_ok) {
+      if (vc) {
+        oand = 0;
+      } else if (mats_ok) {
         oand = vu0_xform_w(vb, vs, n, vp_cache, vo_cache, mats, &oor, tex_bias_auto ? &wpoly : NULL);
         if (oor & 0x80) {
           oand = 0x3F, oor = 0;
@@ -3995,7 +4232,7 @@ static void draw_polys(void) {
       wmin = wpoly < wmin ? wpoly : wmin;
       st_poly((const float *)vb + pq_st);
       if (!oor) {
-        if (gl.cull) {
+        if (gl.cull && !vc) {
           const float *pp[CLIP_MAX];
           for (int j = 0; j < n; j++)
             pp[j] = vp_cache[j];
@@ -4008,7 +4245,7 @@ static void draw_polys(void) {
         fv.vb = vb;
         fast_put(&fv, 0, 1);
         for (int q = 1, lo = 1, hi = n - 1; q < n; q++)
-          fast_put(&fv, (u32)((q & 1) ? lo++ : hi--), q < 2);
+          fast_put(&fv, (u32)((q & 1) ? lo++ : hi--), q < 2 ? 1 : (q & 1) * 2);
         st_cur.tris += (u32)n - 2;
       } else {
         u32 tc0 = mx_count();
@@ -4126,9 +4363,12 @@ void mxgl_DrawGlCmds(const int *cmds, const float *pos, int stride, const unsign
     vp_cache = vp_ram, vo_cache = vo_ram;
   }
   u32 oor;
-  if (xform_all((const u8 *)pos, stride, nv, &oor))
+  const int vc = vu1_clips();
+  if (vc)
+    memset(vo_cache, 0, (u32)nv);
+  else if (xform_all((const u8 *)pos, stride, nv, &oor))
     goto out;
-  const int cmode = !gl.cull ? 0 : gl.cullface == GL_FRONT_AND_BACK ? 3 : gl.cullface == GL_FRONT ? 1 : 2;
+  const int cmode = !gl.cull || vc ? 0 : gl.cullface == GL_FRONT_AND_BACK ? 3 : gl.cullface == GL_FRONT ? 1 : 2;
   u32 drawn = 0;
   for (const int *c = cmds;;) {
     int cnt = *c++;
@@ -4149,7 +4389,7 @@ void mxgl_DrawGlCmds(const int *cmds, const float *pos, int stride, const unsign
 #define GV(i) ((u32)e[3 * (i) + 2])
 #define PUT(i, adc)                                                                               \
   do {                                                                                            \
-    o_put_pos(o_n, (const u8 *)pos + GV(i) * (u32)stride, (adc) ? 0x3F800000u : 0);             \
+    o_put_pos(o_n, (const u8 *)pos + GV(i) * (u32)stride, MXGL_W(adc));             \
     o_put_st(o_n, &e[3 * (i)]);                                                                   \
     o_col[o_n] = col[GV(i)];                                                                      \
     o_n++;                                                                                        \
@@ -4171,7 +4411,7 @@ void mxgl_DrawGlCmds(const int *cmds, const float *pos, int stride, const unsign
         drawn += !cl;
         if (fan && (t & 1))
           PUT(0, 1);
-        PUT(ic, cl);
+        PUT(ic, cl ? 1 : (t & 1) * 2);
       }
       continue;
     }
@@ -4408,8 +4648,10 @@ static void set_cap(GLenum cap, int on) {
     gl.ucp_on = on;
     break;
   /* state the GS has not, or that changes no picture here */
-  case GL_DITHER: case GL_FOG: case GL_LIGHTING: case GL_NORMALIZE: case GL_LINE_SMOOTH:
-  case GL_POINT_SMOOTH: case GL_POLYGON_SMOOTH: case GL_STENCIL_TEST: case GL_COLOR_MATERIAL:
+  case GL_FOG: gl.fog = on; break;
+  case GL_DITHER: case GL_LIGHTING: case GL_NORMALIZE: case GL_LINE_SMOOTH:
+  case GL_STENCIL_TEST: gl.st_on = on; break;
+  case GL_POINT_SMOOTH: case GL_POLYGON_SMOOTH: case GL_COLOR_MATERIAL:
   case GL_TEXTURE_GEN_S: case GL_TEXTURE_GEN_T: case GL_POLYGON_OFFSET_LINE:
   case GL_POLYGON_OFFSET_POINT: case GL_TEXTURE_1D: case GL_LIGHT0:
     break;
@@ -4696,6 +4938,52 @@ void APIENTRY glDepthRange(GLclampd n, GLclampd f) {
 }
 
 void APIENTRY glBlendFunc(GLenum s, GLenum d) { pq_flush(), gl.sf = s, gl.dfac = d, st_serial++; }
+/* the fog's a and b (mxglvf.hlsl, mxglve.hlsl) */
+static void fog_update(void) {
+  if (gl.fog_mode == GL_LINEAR) {
+    float d = gl.fog_end - gl.fog_start;
+    gl.fog_a = d != 0 ? -255.0f / d : 0;
+    gl.fog_b = d != 0 ? 255.0f * gl.fog_end / d : 255.0f;
+  } else {
+    gl.fog_a = gl.fog_density;
+    gl.fog_b = gl.fog_mode == GL_EXP2;
+  }
+}
+static u32 fog_byte(float c) { return (u32)((c < 0 ? 0 : c > 1 ? 1 : c) * 255.0f + 0.5f); }
+void APIENTRY glFogfv(GLenum p, const GLfloat *v) {
+  pq_flush();
+  st_serial++;
+  switch (p) {
+  case GL_FOG_MODE:
+    if (v[0] != GL_LINEAR && v[0] != GL_EXP && v[0] != GL_EXP2) {
+      gl_error(GL_INVALID_ENUM);
+      return;
+    }
+    gl.fog_mode = (GLenum)v[0];
+    break;
+  case GL_FOG_DENSITY: gl.fog_density = v[0]; break;
+  case GL_FOG_START: gl.fog_start = v[0]; break;
+  case GL_FOG_END: gl.fog_end = v[0]; break;
+  case GL_FOG_COLOR:
+    gl.fog_col = fog_byte(v[0]) | fog_byte(v[1]) << 8 | fog_byte(v[2]) << 16;
+    break;
+  case GL_FOG_INDEX: break;
+  default: gl_error(GL_INVALID_ENUM); return;
+  }
+  fog_update();
+}
+void APIENTRY glFogf(GLenum p, GLfloat v) { glFogfv(p, &v); }
+void APIENTRY glFogi(GLenum p, GLint v) {
+  GLfloat f = (GLfloat)v;
+  glFogfv(p, &f);
+}
+void APIENTRY glFogiv(GLenum p, const GLint *v) {
+  GLfloat f[4] = {(GLfloat)v[0], 0, 0, 0};
+  if (p == GL_FOG_COLOR)
+    for (int i = 0; i < 3; i++) /* 0 .. INT_MAX is 0 .. 1 */
+      f[i] = (GLfloat)v[i] * (1.0f / 2147483647.0f);
+  glFogfv(p, f);
+}
 void APIENTRY glAlphaFunc(GLenum f, GLclampf r) { pq_flush(), gl.afunc = f, gl.aref = r, st_serial++; }
 void APIENTRY glDepthFunc(GLenum f) { pq_flush(), gl.dfunc = f, st_serial++; }
 void APIENTRY glDepthMask(GLboolean m) { pq_flush(), gl.dmask = m, st_serial++; }
@@ -4742,7 +5030,45 @@ void APIENTRY glClearColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a) {
   gl.clear[0] = r, gl.clear[1] = g, gl.clear[2] = b, gl.clear[3] = a;
 }
 
+static void clear_cz(GLbitfield mask);
+/* the alpha bit to 0 where a sprite covers: all of the buffer but for the scissor */
+static void clear_stencil(void) {
+  int x0 = 0, x1 = fb_w, y0 = 0, y1 = fb_h;
+  if (gl.scissor) {
+    x0 = gl.sc[0] * fb_w / gl_w, x1 = (gl.sc[0] + gl.sc[2]) * fb_w / gl_w;
+    y0 = (gl_h - (gl.sc[1] + gl.sc[3])) * fb_h / gl_h, y1 = (gl_h - gl.sc[1]) * fb_h / gl_h;
+  }
+  /* beam: context 2, without Z writes (ZBUF and SCISSOR are the passes') */
+  int ctx = beam != 0;
+  u32 n = beam ? 7 : 9;
+  u64 *c = mx_frame_reserve(2 + n);
+  c = mx_e_cnt(c, n + 1, mx_vif_flush(), mx_vif_direct(n + 1));
+  c = mx_e_ad_tag(c, n, 1);
+  c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_TEST_1, ctx), mx_gs_test(0, 0, 0, 0, 0, 0, 1, 1));
+  c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_FRAME_1, ctx), frame_reg(0x00FFFFFFu));
+  c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_FBA_1, ctx), 0);
+  if (!beam) {
+    c = mx_e_ad(c, MX_GS_REG_ZBUF_1, mx_gs_zbuf(rt[buf].zbp, rt[buf].zpsm, 1));
+    c = mx_e_ad(c, MX_GS_REG_SCISSOR_1, mx_gs_scissor(0, fb_w - 1, 0, fb_h - 1));
+  }
+  c = mx_e_ad(c, MX_GS_REG_PRIM, mx_gs_prim(MX_GS_PRIM_SPRITE, 0, 0, 0, 0, 0, 0, ctx, 0));
+  c = mx_e_ad(c, MX_GS_REG_RGBAQ, mx_gs_rgbaq(0, 0, 0, 0, 1));
+  c = mx_e_ad(c, MX_GS_REG_XYZ2, mx_gs_xyz(mx_gs_px((u32)x0), mx_gs_py((u32)y0), 0));
+  c = mx_e_ad(c, MX_GS_REG_XYZ2, mx_gs_xyz(mx_gs_px((u32)x1), mx_gs_py((u32)y1), 0));
+  mx_frame_commit(c);
+  gs.valid = 0, gs_serial++;
+}
 void APIENTRY glClear(GLbitfield mask) {
+  clear_cz(mask);
+  if ((mask & GL_STENCIL_BUFFER_BIT) && st_there()) {
+    frame_start();
+    flush_out();
+    clear_stencil();
+    gl.st_va = (int)(gl.st_clear & 255), gl.st_vb = -1;
+    st_serial++;
+  }
+}
+static void clear_cz(GLbitfield mask) {
   pq_flush();
   int was = in_frame;
   frame_start();
@@ -4761,9 +5087,11 @@ void APIENTRY glClear(GLbitfield mask) {
     y0 = (gl_h - (gl.sc[1] + gl.sc[3])) * fb_h / gl_h, y1 = (gl_h - gl.sc[1]) * fb_h / gl_h;
   }
   int z = (mask & GL_DEPTH_BUFFER_BIT) != 0, col = (mask & GL_COLOR_BUFFER_BIT) != 0;
-  u64 *c = mx_frame_reserve(2 + 8);
-  c = mx_e_cnt(c, 8, mx_vif_flush(), mx_vif_direct(8));
-  c = mx_e_ad_tag(c, 7, 1);
+  u64 *c = mx_frame_reserve(2 + 9);
+  c = mx_e_cnt(c, 9, mx_vif_flush(), mx_vif_direct(9));
+  c = mx_e_ad_tag(c, 8, 1);
+  c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_FRAME_1, !z),
+              frame_reg(col ? (gl.cmask & 0x00FFFFFFu) | 0x80000000u : 0x80000000u));
   c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_TEST_1, !z), mx_gs_test(0, 0, 0, 0, 0, 0, 1, 1));
   c = mx_e_ad(c, mx_gs_ctx(MX_GS_REG_ALPHA_1, !z), mx_gs_alpha(1, 1, 2, 1, 0));
   c = mx_e_ad(c, MX_GS_REG_PRIM, mx_gs_prim(MX_GS_PRIM_SPRITE, 0, 0, 0, !col, 0, 0, !z, 0));
@@ -4790,7 +5118,8 @@ void APIENTRY glClear(GLbitfield mask) {
   c = mx_e_ad(c, MX_GS_REG_ZBUF_1,
               mx_gs_zbuf(t->zbp, t->zpsm, !(mask & GL_DEPTH_BUFFER_BIT) || !gl.dmask));
   c = mx_e_ad(c, MX_GS_REG_FRAME_1,
-              mx_gs_frame(t->fbp, t->fbw, t->psm, (mask & GL_COLOR_BUFFER_BIT) ? gl.cmask : ~0u));
+              mx_gs_frame(t->fbp, t->fbw, t->psm,
+                          (mask & GL_COLOR_BUFFER_BIT) ? gl.cmask | 0x80000000u : ~0u));
   c = mx_e_ad(c, MX_GS_REG_SCISSOR_1, mx_gs_scissor(0, fb_w - 1, 0, fb_h - 1));
   c = mx_e_ad(c, MX_GS_REG_PRIM, mx_gs_prim(MX_GS_PRIM_SPRITE, 0, 0, 0, 0, 0, 0, 0, 0));
   c = mx_e_ad(c, MX_GS_REG_RGBAQ,
@@ -4924,7 +5253,7 @@ static void convert(struct tex *t, u32 lv, int x0, int y0, int w, int h, const u
     switch (f) {
     case 0:
       for (int x = 0; x < w; x++, s += 4)
-        dst[at + (u32)x] = pal_nearest(s);
+        dst[at + (u32)x] = pal_transp >= 0 && s[3] < 128 ? (u8)pal_transp : pal_nearest(s);
       break;
     case 1:
       for (int x = 0; x < w; x++, s += 4) {
@@ -5031,6 +5360,10 @@ static u8 *index_rgba(GLsizei w, GLsizei h, const GLvoid *px) {
     memcpy(o + 4 * i, pal[s[i]], 4);
   return o;
 }
+/* the next tex_set_image's texels are the shared palette's indices, a byte
+   each (glTexImage2D with GL_COLOR_INDEX, the palette on) */
+static int tex_indexed;
+
 static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const GLvoid *px);
 
 static void tex_drop_twin(struct tex *t) {
@@ -5141,8 +5474,15 @@ static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsi
   if (ifmt == GL_LUMINANCE || ifmt == GL_LUMINANCE8 || ifmt == 1 || ifmt == GL_INTENSITY ||
       ifmt == GL_INTENSITY8 || (format == GL_LUMINANCE && (ifmt == 3 || ifmt == GL_RGB)))
     tex_brightness = 1;
-  u8 *rgba = level == 0 ? (format == GL_COLOR_INDEX ? index_rgba(w, h, px) : to_rgba(format, w, h, px))
-                        : NULL;
+  /* indices of the shared palette are kept as they are */
+  if (level == 0 && format == GL_COLOR_INDEX && px && gl.shared_pal && pal_on && w >= 8 && h >= 8 &&
+      !(w & (w - 1)) && !(h & (h - 1))) {
+    tex_indexed = 1;
+    format = GL_RGBA;
+  }
+  u8 *rgba = level == 0 && !tex_indexed
+                 ? (format == GL_COLOR_INDEX ? index_rgba(w, h, px) : to_rgba(format, w, h, px))
+                 : NULL;
   if (rgba) {
     tex_image_2d(target, level, ifmt == GL_COLOR_INDEX8_EXT ? GL_RGBA : ifmt, w, h, border, GL_RGBA,
                  GL_UNSIGNED_BYTE, rgba);
@@ -5180,12 +5520,58 @@ static void tex_image_2d(GLenum target, GLint level, GLint ifmt, GLsizei w, GLsi
 }
 
 /* t's image, w x h RGBA8 texels s (NULL: zeros), at least 8 x 8 */
+/* t's levels from its level 0 of indices: each texel the box of four, through
+   the palette (a box of one index: that index, the usual case in a game's
+   8-bit art); transparent when half of the box is */
+static void index_levels(struct tex *t) {
+  u32 w = t->w, h = t->h;
+  if (t->max_levels < 2)
+    return;
+  u8 black[3] = {0, 0, 0};
+  pal_nearest(black); /* pal_near made */
+  if (!pal_near)
+    return;
+  for (u32 lv = 1; lv < t->max_levels; lv++) {
+    u32 nw = w >> 1, nh = h >> 1;
+    const u8 *up = TLV(t, lv - 1);
+    u8 *dn = TLV(t, lv);
+    for (u32 y = 0; y < nh; y++) {
+      const u8 *p = up + 2 * y * w;
+      for (u32 x = 0; x < nw; x++, p += 2) {
+        u32 a = p[0], b = p[1], c = p[w], d = p[w + 1];
+        if (a == b && a == c && a == d) {
+          *dn++ = (u8)a;
+          continue;
+        }
+        u32 r = 0, g = 0, bl = 0, n = 0, ix[4] = {a, b, c, d};
+        for (int k = 0; k < 4; k++)
+          if ((int)ix[k] != pal_transp) {
+            const u8 *e = pal_rgb[ix[k]];
+            r += e[0], g += e[1], bl += e[2], n++;
+          }
+        if (n < 2) {
+          *dn++ = (u8)pal_transp;
+          continue;
+        }
+        r /= n, g /= n, bl /= n;
+        *dn++ = pal_near[r >> 3 | (g >> 3) << 5 | (bl >> 3) << 10];
+      }
+    }
+    w = nw, h = nh;
+  }
+  t->levels = t->max_levels;
+}
+
 static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const GLvoid *px) {
   /* alpha in the texels? Only 0 and 255 (a colour key: Descent 3's 1555)
      fits 16 bits (the alpha bit, TEXA); other alpha takes 32 */
-  int alpha = 0, alpha8 = 0;
+  int alpha = 0, alpha8 = 0, indexed = tex_indexed;
   const u8 *s = px;
-  if (s && ifmt != GL_RGB && ifmt != GL_RGB8 && ifmt != GL_RGB5 && ifmt != 3)
+  tex_indexed = 0;
+  if (indexed) {
+    for (int i = 0; i < w * h && !alpha; i++)
+      alpha = s[i] == pal_transp;
+  } else if (s && ifmt != GL_RGB && ifmt != GL_RGB8 && ifmt != GL_RGB5 && ifmt != 3)
     for (int i = 0; i < w * h; i++)
       if (s[i * 4 + 3] != 255) {
         alpha = 1;
@@ -5205,13 +5591,13 @@ static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const
   if (planar)
     tex_brightness = 1, tex_one_level = 1;
   t->planar = (u8)planar;
-  /* opaque texels all of the game's palette: its indices (T8, exact), else
-     16 bits */
-  int pal = 0;
-  if (!tex_brightness && !alpha && pal_on && s) {
+  /* texels all of the game's palette (the transparent ones its transparent
+     entry, if it has one): its indices (T8, exact), else 16 bits */
+  int pal = indexed;
+  if (!indexed && !tex_brightness && (!alpha || (pal_transp >= 0 && !alpha8)) && pal_on && s) {
     pal = 1;
     for (int i = 0; i < w * h && pal; i++)
-      if (pal_find((u32)s[i * 4] | (u32)s[i * 4 + 1] << 8 | (u32)s[i * 4 + 2] << 16) < 0)
+      if (s[i * 4 + 3] && pal_find((u32)s[i * 4] | (u32)s[i * 4 + 1] << 8 | (u32)s[i * 4 + 2] << 16) < 0)
         pal = 0;
   }
   t->bright = tex_brightness;
@@ -5245,6 +5631,9 @@ static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const
     free(one);
     if (!ok)
       gl_error(GL_OUT_OF_MEMORY);
+  } else if (indexed) {
+    memcpy(TLV(t, 0), s, (size_t)(w * h));
+    index_levels(t);
   } else if (s) {
     convert(t, 0, 0, 0, w, h, s);
     make_levels(t, s);
@@ -5422,7 +5811,9 @@ void APIENTRY glGetIntegerv(GLenum p, GLint *v) {
   case GL_ACTIVE_TEXTURE: *v = (GLint)(GL_TEXTURE0 + gl.cunit); break;
   case GL_CLIENT_ACTIVE_TEXTURE: *v = (GLint)(GL_TEXTURE0 + gl.ccunit); break;
   case GL_RED_BITS: case GL_GREEN_BITS: case GL_BLUE_BITS: *v = rgb24 ? 8 : 5; break;
-  case GL_ALPHA_BITS: case GL_STENCIL_BITS: *v = 0; break;
+  case GL_ALPHA_BITS: *v = 0; break;
+  /* the frame buffer's alpha bit: none in 24-bit colour */
+  case GL_STENCIL_BITS: *v = st_there(); break;
   case GL_DEPTH_BITS: *v = zmax == ZMAX_Z16 ? 16 : 24; break;
   case GL_MAX_LIST_NESTING: *v = 1; break;
   case GL_MAX_VIEWPORT_DIMS: v[0] = 2048, v[1] = 2048; break;
@@ -5443,6 +5834,7 @@ GLboolean APIENTRY glIsEnabled(GLenum cap) {
   case GL_SHARED_TEXTURE_PALETTE_EXT: return (GLboolean)gl.shared_pal;
   case GL_BLEND: return (GLboolean)gl.blend;
   case GL_ALPHA_TEST: return (GLboolean)gl.atest;
+  case GL_FOG: return (GLboolean)gl.fog;
   case GL_DEPTH_TEST: return (GLboolean)gl.dtest;
   case GL_CULL_FACE: return (GLboolean)gl.cull;
   case GL_SCISSOR_TEST: return (GLboolean)gl.scissor;
@@ -5599,10 +5991,23 @@ void APIENTRY glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
   }
   gl.cmask = m;
 }
-void APIENTRY glStencilFunc(GLenum f, GLint r, GLuint m) {}
-void APIENTRY glStencilOp(GLenum a, GLenum b, GLenum c) {}
-void APIENTRY glStencilMask(GLuint m) {}
-void APIENTRY glClearStencil(GLint s) {}
+void APIENTRY glStencilFunc(GLenum f, GLint r, GLuint m) {
+  pq_flush();
+  gl.st_func = f, gl.st_ref = r, gl.st_mask = m;
+  st_serial++;
+}
+void APIENTRY glStencilOp(GLenum a, GLenum b, GLenum c) {
+  (void)a, (void)b; /* what fails is not written: see gl.st_on */
+  pq_flush();
+  gl.st_op = c;
+  st_serial++;
+}
+void APIENTRY glStencilMask(GLuint m) {
+  pq_flush();
+  gl.st_wmask = m;
+  st_serial++;
+}
+void APIENTRY glClearStencil(GLint s) { gl.st_clear = (u32)s; }
 void APIENTRY glClearDepth(GLclampd d) {}
 void APIENTRY glPolygonOffset(GLfloat factor, GLfloat units) {
   if (factor != gl.pofactor || units != gl.pounits) {
@@ -5633,6 +6038,7 @@ void APIENTRY glClipPlanef(GLenum p, const GLfloat *e) { clip_plane(p, e); }
 void APIENTRY glLockArraysEXT(GLint first, GLsizei count) {
   lk.on = 1;
   lk.valid = 0;
+  lk.count = first + count;
 }
 void APIENTRY glUnlockArraysEXT(void) { lk.on = lk.valid = 0; }
 /* GL_EXT_paletted_texture, GL_EXT_shared_texture_palette: a palette of up
@@ -5656,6 +6062,10 @@ void APIENTRY glColorTableEXT(GLenum target, GLenum ifmt, GLsizei width, GLenum 
     for (int i = 0; i < 256; i++)
       memcpy(rgb + 3 * i, rgba[i], 3);
     pq_flush();
+    pal_transp = -1;
+    for (int i = 0; i < 256 && pal_transp < 0; i++)
+      if (!rgba[i][3])
+        pal_transp = i;
     mxgl_Palette(rgb);
     memcpy(pal_rgba, rgba, sizeof rgba);
     return;
@@ -5967,7 +6377,7 @@ static int start_mode(int mode, int flags) {
     start_buffers(&video_1080i_frame, 640, 540, MX_GS_PSM_Z16S);
     scr_w = 1920, scr_h = 1080;
   } else {
-    start_buffers(pal ? &mx_video_pal : &mx_video_ntsc, 640, pal ? 512 : 448, MX_GS_PSM_Z24);
+    start_buffers(pal ? &mx_video_pal : &mx_video_ntsc, MXGL_FB_W, pal ? 512 : 448, MXGL_FB_Z);
     scr_w = fb_w, scr_h = fb_h;
   }
   return flags & MXGL_BEAM ? -1 : 0;
@@ -6014,7 +6424,8 @@ int mxgl_set_mode(int mode) {
   u32 p0 = mx_gs.tbp / 32, p1 = (vram_lo + 31) / 32;
   if (mx_vram_take(p0, p1 - p0, MX_VRAM_APP) < 0)
     mx_printf("mxgl: GS memory for the font and CLUTs taken\n");
-  vram_lo = p1 * 32;
+  /* the pages below the buffers count too (beam racing's start high: mx_hires_init) */
+  vram_lo = (p1 - (beam ? mx_gs.fbp[0] : 0)) * 32;
   /* beam racing: uploads go in the once records (PATH3), ahead of the
      passes of the frames before: only what the GS is done with goes */
 #ifndef MXGL_VCACHE_POLICY
@@ -6058,7 +6469,22 @@ void mxgl_init(void) {
   gl_stream = mx_heap_create("gl.stream", MX_MEM_STREAM, 0);
   if (mx_vm_active())
     gl_assets = mx_heap_create("gl.textures", MX_MEM_ASSET, GL_ASSET_BYTES);
+#if MXGL_VU1CLIP
+  shader = MX_VU_SHADER(MXGLC, mxglc_vu, mxglc_vu_end);
+#else
   shader = MX_VU_SHADER(MXGLV, mxglv_vu, mxglv_vu_end);
+#endif
+#if MXGL_VU1CLIP
+  struct mx_shader fs = MX_VU_SHADER(MXGLCF, mxglcf_vu, mxglcf_vu_end);
+  fog_program(0, &fs);
+  fs = MX_VU_SHADER(MXGLCE, mxglce_vu, mxglce_vu_end);
+  fog_program(1, &fs);
+#else
+  struct mx_shader fs = MX_VU_SHADER(MXGLVF, mxglvf_vu, mxglvf_vu_end);
+  fog_program(0, &fs);
+  fs = MX_VU_SHADER(MXGLVE, mxglve_vu, mxglve_vu_end);
+  fog_program(1, &fs);
+#endif
   for (int i = 0; i < 2; i++) {
     arena[i] = mx_heap_alloc(gl_stream, ARENA_BYTES, 64);
     /* written through UCAB only: no line of them may be in the cache */
@@ -6080,8 +6506,11 @@ void mxgl_init(void) {
   gl.mode = GL_MODELVIEW;
   gl.vp[2] = gl_w, gl.vp[3] = gl_h; /* the window of mxgl_set_mode */
   gl.df = 1;
+  gl.fog_mode = GL_EXP, gl.fog_density = 1, gl.fog_end = 1; /* GL's defaults */
+  gl.fog_a = 1;
   gl.sf = GL_ONE, gl.dfac = GL_ZERO;
   gl.dfunc = GL_LESS, gl.dmask = 1, gl.cullface = GL_BACK, gl.afunc = GL_ALWAYS;
+  gl.st_func = GL_ALWAYS, gl.st_op = GL_KEEP, gl.st_mask = ~0u, gl.st_wmask = ~0u, gl.st_vb = -1;
   gl.texenv = GL_MODULATE;
   gl.color[0] = gl.color[1] = gl.color[2] = gl.color[3] = 1;
   gl.col8 = 0xFFFFFFFFu;
@@ -6201,6 +6630,7 @@ struct vprog {
   u32 at;             /* the code's address */
   const struct mxgl_vu1_binary *bin;
   int r_mvp, r_cscale, r_tms, r_tmt; /* libgl's uniforms: quadwords, -1 none */
+  int r_clip;                        /* mxglc.i's clipping uniforms */
   float (*uni)[4];
 };
 static struct {
@@ -6211,6 +6641,25 @@ static struct {
   const char *log;
 } glsl[MAX_GLSL];
 static u32 vu1_next;
+
+/* room in VU1's micro memory for n double words, after libgl's own program */
+static u32 vu1_place(u32 n) {
+  u32 own = (shader.code_bytes + 7) / 8;
+  if (vu1_next < own || vu1_next + n > VU1_CODE)
+    vu1_next = own;
+  u32 at = vu1_next;
+  vu1_next += n;
+  return at;
+}
+
+/* a fog program: placed once, drawn with o_uni (no uni of its own) */
+static void fog_program(int i, const struct mx_shader *s) {
+  static struct vprog progs[2];
+  struct vprog *p = fog_prog[i] = &progs[i];
+  p->at = vu1_place((s->code_bytes + 7) / 8);
+  p->s = *s;
+  p->s.entry = s->entry + p->at;
+}
 
 /* the stream's program becomes p's (NULL: libgl's own); its shader */
 static const struct mx_shader *vprog_use(struct vprog *p) {
@@ -6235,12 +6684,16 @@ static const struct mx_shader *vprog_use(struct vprog *p) {
 /* p's uniforms with libgl's (mvp, cscale, tms, tmt) from those of its own
    program; fixed itself for libgl's */
 static const void *vprog_uni(struct vprog *p, const float (*fixed)[4]) {
-  if (!p)
+  if (!p || !p->uni) /* libgl's own, the fog programs: its layout */
     return fixed;
   if (p->r_mvp >= 0)
     memcpy(p->uni[p->r_mvp], fixed[VU_MXGLV_MVP], 64);
   if (p->r_cscale >= 0)
     memcpy(p->uni[p->r_cscale], fixed[VU_MXGLV_CSCALE], 16);
+#if MXGL_VU1CLIP
+  if (p->r_clip >= 0)
+    memcpy(p->uni[p->r_clip], fixed[VU_MXGLV_UNI_QW], (MXGL_UNI_QW - VU_MXGLV_UNI_QW) * 16);
+#endif
   if (p->r_tms >= 0)
     memcpy(p->uni[p->r_tms], fixed[VU_MXGLV_TMS], 16);
   if (p->r_tmt >= 0)
@@ -6370,10 +6823,7 @@ void APIENTRY glLinkProgram(GLuint prog) {
     gl_free(p->uni);
     p->uni = NULL;
   }
-  if (vu1_next < own || vu1_next + n > VU1_CODE)
-    vu1_next = own;
-  p->at = vu1_next;
-  vu1_next += n;
+  p->at = vu1_place(n);
   p->s = s;
   p->s.entry = s.entry + p->at;
   p->bin = b;
@@ -6388,6 +6838,7 @@ void APIENTRY glLinkProgram(GLuint prog) {
   int k;
   p->r_mvp = (k = uni_find(b, "mvp")) >= 0 ? b->uni[k].at : -1;
   p->r_cscale = (k = uni_find(b, "cscale")) >= 0 ? b->uni[k].at : -1;
+  p->r_clip = (k = uni_find(b, "clip")) >= 0 ? b->uni[k].at : -1;
   p->r_tms = (k = uni_find(b, "tms")) >= 0 ? b->uni[k].at : -1;
   p->r_tmt = (k = uni_find(b, "tmt")) >= 0 ? b->uni[k].at : -1;
   glsl[prog].p = p;
@@ -6421,7 +6872,7 @@ void APIENTRY glGetProgramInfoLog(GLuint prog, GLsizei size, GLsizei *len, GLcha
 }
 void APIENTRY glUseProgram(GLuint prog) {
   if (!prog) {
-    cur_prog = NULL;
+    cur_prog = NULL, cur_prog_clips = 0;
     return;
   }
   if (!glsl_is(prog, 2) || !glsl[prog].linked) {
@@ -6429,6 +6880,7 @@ void APIENTRY glUseProgram(GLuint prog) {
     return;
   }
   cur_prog = glsl[prog].p;
+  cur_prog_clips = cur_prog->r_clip >= 0;
 }
 /* a float's index in the uniforms (the member's first), or -1 */
 GLint APIENTRY glGetUniformLocation(GLuint prog, const GLchar *name) {
@@ -6579,6 +7031,10 @@ static const struct {
     {"glEndList", (void (*)(void))glEndList},
     {"glFinish", (void (*)(void))glFinish},
     {"glFlush", (void (*)(void))glFlush},
+    {"glFogf", (void (*)(void))glFogf},
+    {"glFogfv", (void (*)(void))glFogfv},
+    {"glFogi", (void (*)(void))glFogi},
+    {"glFogiv", (void (*)(void))glFogiv},
     {"glFrustum", (void (*)(void))glFrustum},
     {"glFrustumf", (void (*)(void))glFrustumf},
     {"glGenBuffers", (void (*)(void))glGenBuffers},

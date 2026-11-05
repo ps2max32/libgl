@@ -1,0 +1,5 @@
+; libgl's vertex program with clipping and culling on VU1 (mxglc.i)
+	.section .vutext, "ax", @progbits
+	.set MXGLC_COLOUR, 0
+	.set MXGLC_FOG, 0
+	.include "mxglc.i"

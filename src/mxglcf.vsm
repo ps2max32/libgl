@@ -1,0 +1,21 @@
+; mxglc.vsm with GL_LINEAR fog, as mxglvf.hlsl: F = a * w + b, clamped to 0..255, with
+; tms.w a and tmt.w b (vf1.w, vf3.w)
+	.section .vutext, "ax", @progbits
+	.set MXGLC_COLOUR, 0
+	.set MXGLC_FOG, 1
+	.macro mxglc_fog
+	mulaw.w acc, vf3, vf0w		loi 0x437f0000
+	maddw.w vf26, vf1, vf12w	nop
+	muli.w vf27, vf0, i		nop
+	nop				nop
+	nop				nop
+	maxx.w vf26, vf26, vf0x		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	mini.w vf26, vf26, vf27		nop
+	nop				nop
+	nop				nop
+	nop				nop
+	.endm
+	.include "mxglc.i"

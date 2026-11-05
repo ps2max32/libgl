@@ -1,0 +1,80 @@
+; glvsm: libgl's vertex program (src/mxglv.hlsl) by hand, not pipelined: the
+; starting point for hand-written VU1 programs. It keeps the entry ABI of a
+; compiled vertex program (llvm lib/Target/VU/VUEntryABI.md): MSCAL at the
+; start for a draw's first batch, which loads the uniforms from the context
+; at ITOP; each batch ends with XGKICK and an E bit, and MSCNT goes on after
+; it. Its layout, the header a compiled program gets from llc, is glvsm.h.
+;
+;   vf1 tms   vf2 (tms.z, tmt.z)   vf3 tmt   vf4-7 mvp   vf8 cmul   vf9 cadd
+;   vf10 cscale   vf19.x 1.5 * 2^23 (rounds the colour to an integer)
+;   vi1 the buffer   vi3 the vertex   vi4 vertices to do
+	.section .vutext, "ax", @progbits
+	.globl glvsm_vu
+glvsm_vu:
+	nop				xitop vi1
+	nop				lq.xyzw vf1, 6(vi1)
+	nop				lq.xyzw vf3, 7(vi1)
+	nop				lq.xyzw vf4, 1(vi1)
+	nop				lq.xyzw vf5, 2(vi1)
+	nop				lq.xyzw vf6, 3(vi1)
+	nop				lq.xyzw vf7, 4(vi1)
+	nop				lq.xyzw vf8, 8(vi1)
+	nop				lq.xyzw vf9, 9(vi1)
+	nop				lq.xyzw vf10, 5(vi1)
+	addz.xyz vf2, vf0, vf1z		loi 0x4b400000
+	addz.y vf2, vf0, vf3z		nop
+	addi.x vf19, vf0, i		nop
+batch:
+	nop				xtop vi1
+	nop				xitop vi2
+	nop				ilw.x vi4, 0(vi1)
+	nop				ilw.x vi3, 0(vi2)
+	nop				lq.xyzw vf11, 0(vi2)
+	nop				nop
+	nop				nop
+	nop				nop
+	nop				ior vi2, vi3, vi4
+	nop				sq.xyzw vf11, 253(vi1)
+	nop				nop
+	nop				ibeq vi4, vi0, done
+	nop				isw.x vi2, 253(vi1)
+	nop				iaddi vi3, vi1, 1
+loop:
+	nop				lq.xyzw vf13, 0(vi3)
+	nop				lq.xyzw vf15, 1(vi3)
+	nop				lq.xyzw vf14, 2(vi3)
+	mulaw.xyzw acc, vf7, vf0w	nop
+	maddax.xyzw acc, vf4, vf13x	nop
+	madday.xyzw acc, vf5, vf13y	nop
+	maddz.xyzw vf12, vf6, vf13z	nop
+	addw.x vf13, vf0, vf13w		nop
+	mulaw.xyzw acc, vf2, vf0w	nop
+	maddax.xyzw acc, vf1, vf15x	div q, vf0w, vf12w
+	maddy.xyzw vf15, vf3, vf15y	nop
+	ftoi0.x vf13, vf13		nop
+	itof0.xyzw vf14, vf14		nop
+	mulaw.xyzw acc, vf9, vf0w	nop
+	madd.xyzw vf18, vf8, vf14	nop
+	nop				mtir vi5, vf13x
+	mul.xyzw vf17, vf18, vf10	nop
+	nop				iaddiu vi5, vi5, 32767
+	addx.xyzw vf17, vf17, vf19x	waitq
+	mulq.xyzw vf15, vf15, q		nop
+	mulq.xyzw vf14, vf12, q		nop
+	addq.z vf15, vf0, q		nop
+	ftoi4.xyzw vf16, vf14		nop
+	nop				sq.xyzw vf17, 254(vi3)
+	nop				sq.xyzw vf15, 253(vi3)
+	nop				mfir.w vf16, vi5
+	nop				iaddi vi4, vi4, -1
+	nop				sq.xyzw vf16, 255(vi3)
+	nop				nop
+	nop				ibne vi4, vi0, loop
+	nop				iaddi vi3, vi3, 3
+done:
+	nop				iaddiu vi1, vi1, 253
+	nop				xgkick vi1
+	nop[e]				nop
+	nop				nop
+	nop				b batch
+	nop				nop

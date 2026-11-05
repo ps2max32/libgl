@@ -23,7 +23,7 @@ by name (core and ARB/EXT names):
 | `GL_ARB_texture_env_combine` | COMBINE as MODULATE or REPLACE (COMBINE_RGB), RGB_SCALE 1 or 2 (the GS's modulate takes the colour up to 2x) |
 | `GL_EXT_compiled_vertex_array` | between `glLockArraysEXT` and `glUnlockArraysEXT` a draw's transformed vertices are kept for the next draws of the same arrays and matrices (Quake 3's stages) |
 | `GL_EXT_draw_range_elements`, `GL_EXT_multi_draw_arrays`, `GL_IBM_multimode_draw_arrays` | `glDrawRangeElements` (no index searched), `glMultiDrawArrays`, `glMultiModeDrawArraysIBM`: a model's strips and fans in one draw |
-| `GL_EXT_paletted_texture`, `GL_EXT_shared_texture_palette` | `glColorTableEXT` and `GL_COLOR_INDEX` texels; the textures whose texels are all of the shared palette are kept as its indices (T8 with one CLUT: exact, half the memory of 16 bits) |
+| `GL_EXT_paletted_texture`, `GL_EXT_shared_texture_palette` | `glColorTableEXT` and `GL_COLOR_INDEX` texels; the textures whose texels are all of the shared palette are kept as its indices (T8 with one CLUT: exact, half the memory of 16 bits); an entry with alpha 0 (`GL_RGBA` table) is the transparent one: textures keyed with alpha 0 are kept so too; `GL_COLOR_INDEX` texels with the palette enabled are stored as they are, sides of powers of two from 8 up (no RGBA on the way: a game's 8-bit art loads several times faster) |
 | `GL_OES_compressed_paletted_texture` | `glCompressedTexImage2D` of 16 or 256 colours: T8 with the texture's own CLUT, its levels as given |
 | `GL_SGIS_generate_mipmap`, `GL_EXT_texture_edge_clamp` | the levels are made here anyway; CLAMP_TO_EDGE is the GS's clamp |
 | `GL_PS2_vertex_program_binary` | GL 2.0's vertex shaders as VU1 programs from HLSL (`glShaderBinary` with `GL_PS2_VU1_BINARY`, `glLinkProgram`, `glUseProgram`, `glUniform*`); below |
@@ -47,6 +47,14 @@ NAME_vu1)`; then `glAttachShader`, `glLinkProgram`, `glUseProgram`, `glGetUnifor
 - Quake 3's `code/ps2/q3stage.hlsl`: a stage's `rgbGen`/`alphaGen` as `col * cmul + cadd`
   (and the vertex light's hue), so the EE no longer fills a colour per vertex and stage.
 
+Fog (`glEnable(GL_FOG)`, `glFog*`, `GL_LINEAR`, `GL_EXP`, `GL_EXP2`) is the GS's: `PRIM.FGE` and
+`FOGCOL`, the fog value per vertex in `XYZF2` from libgl's programs `src/mxglvf.hlsl` (linear) and
+`src/mxglve.hlsl` (exponential), which have `mxglv.hlsl`'s data layout (no FLUSH when fog goes on or
+off; draws without fog are as they were). The GS interpolates the value across a triangle without
+perspective, and it has 8 bits. The eye distance is the vertex's w, so it needs a perspective
+projection (w is 1 under `glOrtho`: one value for all). Display lists, lines and points, and a
+game's own vertex programs are drawn without fog.
+
 Display lists (`glNewList` .. `glCallList`) hold their draws as DMA chains the frame calls,
 with the matrices of the call; `glReadPixels` reads colour and depth (the stream drawn first:
 slow); `glClipPlane` (one plane), `glPolygonOffset` (a Z bias), `glColorMask` (FBMSK), the
@@ -61,10 +69,16 @@ What the GS cannot do is left out or done another way:
   `DST_COLOR ONE` (a dynamic light) is `Cd * (1 + As)`, the vertex alpha the light's strength.
   Colour in these is lost; a game can tint the surface's own pass (Quake 3 uses the vertex
   light's hue).
-- No destination alpha (`GL_ALPHA_BITS` 0): `DST_ALPHA` is 1. No stencil. The depth tests
+- No destination alpha (`GL_ALPHA_BITS` 0): `DST_ALPHA` is 1. The depth tests
   are LESS, LEQUAL (EQUAL: the same vertices), ALWAYS, NEVER (GS Z is larger nearer).
-- In 1080i `glColorMask`, `glScissor` and `glReadPixels` are not kept (the passes own the
-  buffer).
+- With beam racing `glScissor` and `glReadPixels` are not kept (the passes own SCISSOR and
+  draw the buffer in strips).
+- The stencil is one bit (`GL_STENCIL_BITS` 1, 0 in 24-bit colour): the frame buffer's alpha
+  bit, tested with `TEST.DATE`, and two values, the clear value and the first other one
+  written, for masks and shadows drawn once. No counting (shadow volumes). `glStencilOp`'s
+  fail and depth-fail operations are not done. A write of the first value with colour on is
+  left out. A colour clear keeps the bit, but the frame's first clear (mx_frame_begin) sets
+  it: `glClear` the stencil before using it.
 - Textures up to 128 x 128 (`GL_MAX_TEXTURE_SIZE`), sides of powers of two (others are
   scaled). A MIN_FILTER without MIPMAP draws level 0 only (GLQuake's lightmaps: a level below
   mixes the surfaces packed next to each other).
