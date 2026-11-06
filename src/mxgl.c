@@ -3054,7 +3054,7 @@ static void lp_fetch(struct cv *v, u32 i) {
   }
 }
 
-#define LP_RUN 120 /* vertices a packet (3 quadwords each) */
+#define LP_RUN 80 /* vertices a packet (3 quadwords each): it must fit a half of the frame stream (beam racing: 255 quadwords) */
 static struct {
   u32 prim, n;
   float cs[4], tms[4], tmt[4];
