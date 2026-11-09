@@ -577,6 +577,10 @@ static void frame_start(void) {
   }
   e = mx_e_ad(e, MX_GS_REG_PRMODECONT, 1);
   e = mx_e_ad(e, MX_GS_REG_COLCLAMP, 1);
+  /* the dither matrix: the manual's 4 x 4, offsets -4 to 3, a whole step
+     of 5 bits (8 of 255), so every shade between two dithers. The GS then
+     keeps the top 5 bits: a write is 4 of 255 darker on average (8 bits
+     would need offsets 0 to 7; DIMX has -4 to 3) */
   e = mx_e_ad(e, MX_GS_REG_DIMX, 0x6071243571603524ull);
   e = mx_e_ad(e, MX_GS_REG_DTHE, !rgb24); /* not defined into 32 bits */
   if (!beam)
@@ -1790,10 +1794,16 @@ static void make_mvp(float *m) {
   memset(vpm, 0, 64);
   float vx = (float)gl.vp[0], vy = (float)gl.vp[1], vw = (float)gl.vp[2], vh = (float)gl.vp[3];
   float r = (float)fb_h / (float)gl_h, rx = (float)fb_w / (float)gl_w;
+  /* GL samples a pixel at its centre (x + 0.5), the GS at its corner (x):
+     half a pixel of the picture less, or the picture lay half a pixel right
+     and down of GL's (measured against Mesa: GLQuake at +0.5, +0.5) and
+     pixel-aligned 2D sampled its texels between two. With beam racing the
+     buffer is a field (its line two of the picture's, the fields half a
+     line apart): half a picture line is a quarter of a buffer line. */
   vpm[0] = vw / 2 * rx;
-  vpm[12] = 2048.0f - fb_w / 2 + (vx + vw / 2) * rx;
+  vpm[12] = 2048.0f - fb_w / 2 + (vx + vw / 2) * rx - 0.5f;
   vpm[5] = -vh / 2 * r;
-  vpm[13] = 2048.0f - fb_h / 2 + (gl_h - vy - vh / 2) * r;
+  vpm[13] = 2048.0f - fb_h / 2 + (gl_h - vy - vh / 2) * r - (beam ? 0.25f : 0.5f);
   vpm[10] = -zmax * (gl.df - gl.dn) / 2;
   vpm[14] = zmax * (1 - gl.dn - (gl.df - gl.dn) / 2);
   vpm[15] = 1;
