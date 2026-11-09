@@ -57,10 +57,14 @@ game's own vertex programs are drawn without fog.
 
 Display lists (`glNewList` .. `glCallList`) hold their draws as DMA chains the frame calls,
 with the matrices of the call; `glReadPixels` reads colour and depth (the stream drawn first:
-slow); `glClipPlane` (one plane), `glPolygonOffset` (a Z bias), `glColorMask` (FBMSK), the
+slow), and so does `glCopyTexSubImage2D` (into the bound texture); `glGetTexImage` gives level 0; `glFrontFace`; `glClipPlane` (one plane), `glPolygonOffset` (a Z bias), `glColorMask` (FBMSK), the
 texture matrix (on VU1), lines and points (on the EE) are there.
 
 What the GS cannot do is left out or done another way:
+- An RGBA texture whose texels are all grey and opaque (or black with alpha 0: a lightmap
+  block's unused texels) is kept as its brightness (T8, 8 bits, exact; Quakespasm's lightmaps),
+  with a CLUT of alpha 1 when drawn other than in a product (those black texels are then
+  opaque).
 - Blends with the destination colour (lightmaps) are `Cd * As`: a luminance texture
   (internal format `GL_LUMINANCE8`, `GL_LUMINANCE`, `GL_INTENSITY8`) is kept as its brightness
   (the largest of R, G and B; T8 with a CLUT that puts it in alpha). A colour texture in such

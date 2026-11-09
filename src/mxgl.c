@@ -260,6 +260,8 @@ struct tex {
   u8 alpha;
   u8 alpha_fmt;          /* its format has alpha (REPLACE takes the texture's) */
   u8 bright;             /* T8 brightness texture (CLUT_2X/1X/INV) */
+  u8 grey;               /* bright, from RGBA texels all grey and opaque (Quakespasm's
+                            lightmaps): CLUT_GREY when not in a product */
   u8 planar;             /* mxgl_color_light's GL_RGB8 texture without MIPMAP (a
                             lightmap): its texels the red channel's brightness,
                             twin[2], twin[3] the green and blue ones; no levels */
@@ -987,9 +989,10 @@ static void texflush(void) {
 /* the CLUTs of the brightness textures (T8): entry i is grey i, and in
    alpha (0x80 is 1.0 in the blend Cd * As): i (up to 2x, for overbright),
    i / 2 (1x), (255 - i) / 2 (1x of the inverse, blendFunc ZERO
-   ONE_MINUS_SRC_COLOR); in CSM1's order (bits 3 and 4 of the index
-   swapped), each 16 x 16 CT32 (4 blocks) */
-enum { CLUT_2X, CLUT_1X, CLUT_INV, NCLUT };
+   ONE_MINUS_SRC_COLOR), 1.0 (CLUT_GREY: a grey RGBA texture drawn other
+   than in a product, as GL draws it); in CSM1's order (bits 3 and 4 of the
+   index swapped), each 16 x 16 CT32 (4 blocks) */
+enum { CLUT_2X, CLUT_1X, CLUT_INV, CLUT_GREY, NCLUT };
 static u32 clut_cbp;
 static u32 clut[NCLUT][256] MX_ALIGNED(64);
 
@@ -1084,6 +1087,7 @@ static void clut_make(void) {
     clut[CLUT_2X][at] = g | i << 24;
     clut[CLUT_1X][at] = g | ((i + 1) >> 1) << 24;
     clut[CLUT_INV][at] = g | ((256 - i) >> 1) << 24;
+    clut[CLUT_GREY][at] = g | 0x80u << 24;
   }
   mx_dcache_writeback(clut, sizeof clut);
 }
@@ -1537,7 +1541,7 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   }
 
   u64 alpha = 0;
-  clut_pick = CLUT_1X;
+  clut_pick = t && t->grey ? CLUT_GREY : CLUT_1X;
   int abe = gl.blend ? blend_mode(&alpha, t) : 0;
   if (abe < 0)
     return -1;
@@ -4997,7 +5001,19 @@ void APIENTRY glFogiv(GLenum p, const GLint *v) {
 void APIENTRY glAlphaFunc(GLenum f, GLclampf r) { pq_flush(), gl.afunc = f, gl.aref = r, st_serial++; }
 void APIENTRY glDepthFunc(GLenum f) { pq_flush(), gl.dfunc = f, st_serial++; }
 void APIENTRY glDepthMask(GLboolean m) { pq_flush(), gl.dmask = m, st_serial++; }
-void APIENTRY glCullFace(GLenum m) { pq_flush(), gl.cullface = m, st_serial++; }
+/* gl.cullface is the face culled in counter-clockwise terms (culled()):
+   glCullFace's, the other one under glFrontFace(GL_CW) */
+static GLenum cull_mode = GL_BACK;
+static int front_cw;
+static void cull_set(void) {
+  pq_flush();
+  gl.cullface = !front_cw || cull_mode == GL_FRONT_AND_BACK ? cull_mode
+                : cull_mode == GL_FRONT                    ? GL_BACK
+                                                           : GL_FRONT;
+  st_serial++;
+}
+void APIENTRY glCullFace(GLenum m) { cull_mode = m, cull_set(); }
+void APIENTRY glFrontFace(GLenum m) { front_cw = m == GL_CW, cull_set(); }
 /* each unit's GL_COMBINE, COMBINE_RGB, RGB_SCALE (0: 1, 1: 2), and unit 0's
    mxgl_ColorShift */
 static int env_combine[2], env_scale[2], env_legacy;
@@ -5610,6 +5626,22 @@ static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const
       if (s[i * 4 + 3] && pal_find((u32)s[i * 4] | (u32)s[i * 4 + 1] << 8 | (u32)s[i * 4 + 2] << 16) < 0)
         pal = 0;
   }
+  /* RGBA texels all grey (R = G = B) and opaque, or black with alpha 0
+     (a lightmap block's unused texels, calloc'ed): the brightness texture
+     (8 bits, not 16; one byte a texel to update, no brightness copy for
+     the products with the destination: lightmaps sent as RGBA). Exact,
+     but for those black texels outside a product: opaque there */
+  int grey = 0;
+  if (!pal && !indexed && !tex_brightness && !planar && !alpha8 && s) {
+    grey = 1;
+    for (int i = 0; i < w * h && grey; i++) {
+      const u8 *c = s + i * 4;
+      grey = c[0] == c[1] && c[0] == c[2] && (c[3] == 255 || (c[3] == 0 && c[0] == 0));
+    }
+    if (grey)
+      tex_brightness = 1;
+  }
+  t->grey = (u8)grey;
   t->bright = tex_brightness;
   t->pal = pal;
   t->alpha_fmt = tex_brightness || ifmt == GL_RGBA || ifmt == 4 || ifmt == GL_RGBA8 ||
@@ -5989,6 +6021,67 @@ void APIENTRY glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLe
         if (nc == 4)
           o[3] = 255;
       }
+    }
+  }
+}
+
+/* the window's pixels into the bound texture's level 0 (glReadPixels, then
+   glTexSubImage2D): the frame drawn so far is finished first, so it is
+   slow; with beam racing the pixels are zeros (glReadPixels) */
+void APIENTRY glCopyTexSubImage2D(GLenum target, GLint level, GLint xoff, GLint yoff, GLint x, GLint y,
+                                  GLsizei w, GLsizei h) {
+  if (w <= 0 || h <= 0)
+    return;
+  u8 *px = malloc((size_t)w * (size_t)h * 4);
+  if (!px) {
+    gl_error(GL_OUT_OF_MEMORY);
+    return;
+  }
+  int align = gl.pack_align;
+  gl.pack_align = 1;
+  glReadPixels(x, y, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+  gl.pack_align = align;
+  glTexSubImage2D(target, level, xoff, yoff, w, h, GL_RGBA, GL_UNSIGNED_BYTE, px);
+  free(px);
+}
+
+/* the bound texture's level 0 as RGBA or RGB bytes, from its texels in
+   GS format (16-bit ones as 5 bits a channel, a brightness texture as
+   grey); level 0 only */
+void APIENTRY glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid *px) {
+  GLuint bound = TBOUND;
+  int nc = format == GL_RGBA ? 4 : format == GL_RGB ? 3 : 0;
+  if (!nc || type != GL_UNSIGNED_BYTE) {
+    gl_error(GL_INVALID_ENUM);
+    return;
+  }
+  if (level != 0 || !bound || bound >= MAX_TEX || !texs[bound].data)
+    return;
+  pq_flush();
+  const struct tex *t = &texs[bound];
+  const u8 *src = TLV(t, 0);
+  u32 line = ((t->w * (u32)nc) + (u32)gl.pack_align - 1) & ~((u32)gl.pack_align - 1);
+  for (u32 y = 0; y < t->h; y++) {
+    u8 *d = (u8 *)px + y * line;
+    for (u32 x = 0; x < t->w; x++, d += nc) {
+      u32 i = y * t->w + x;
+      u8 c[4];
+      if (t->psm == MX_GS_PSM_CT32) {
+        u32 v = ((const u32 *)src)[i];
+        u32 a = v >> 24;
+        c[0] = (u8)v, c[1] = (u8)(v >> 8), c[2] = (u8)(v >> 16), c[3] = (u8)(a >= 128 ? 255 : a * 2);
+      } else if (t->psm == MX_GS_PSM_T8) {
+        u8 k = src[i];
+        if (t->pal)
+          memcpy(c, pal_rgb[k], 3), c[3] = k == pal_transp ? 0 : 255;
+        else
+          c[0] = c[1] = c[2] = k, c[3] = 255;
+      } else {
+        u16 v = ((const u16 *)src)[i];
+        c[0] = (u8)((v & 31) << 3), c[1] = (u8)(((v >> 5) & 31) << 3), c[2] = (u8)(((v >> 10) & 31) << 3);
+        c[3] = v & 0x8000 ? 255 : 0;
+      }
+      memcpy(d, c, (size_t)nc);
     }
   }
 }
@@ -7014,6 +7107,7 @@ static const struct {
     {"glColorTableEXT", (void (*)(void))glColorTableEXT},
     {"glCompressedTexImage2D", (void (*)(void))glCompressedTexImage2D},
     {"glCompressedTexImage2DARB", (void (*)(void))glCompressedTexImage2DARB},
+    {"glCopyTexSubImage2D", (void (*)(void))glCopyTexSubImage2D},
     {"glCreateProgram", (void (*)(void))glCreateProgram},
     {"glCreateShader", (void (*)(void))glCreateShader},
     {"glCullFace", (void (*)(void))glCullFace},
@@ -7045,6 +7139,7 @@ static const struct {
     {"glFogfv", (void (*)(void))glFogfv},
     {"glFogi", (void (*)(void))glFogi},
     {"glFogiv", (void (*)(void))glFogiv},
+    {"glFrontFace", (void (*)(void))glFrontFace},
     {"glFrustum", (void (*)(void))glFrustum},
     {"glFrustumf", (void (*)(void))glFrustumf},
     {"glGenBuffers", (void (*)(void))glGenBuffers},
@@ -7060,6 +7155,7 @@ static const struct {
     {"glGetProgramiv", (void (*)(void))glGetProgramiv},
     {"glGetShaderiv", (void (*)(void))glGetShaderiv},
     {"glGetString", (void (*)(void))glGetString},
+    {"glGetTexImage", (void (*)(void))glGetTexImage},
     {"glGetUniformLocation", (void (*)(void))glGetUniformLocation},
     {"glHint", (void (*)(void))glHint},
     {"glIsBuffer", (void (*)(void))glIsBuffer},
