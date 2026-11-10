@@ -431,6 +431,26 @@ int main(void) {
     glDisable(GL_ALPHA_TEST);
     CHECK_PIX(320, 300, 0x000000);
     CHECK_PIX(380, 300, 0x00FF00);
+    /* a font as RGBA: white texels, the others black and transparent (kept
+       8-bit with entry 0 transparent, CLUT_GREYK): over red, alpha tested,
+       red where it is transparent */
+    static u8 font[8 * 8 * 4];
+    for (int i = 0; i < 8 * 8; i++) {
+      u8 v = (i & 7) < 4 ? 0 : 255;
+      font[i * 4] = font[i * 4 + 1] = font[i * 4 + 2] = font[i * 4 + 3] = v;
+    }
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, font);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glDisable(GL_TEXTURE_2D);
+    glColor3f(1, 0, 0);
+    quad(450, 250, 550, 350, 0);
+    glEnable(GL_TEXTURE_2D);
+    glColor3f(1, 1, 1);
+    glEnable(GL_ALPHA_TEST);
+    quad(450, 250, 550, 350, 0);
+    glDisable(GL_ALPHA_TEST);
+    CHECK_PIX(470, 300, 0x0000FF);
+    CHECK_PIX(530, 300, 0xFFFFFF);
     glDeleteTextures(1, &gid);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
     glDisable(GL_TEXTURE_2D);

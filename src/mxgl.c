@@ -261,7 +261,8 @@ struct tex {
   u8 alpha_fmt;          /* its format has alpha (REPLACE takes the texture's) */
   u8 bright;             /* T8 brightness texture (CLUT_2X/1X/INV) */
   u8 grey;               /* bright, from RGBA texels all grey and opaque (Quakespasm's
-                            lightmaps): CLUT_GREY when not in a product */
+                            lightmaps): CLUT_GREY when not in a product; 2: its black
+                            texels all transparent (a font), CLUT_GREYK */
   u8 planar;             /* mxgl_color_light's GL_RGB8 texture without MIPMAP (a
                             lightmap): its texels the red channel's brightness,
                             twin[2], twin[3] the green and blue ones; no levels */
@@ -998,7 +999,9 @@ static void texflush(void) {
    (draw_env); in
    CSM1's order (bits 3 and 4 of the index swapped), each 16 x 16 CT32 (4
    blocks) */
-enum { CLUT_2X, CLUT_1X, CLUT_INV, CLUT_GREY, CLUT_ENV, NCLUT };
+/* CLUT_GREYK: CLUT_GREY with entry 0 transparent (a grey texture whose
+   black texels are all transparent: a font) */
+enum { CLUT_2X, CLUT_1X, CLUT_INV, CLUT_GREY, CLUT_ENV, CLUT_GREYK, NCLUT };
 static u32 clut_cbp;
 static u32 clut[NCLUT][256] MX_ALIGNED(64);
 
@@ -1095,6 +1098,7 @@ static void clut_make(void) {
     clut[CLUT_INV][at] = g | ((256 - i) >> 1) << 24;
     clut[CLUT_GREY][at] = g | 0x80u << 24;
     clut[CLUT_ENV][at] = 0xFFFFFFu | ((i + 1) >> 1) << 24;
+    clut[CLUT_GREYK][at] = g | (i ? 0x80u : 0u) << 24;
   }
   mx_dcache_writeback(clut, sizeof clut);
 }
@@ -1560,7 +1564,7 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   }
 
   u64 alpha = 0;
-  clut_pick = t && t->grey ? CLUT_GREY : CLUT_1X;
+  clut_pick = t && t->grey ? (t->grey == 2 ? CLUT_GREYK : CLUT_GREY) : CLUT_1X;
   int abe = gl.blend ? blend_mode(&alpha, t) : 0;
   if (abe < 0)
     return -1;
@@ -2569,7 +2573,7 @@ static __attribute__((noinline)) void draw_env(const u32 *idx, int nidx, int nve
   dl_get_state(&keep);
   GLenum env = gl.texenv;
   const struct tex *t = gl.bound && gl.bound < MAX_TEX && texs[gl.bound].used ? &texs[gl.bound] : NULL;
-  if (t && t->alpha && !t->bright) /* Af At: the texture's alpha, white */
+  if (t && t->alpha && (!t->bright || t->grey == 2)) /* Af At: the texture's alpha, white */
     gl.texenv = GL_MODULATE, env_pass = 2;
   else
     gl.tex2d = 0;
@@ -5514,7 +5518,7 @@ static u32 tex_alpha_of(const struct tex *t, u32 i) {
   const u8 *src = TLV(t, 0);
   u32 a;
   if (t->bright)
-    return 255;
+    return t->grey == 2 && !src[i] ? 0 : 255;
   if (t->oclut)
     a = t->oclut[csm1(src[i])] >> 24;
   else if (t->pal)
@@ -5748,11 +5752,17 @@ static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const
      but for those black texels outside a product: opaque there */
   int grey = 0;
   if (!pal && !indexed && !tex_brightness && !planar && !alpha8 && s) {
+    /* its black texels all transparent (and some are): a font, kept with
+       entry 0 transparent (CLUT_GREYK) */
+    int clear = 0, black = 0;
     grey = 1;
     for (int i = 0; i < w * h && grey; i++) {
       const u8 *c = s + i * 4;
       grey = c[0] == c[1] && c[0] == c[2] && (c[3] == 255 || (c[3] == 0 && c[0] == 0));
+      clear |= c[3] == 0, black |= c[3] == 255 && c[0] == 0;
     }
+    if (grey && clear && !black)
+      grey = 2;
     if (grey)
       tex_brightness = 1;
   }

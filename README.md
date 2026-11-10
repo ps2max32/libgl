@@ -70,7 +70,8 @@ What the GS cannot do is left out or done another way:
 - An RGBA texture whose texels are all grey and opaque (or black with alpha 0: a lightmap
   block's unused texels) is kept as its brightness (T8, 8 bits, exact; Quakespasm's lightmaps),
   with a CLUT of alpha 1 when drawn other than in a product (those black texels are then
-  opaque).
+  opaque). When all its black texels are transparent (a font: white or grey on clear), its
+  CLUT keeps them transparent (entry 0, alpha 0).
 - Blends with the destination colour (lightmaps) are `Cd * As`: a luminance texture
   (internal format `GL_LUMINANCE8`, `GL_LUMINANCE`, `GL_INTENSITY8`) is kept as its brightness
   (the largest of R, G and B; T8 with a CLUT that puts it in alpha). A colour texture in such
