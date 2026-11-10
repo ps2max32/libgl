@@ -383,6 +383,60 @@ int main(void) {
     glDeleteTextures(1, &id);
   }
 
+  /* GL_BLEND: red fragments, a half grey texture, green environment colour:
+     red (1 - 0.5) + green 0.5; a white RGBA texture: the environment colour
+     (its brightness copy); GL_ADD: red + half grey */
+  frame();
+  {
+    static u8 white[8 * 8 * 4], half[8 * 8];
+    memset(white, 255, sizeof white);
+    memset(half, 128, sizeof half);
+    GLuint id[2];
+    glGenTextures(2, id);
+    glBindTexture(GL_TEXTURE_2D, id[0]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE8, 8, 8, 0, GL_LUMINANCE, GL_UNSIGNED_BYTE, half);
+    glBindTexture(GL_TEXTURE_2D, id[1]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+    static const float green[4] = {0, 1, 0, 1};
+    glTexEnvfv(GL_TEXTURE_ENV, GL_TEXTURE_ENV_COLOR, green);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_BLEND);
+    glEnable(GL_TEXTURE_2D);
+    glColor3f(1, 0, 0);
+    glBindTexture(GL_TEXTURE_2D, id[0]);
+    quad(100, 100, 200, 200, 0);
+    CHECK_PIX(150, 150, 0x008080);
+    glBindTexture(GL_TEXTURE_2D, id[1]);
+    quad(300, 100, 400, 200, 0);
+    CHECK_PIX(350, 150, 0x00FF00);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_ADD);
+    glBindTexture(GL_TEXTURE_2D, id[0]);
+    quad(100, 250, 200, 350, 0);
+    CHECK_PIX(150, 300, 0x8080FF);
+    /* GL_BLEND of a texture with alpha (a font: white, its left half
+       transparent), alpha tested: the left half not drawn, the right one
+       the environment colour */
+    static u8 glyph[8 * 8 * 4];
+    for (int i = 0; i < 8 * 8; i++)
+      glyph[i * 4] = glyph[i * 4 + 1] = glyph[i * 4 + 2] = 255, glyph[i * 4 + 3] = (i & 7) < 4 ? 0 : 255;
+    GLuint gid;
+    glGenTextures(1, &gid);
+    glBindTexture(GL_TEXTURE_2D, gid);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 8, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, glyph);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_BLEND);
+    glEnable(GL_ALPHA_TEST);
+    glAlphaFunc(GL_GREATER, 0.5f);
+    quad(300, 250, 400, 350, 0);
+    glDisable(GL_ALPHA_TEST);
+    CHECK_PIX(320, 300, 0x000000);
+    CHECK_PIX(380, 300, 0x00FF00);
+    glDeleteTextures(1, &gid);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glDisable(GL_TEXTURE_2D);
+    glDeleteTextures(2, id);
+  }
+
   /* multitexture: unit 1's luminance texture (half) multiplies unit 0's */
   frame();
   {

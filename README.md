@@ -61,6 +61,12 @@ slow), and so does `glCopyTexSubImage2D` (into the bound texture); `glGetTexImag
 texture matrix (on VU1), lines and points (on the EE) are there.
 
 What the GS cannot do is left out or done another way:
+- The texture environments `GL_BLEND` (`Cf (1 - Ct) + Cc Ct`, `GL_TEXTURE_ENV_COLOR` Cc) and
+  `GL_ADD` (`Cf + Ct`) of unit 0 are two passes (Daedalus's N64 combiners): the fragment
+  colour with the texture's alpha (`Af At`: a white copy with its alpha; blending and the alpha
+  test as set), then over its pixels (depth EQUAL, no depth writes) for BLEND Cc blended by the
+  texture's brightness times its alpha (`(Cc - Cd) Bt + Cd`: exact for grey textures), for ADD
+  the texture added. The copies are made at the first such draw.
 - An RGBA texture whose texels are all grey and opaque (or black with alpha 0: a lightmap
   block's unused texels) is kept as its brightness (T8, 8 bits, exact; Quakespasm's lightmaps),
   with a CLUT of alpha 1 when drawn other than in a product (those black texels are then

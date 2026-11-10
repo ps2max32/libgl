@@ -270,7 +270,9 @@ struct tex {
   u8 lin_mag, lin_min;   /* filters: 1 linear */
   u8 mip;                /* MIN_FILTER: 0 no levels, 1 nearest level, 2 both levels */
   u8 dirty;              /* changed (glTexSubImage2D) while in GS memory: upload it again */
-  u16 twin[4];           /* its brightness copy (0) and channel copies (1 R, 2 G, 3 B):
+  u16 twin[6];           /* its brightness copy (0) and channel copies (1 R, 2 G, 3 B),
+                            and for GL_BLEND and GL_ADD (draw_env) its alpha with white
+                            (TWIN_ENV_A) and its brightness times its alpha (TWIN_ENV_B):
                             twins[twin - 1], or 0 */
   u16 dy0, dy1;          /* the lines of level 0 changed since: dy0 .. dy1 - 1 */
   struct mx_tex_mem m;   /* its levels in GS format (m.level[], 64-byte aligned): the
@@ -295,6 +297,7 @@ static struct tex texs[MAX_TEX];
 /* brightness copies of colour textures, made when a draw multiplies with
    the destination (tex_twin) */
 #define MAX_TWIN 512 /* a lightmap page has 3 with mxgl_color_light */
+enum { TWIN_ENV_A = 4, TWIN_ENV_B = 5, NTWIN = 6 };
 static struct tex twins[MAX_TWIN];
 static void tex_drop_twin(struct tex *t);
 static void defer_free(void *p);
@@ -990,9 +993,12 @@ static void texflush(void) {
    alpha (0x80 is 1.0 in the blend Cd * As): i (up to 2x, for overbright),
    i / 2 (1x), (255 - i) / 2 (1x of the inverse, blendFunc ZERO
    ONE_MINUS_SRC_COLOR), 1.0 (CLUT_GREY: a grey RGBA texture drawn other
-   than in a product, as GL draws it); in CSM1's order (bits 3 and 4 of the
-   index swapped), each 16 x 16 CT32 (4 blocks) */
-enum { CLUT_2X, CLUT_1X, CLUT_INV, CLUT_GREY, NCLUT };
+   than in a product, as GL draws it); CLUT_ENV: white (the vertex colour
+   as it is in a modulate) with i / 2 in alpha, for GL_BLEND's second pass
+   (draw_env); in
+   CSM1's order (bits 3 and 4 of the index swapped), each 16 x 16 CT32 (4
+   blocks) */
+enum { CLUT_2X, CLUT_1X, CLUT_INV, CLUT_GREY, CLUT_ENV, NCLUT };
 static u32 clut_cbp;
 static u32 clut[NCLUT][256] MX_ALIGNED(64);
 
@@ -1088,6 +1094,7 @@ static void clut_make(void) {
     clut[CLUT_1X][at] = g | ((i + 1) >> 1) << 24;
     clut[CLUT_INV][at] = g | ((256 - i) >> 1) << 24;
     clut[CLUT_GREY][at] = g | 0x80u << 24;
+    clut[CLUT_ENV][at] = 0xFFFFFFu | ((i + 1) >> 1) << 24;
   }
   mx_dcache_writeback(clut, sizeof clut);
 }
@@ -1390,6 +1397,12 @@ static int tex_place(struct tex *t) {
 /* ---- draw state ---------------------------------------------------------- */
 
 static int clut_pick; /* the CLUT of a brightness texture (blend_mode) */
+/* draw_env: 1 while the second pass of a GL_BLEND draw is being drawn
+   (set_state uses the texture's brightness times its alpha, with CLUT_ENV),
+   2 while the first pass of a texture with alpha (its alpha copy: white) */
+static int env_pass;
+/* GL_TEXTURE_ENV_COLOR of unit 0 (GL_BLEND's Cc) */
+static float env_color[4];
 
 /* the blend factors; the framebuffer keeps no alpha (GL_ALPHA_BITS 0):
    DST_ALPHA is 1 */
@@ -1533,7 +1546,13 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   /* a colour texture multiplied with the destination: its brightness, or
      per channel (mxgl_color_light) */
   struct tex *cl_src = NULL;
-  if (t && (!t->bright || t->planar) && gl.blend && blend_product()) {
+  if (t && env_pass == 2) { /* draw_env's first pass: the fragment colour, the texture's alpha */
+    if (!(t = tex_twin(t, TWIN_ENV_A)))
+      return -1;
+  } else if (t && env_pass) { /* GL_BLEND's second: its brightness (times its alpha) */
+    if ((!t->bright || t->planar) && !(t = tex_twin(t, t->alpha ? TWIN_ENV_B : 0)))
+      return -1;
+  } else if (t && (!t->bright || t->planar) && gl.blend && blend_product()) {
     if (cl_enabled && !(t->mip && t->levels > 1))
       cl_src = t;
     if (!(t = tex_twin(t, cl_src ? 1 : 0)))
@@ -1545,6 +1564,8 @@ static int set_state(u32 *prim, float *cscale, s32 lod_k) {
   int abe = gl.blend ? blend_mode(&alpha, t) : 0;
   if (abe < 0)
     return -1;
+  if (env_pass == 1)
+    clut_pick = CLUT_ENV;
   /* the registers were written by others (the frame's start, glClear, the
      HUD): none of the values kept holds, also of those this draw does not
      write (ALPHA when it does not blend: the next draw that does must
@@ -2531,9 +2552,65 @@ static __attribute__((noinline)) void draw_unit1(const u32 *idx, int nidx, int n
   dl_set_state(&keep);
 }
 
+/* GL_BLEND (Cf (1 - Ct) + Cc Ct) and GL_ADD (Cf + Ct) of texture unit 0,
+   which the GS's texture functions do not have: two passes. The first
+   draws the fragment colour Cf without the texture; the second goes over
+   its pixels (depth EQUAL, no depth writes) with the vertex colour
+   constant: for BLEND the environment colour Cc, its alpha the texture's
+   brightness (a brightness texture, or the brightness copy of a colour
+   one, with CLUT_ENV), blended (Cc - Cd) * At + Cd: exact for grey
+   textures, the brightness of a colour one's; for ADD the texture, added
+   (Cd + Ct). The fragment's alpha (blending, alpha test) is the first
+   pass's, without the texture's. */
+static inline u32 to_u8(float c);
+static __attribute__((noinline)) void draw_env(const u32 *idx, int nidx, int nverts) {
+  pq_flush();
+  struct dl_state keep;
+  dl_get_state(&keep);
+  GLenum env = gl.texenv;
+  const struct tex *t = gl.bound && gl.bound < MAX_TEX && texs[gl.bound].used ? &texs[gl.bound] : NULL;
+  if (t && t->alpha && !t->bright) /* Af At: the texture's alpha, white */
+    gl.texenv = GL_MODULATE, env_pass = 2;
+  else
+    gl.tex2d = 0;
+  st_serial++;
+  draw_tris_(idx, nidx, nverts);
+  env_pass = 0;
+
+  pq_flush();
+  int ca = gl.ca;
+  u32 col8 = gl.col8;
+  float col[4];
+  memcpy(col, gl.color, sizeof col);
+  gl.tex2d = 1, gl.texenv = GL_MODULATE, gl.atest = 0, gl.blend = 1, gl.ca = 0;
+  if (env == GL_BLEND) {
+    gl.sf = GL_SRC_ALPHA, gl.dfac = GL_ONE_MINUS_SRC_ALPHA;
+    gl.color[0] = env_color[0], gl.color[1] = env_color[1], gl.color[2] = env_color[2];
+    env_pass = 1;
+  } else { /* Cd + Ct At (a brightness texture has no alpha: its CLUT's is its brightness) */
+    gl.sf = t && t->alpha && !t->bright ? GL_SRC_ALPHA : GL_ONE, gl.dfac = GL_ONE;
+    gl.color[0] = gl.color[1] = gl.color[2] = 1;
+  }
+  gl.color[3] = 1;
+  gl.col8 = to_u8(gl.color[0]) | to_u8(gl.color[1]) << 8 | to_u8(gl.color[2]) << 16 | 0xFFu << 24;
+  if (gl.dtest)
+    gl.dfunc = GL_EQUAL;
+  gl.dmask = 0;
+  st_serial++;
+  draw_tris_(idx, nidx, nverts);
+  pq_flush();
+  env_pass = 0;
+  gl.ca = ca, gl.col8 = col8;
+  memcpy(gl.color, col, sizeof col);
+  dl_set_state(&keep);
+}
+
 static inline __attribute__((always_inline)) void draw_tris(const u32 *idx, int nidx, int nverts) {
   u32 t0 = mx_count();
-  draw_tris_(idx, nidx, nverts);
+  if (gl.tex2d && (gl.texenv == GL_BLEND || gl.texenv == GL_ADD))
+    draw_env(idx, nidx, nverts);
+  else
+    draw_tris_(idx, nidx, nverts);
   if (gl.u1.tex2d && !gl.atest && u1_on())
     draw_unit1(idx, nidx, nverts);
   st_cur.gl_cycles += mx_count() - t0;
@@ -5392,8 +5469,19 @@ static int tex_indexed;
 
 static void tex_set_image(struct tex *t, GLint ifmt, GLsizei w, GLsizei h, const GLvoid *px);
 
+static void tex_drop_twin_ch(struct tex *t, int ch) {
+  if (!t->twin[ch])
+    return;
+  struct tex *c = &twins[t->twin[ch] - 1];
+  tex_free_mem(c);
+  if (c->gen)
+    tex_drop(c);
+  memset(c, 0, sizeof *c);
+  t->twin[ch] = 0;
+}
+
 static void tex_drop_twin(struct tex *t) {
-  for (int ch = 0; ch < 4; ch++) {
+  for (int ch = 0; ch < NTWIN; ch++) {
     if (!t->twin[ch])
       continue;
     struct tex *c = &twins[t->twin[ch] - 1];
@@ -5421,6 +5509,23 @@ static void tex_rgb(const struct tex *t, u32 i, u8 *o) {
   }
 }
 
+/* texel i of t's level 0's alpha, 0 .. 255 */
+static u32 tex_alpha_of(const struct tex *t, u32 i) {
+  const u8 *src = TLV(t, 0);
+  u32 a;
+  if (t->bright)
+    return 255;
+  if (t->oclut)
+    a = t->oclut[csm1(src[i])] >> 24;
+  else if (t->pal)
+    return pal_rgba[src[i]][3];
+  else if (t->psm == MX_GS_PSM_CT32)
+    a = src[i * 4 + 3];
+  else
+    return ((const u16 *)src)[i] & 0x8000 ? 255 : 0;
+  return a >= 0x80 ? 255 : a * 2; /* stored halved: 0x80 is 1.0 */
+}
+
 /* t's brightness copy (T8, the largest of R, G and B; for blendFunc
    products, blend_product), made from its level 0 when first asked for;
    NULL if there is no room */
@@ -5434,15 +5539,16 @@ static struct tex *twin_make(struct tex *t, int ch, u8 *rgba) {
     k++;
   if (k == MAX_TWIN)
     return NULL;
-  if (ch)
+  if (ch >= 1 && ch <= 3)
     for (u32 i = 0; i < t->w * t->h; i++)
       rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = rgba[i * 4 + ch - 1];
   struct tex *c = &twins[k];
   memset(c, 0, sizeof *c);
   c->used = 1;
-  tex_brightness = 1;
-  tex_one_level = ch != 0; /* the channels': drawn without MIPMAP filtering (cl_src) */
-  tex_set_image(c, GL_RGB, (GLsizei)t->w, (GLsizei)t->h, rgba);
+  /* TWIN_ENV_A keeps its alpha (RGBA); the others are brightness textures */
+  tex_brightness = ch != TWIN_ENV_A;
+  tex_one_level = ch >= 1 && ch <= 3; /* the channels': drawn without MIPMAP filtering (cl_src) */
+  tex_set_image(c, ch == TWIN_ENV_A ? GL_RGBA : GL_RGB, (GLsizei)t->w, (GLsizei)t->h, rgba);
   if (!c->data) {
     c->used = 0;
     return NULL;
@@ -5462,11 +5568,20 @@ static struct tex *tex_twin(struct tex *t, int ch) {
       return NULL;
     for (u32 i = 0; i < t->w * t->h; i++) {
       u8 *o = rgba + i * 4;
+      if (ch == TWIN_ENV_A) { /* white, its alpha */
+        o[0] = o[1] = o[2] = 255, o[3] = (u8)tex_alpha_of(t, i);
+        continue;
+      }
       if (t->planar) { /* the brightness of its planes */
         const struct tex *g = &twins[t->twin[2] - 1], *b = &twins[t->twin[3] - 1];
         o[0] = TLV(t, 0)[i], o[1] = TLV(g, 0)[i], o[2] = TLV(b, 0)[i];
       } else
         tex_rgb(t, i, o);
+      if (ch == TWIN_ENV_B) { /* the brightness times the alpha */
+        u32 m = o[0] > o[1] ? o[0] : o[1], a = tex_alpha_of(t, i);
+        m = o[2] > m ? o[2] : m;
+        o[0] = o[1] = o[2] = (u8)((m * a + 127) / 255);
+      }
       o[3] = 255;
     }
     struct tex *c = twin_make(t, ch, rgba);
@@ -5698,6 +5813,9 @@ void APIENTRY glTexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsi
   struct tex *t = &texs[bound];
   if (!t->data)
     return;
+  /* GL_BLEND's and GL_ADD's copies: made again when drawn */
+  tex_drop_twin_ch(t, TWIN_ENV_A);
+  tex_drop_twin_ch(t, TWIN_ENV_B);
   /* bytes into a brightness texture (Quake's lightmaps, every frame): its
      texels as they are, without the RGBA8 copy */
   if ((format == GL_LUMINANCE || format == GL_INTENSITY) && px && t->psm == MX_GS_PSM_T8 &&
@@ -5925,10 +6043,19 @@ void APIENTRY glTexParameterfv(GLenum t, GLenum p, const GLfloat *v) {
 void APIENTRY glTexEnvfv(GLenum t, GLenum p, const GLfloat *v) {
   if (p != GL_TEXTURE_ENV_COLOR)
     glTexEnvf(t, p, v[0]);
+  else if (!gl.cunit)
+    for (int i = 0; i < 4; i++)
+      env_color[i] = v[i] < 0 ? 0 : v[i] > 1 ? 1 : v[i];
 }
 void APIENTRY glTexEnviv(GLenum t, GLenum p, const GLint *v) {
   if (p != GL_TEXTURE_ENV_COLOR)
     glTexEnvf(t, p, (GLfloat)v[0]);
+  else {
+    GLfloat f[4];
+    for (int i = 0; i < 4; i++)
+      f[i] = (GLfloat)v[i] / 2147483647.0f;
+    glTexEnvfv(t, p, f);
+  }
 }
 GLboolean APIENTRY glIsTexture(GLuint t) { return t && t < MAX_TEX && texs[t].used; }
 /* OpenGL ES 1.1's float forms */
