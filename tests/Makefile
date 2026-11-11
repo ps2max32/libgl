@@ -17,6 +17,8 @@ MXGL_PROGS  := glprog
 MXGL_VSM_DIR   := $(HERE)
 MXGL_VSM_PROGS := glvsm
 include $(MXGL)/mk/mxgl.mk
+# standalone ELFs (libmx), run on PCSX2 with -elf
+MX_TARGET ?= standalone
 include $(MAXSDK)/mk/maxsdk.mk
 
 PICOLIBC ?= $(PS2MAX)/build/libs/picolibc/install
