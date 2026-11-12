@@ -144,7 +144,8 @@ static u32 ws_last_w0, ws_last_e; /* the last second's average W, and its estima
 static u32 ws_far[3];             /* the last frame's mipped textures by need (0, 1, 2+) */
 
 #define RING_BYTES (64 * 1024) /* the stream's slots (chain mode) */
-static u8 ring[RING_BYTES] MX_ALIGNED(64);
+/* the frame chain's ring (DMA): core also when libgl is VM (mx OS plan 4b) */
+static u8 ring[RING_BYTES] MX_ALIGNED(64) MX_CORE_BSS;
 /* the batches' vertices of a frame (Quake: up to ~230 KB); a game may set
    another size (MXGL_ARENA_BYTES: Descent 3 takes 256 KB) */
 #ifdef MXGL_ARENA_BYTES
@@ -1003,7 +1004,7 @@ static void texflush(void) {
    black texels are all transparent: a font) */
 enum { CLUT_2X, CLUT_1X, CLUT_INV, CLUT_GREY, CLUT_ENV, CLUT_GREYK, NCLUT };
 static u32 clut_cbp;
-static u32 clut[NCLUT][256] MX_ALIGNED(64);
+static u32 clut[NCLUT][256] MX_ALIGNED(64) MX_CORE_BSS; /* sent to the GS */
 
 /* the game's palette as a CLUT (mxgl_Palette), after the brightness CLUTs */
 static u32 clut_pal[256] MX_ALIGNED(64);
@@ -4582,7 +4583,7 @@ static struct {
 } imm;
 
 #define IMM_SMALL 1024
-static struct imm_v imm_small[IMM_SMALL] MX_ALIGNED(64);
+static struct imm_v imm_small[IMM_SMALL] MX_ALIGNED(64) MX_CORE_BSS; /* VU0 reads it */
 
 void APIENTRY glBegin(GLenum mode) {
   imm.mode = mode;
@@ -6100,7 +6101,7 @@ void APIENTRY glFlush(void) {}
    and GL_DEPTH_COMPONENT (GL_FLOAT, GL_UNSIGNED_INT, _SHORT, _BYTE), in the
    window's coordinates (mxgl_window), lines GL_PACK_ALIGNMENT apart.
    Not in 1080i (the passes own the buffer): zeros. */
-static u32 rp_line[1920] MX_ALIGNED(64);
+static u32 rp_line[1920] MX_ALIGNED(64) MX_CORE_BSS; /* the GS's download writes it */
 void APIENTRY glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum t,
                            GLvoid *px) {
   int depth = f == GL_DEPTH_COMPONENT;
