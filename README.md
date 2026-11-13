@@ -121,6 +121,10 @@ libgl's static tables are about 740 KB, 500 KB of them the texture names' (2048)
 lists and their pool) while a program draws nothing, as a shell beside a game; `mxgl_resume`
 takes it again and sets the mode that was set. The textures stay unless deleted first.
 
+`mxgl_deflicker(1)` is the flicker filter of NTSC and PAL without beam racing: the PCRTC's two read
+circuits show the buffer a line apart, blended 1:1, so each line shown is the mean of two drawn
+(softer down, no drawing cost). Off by default: every line as drawn.
+
 `mxgl_texture_quality` leaves the top levels out (1 or 2) of textures drawn with MIPMAP
 filtering, or picks them by itself (`MXGL_TEX_AUTO`), with two controls apart:
 

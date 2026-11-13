@@ -60,6 +60,16 @@ int mxgl_set_mode(int mode);
    an interlaced screen), else one a frame. n 0: the GS manual's matrix
    for every frame, as before. */
 void mxgl_dither(const unsigned long long *dimx, int n);
+/* The flicker filter of the interlaced TV modes (NTSC, PAL without
+   MXGL_BEAM, whose buffers hold every line of the picture and each field
+   shows every other one): on, each line shown is the mean of two lines
+   drawn (the PCRTC blends its two read circuits, a line apart: no drawing
+   cost), which takes the flicker of thin lines and edges away and makes the
+   picture softer down. Off (the default): every line as drawn, for a
+   display that weaves the fields. Kept across mxgl_set_mode; nothing in
+   the other modes: with MXGL_BEAM a field is drawn anew at its own lines,
+   the progressive modes and 1080i's stretched buffer do not flicker. */
+void mxgl_deflicker(int on);
 /* While the program draws nothing for a time (a shell waiting beside a
    game): mxgl_suspend ends the frame begun, stops the pipeline and gives
    back the memory the frames need: the arenas, beam racing's records, the
@@ -68,10 +78,13 @@ void mxgl_dither(const unsigned long long *dimx, int n);
    glDeleteTextures before it gives their memory back too. No GL call may
    draw until mxgl_resume, which takes the memory again and sets the mode
    that was set (the pipeline starts again, GS memory is filled again as
-   after mxgl_set_mode). Returns mxgl_set_mode's value, or -1 without
-   memory for the arenas (still suspended: mxgl_resume again later). */
+   after mxgl_set_mode). Returns mxgl_set_mode's value (0, or -1: running,
+   without beam racing or in the console's own mode), or -2 without memory
+   for the arenas: still suspended (mxgl_suspended 1), mxgl_resume again
+   later. */
 void mxgl_suspend(void);
 int mxgl_resume(void);
+int mxgl_suspended(void);
 /* the mode set: MXGL_NTSC, MXGL_PAL, MXGL_1080I, ... (not MXGL_SD) */
 int mxgl_mode(void);
 /* the flags in effect: MXGL_BEAM, MXGL_RGB24 */

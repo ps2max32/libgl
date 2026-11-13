@@ -9,6 +9,33 @@ static int mode_want;     /* the flags asked for with it */
 
 /* without beam racing: video mode m, two CT16S buffers of w x h and a Z
    buffer of zpsm */
+/* mxgl_deflicker: the flicker filter of the interlaced modes whose two
+   buffers hold every line of the picture (FIELD mode: a field shows every
+   other line). Read circuit 1 shows the buffer a line lower than circuit 2
+   and the PCRTC blends them 1:1 (PMODE's ALP 0x80), so each line shown is
+   the mean of two drawn lines (the screen's last line with the line after
+   the buffer, as maxsdk's MX_SMOOTH_DOWN). Off: circuit 2 alone. */
+static int deflicker, deflicker_fits;
+static void deflicker_set(void) {
+  int on = deflicker && deflicker_fits && !beam;
+  for (int j = 0; j < 2; j++) {
+    struct mx_display *d = &disp[j];
+    d->c[0] = d->c[1];
+    d->c[0].on = (u8)on;
+    if (on)
+      d->c[0].dby++;
+    d->mmod = 1;
+    d->amod = (u8)!on;
+    d->alp = on ? 0x80 : 0;
+  }
+}
+
+void mxgl_deflicker(int on) {
+  deflicker = on != 0;
+  if (mode_set >= 0 && !beam)
+    deflicker_set();
+}
+
 static int start_buffers(const struct mx_video_mode *m, int w, int h, u32 zpsm) {
   if (mx_gs_init_video(m) < 0)
     return -1;
@@ -19,6 +46,9 @@ static int start_buffers(const struct mx_video_mode *m, int w, int h, u32 zpsm) 
     mx_rt_init(&rt[j], fbp, (u32)w, (u32)h, MX_GS_PSM_CT16S, zbp, zpsm);
     mx_display_init(&disp[j], &rt[j]);
   }
+  beam = 0;
+  deflicker_fits = m->interlace && !m->ffmd;
+  deflicker_set();
   mx_gs_displays(disp, 2);
   mx_vu_reset(2);
   /* chain mode: the stream calls the display lists' chains */
@@ -248,6 +278,8 @@ void mxgl_suspend(void) {
   mode_set = -1;
 }
 
+int mxgl_suspended(void) { return suspended >= 0; }
+
 int mxgl_resume(void) {
   if (suspended < 0)
     return 0;
@@ -262,7 +294,7 @@ int mxgl_resume(void) {
       mx_heap_free(gl_stream, arena[i]);
       arena[i] = NULL;
     }
-    return -1;
+    return -2;
   }
   int mode = suspended | suspended_flags;
   suspended = -1;

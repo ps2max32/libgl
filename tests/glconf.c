@@ -1048,6 +1048,16 @@ int main(void) {
     CHECK_EQ(glGetError(), GL_NO_ERROR);
   }
 
+  /* mxgl_deflicker: only the display; the buffer reads back as drawn */
+  frame();
+  mxgl_deflicker(1);
+  glColor3f(1, 0, 0);
+  quad(100, 100, 200, 110, 0);
+  CHECK_PIX(150, 105, 0x0000FF);
+  CHECK_PIX(150, 115, 0x000000);
+  frame();
+  mxgl_deflicker(0);
+
   /* mxgl_suspend, mxgl_resume: the textures stay, the lists go, the mode is
      set again */
   frame();
