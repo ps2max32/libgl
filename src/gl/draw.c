@@ -90,8 +90,8 @@ static s32 lod_k(const u32 *idx, int nidx, int nverts) {
   }
   if (ao < 1e-6f || at < 1e-12f)
     return 0;
-  float k = (0.5f * (fast_log2(at * (float)t->w * (float)t->h / ao) + tm_log2_area()) - proj_lpp()) *
-            16.0f;
+  float k = (0.5f * (fast_log2(at * (float)t->w * (float)t->h / ao) + tm_log2_area()) - proj_lpp() +
+             gl.lod_bias) * 16.0f;
   s32 ki = (s32)(k + (k < 0 ? -0.5f : 0.5f));
   return ki < -2048 ? -2048 : ki > 2047 ? 2047 : ki;
 }

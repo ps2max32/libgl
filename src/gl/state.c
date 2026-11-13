@@ -60,6 +60,10 @@ static struct mx_shader shader;
 struct vprog;
 static struct vprog *o_prog, *cur_prog;
 static int cur_prog_clips; /* cur_prog has mxglc.i's clipping */
+static int cur_prog_attribs; /* cur_prog has inputs of its own: drawn from the generic attributes */
+static void draw_attribs(GLenum mode, GLint first, GLsizei count, GLenum itype, const void *idx);
+static int prim_restart, prim_restart_fixed;
+static u32 lk_serial; /* glLockArraysEXT's count */
 static struct vprog *fog_prog[2]; /* GL_LINEAR; GL_EXP and GL_EXP2 */
 static void fog_program(int i, const struct mx_shader *s);
 static const struct mx_shader *vu_cur;
@@ -291,6 +295,7 @@ static struct {
   float aref;
   int dmask;
   int cshift; /* mxgl_ColorShift */
+  float lod_bias; /* GL_TEXTURE_LOD_BIAS */
   float color[4];
   u32 col8;   /* color as bytes (R, G, B, A in memory order) */
   float clear[4];

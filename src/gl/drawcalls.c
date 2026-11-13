@@ -57,6 +57,10 @@ static const u32 *mode_tris(GLenum mode, const u32 *in, int n, int *k) {
 static void draw_elements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices, int maxv) {
   if (gl.ebuf)
     indices = buf_ptr(gl.ebuf, (uintptr_t)indices);
+  if (cur_prog_attribs) {
+    draw_attribs(mode, 0, count, type, indices);
+    return;
+  }
   if (count < 0 || (type != GL_UNSIGNED_INT && type != GL_UNSIGNED_SHORT && type != GL_UNSIGNED_BYTE)) {
     gl_error(count < 0 ? GL_INVALID_VALUE : GL_INVALID_ENUM);
     return;
@@ -199,6 +203,10 @@ static void pq_copy(const void *xyz, int xs, const void *st, int ss, int n) {
 }
 
 void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count) {
+  if (cur_prog_attribs) {
+    draw_attribs(mode, first, count, 0, NULL);
+    return;
+  }
   /* a polygon of one buffer object's records (Quake's world): straight
      into the polygon queue, as a pointer into the buffer */
   if (mode == GL_POLYGON && gl.vbuf && gl.vbuf == gl.tbuf && gl.va && gl.ta && !gl.ca &&

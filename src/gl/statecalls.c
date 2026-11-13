@@ -82,6 +82,13 @@ static void env_shifts(void) {
 void APIENTRY glTexEnvf(GLenum t, GLenum p, GLfloat v) {
   pq_flush();
   st_serial++;
+  if (t == GL_TEXTURE_FILTER_CONTROL) { /* GL_EXT_texture_lod_bias: levels added to every draw's */
+    if (p == GL_TEXTURE_LOD_BIAS)
+      gl.lod_bias = v;
+    else
+      gl_error(GL_INVALID_ENUM);
+    return;
+  }
   GLenum *env = gl.cunit ? &gl.u1.texenv : &gl.texenv;
   int u = gl.cunit;
   switch (p) {

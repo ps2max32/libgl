@@ -16,6 +16,8 @@ struct vprog {
   const struct mxgl_vu1_binary *bin;
   int r_mvp, r_cscale, r_tms, r_tmt; /* libgl's uniforms: quadwords, -1 none */
   int r_clip;                        /* mxglc.i's clipping uniforms */
+  int attribs;                       /* inputs of its own (gl/attribs.c) */
+  int in_adc;                        /* its input ADC, which libgl fills; -1 none */
   float (*uni)[4];
 };
 static struct {
@@ -53,7 +55,8 @@ static const struct mx_shader *vprog_use(struct vprog *p) {
     return s;
   const struct mx_shader *o = vu_cur;
   if (!o || s->buf_qw != o->buf_qw || s->ctx_at != o->ctx_at || s->ctx_qw != o->ctx_qw ||
-      s->nctx != o->nctx || s->in_at != o->in_at || s->out_at != o->out_at) {
+      s->nctx != o->nctx || s->in_at != o->in_at || s->out_at != o->out_at || s->nin != o->nin ||
+      s->item_qw != o->item_qw) {
     /* another layout: its inputs or contexts may be where the GIF still
        reads the last program's packets (as mx_frame_shader_setup) */
     u64 *c = mx_frame_reserve(2);
@@ -187,11 +190,15 @@ void APIENTRY glLinkProgram(GLuint prog) {
   }
   struct mx_shader s;
   b->shader(&s);
-  if (s.nin != shader.nin || memcmp(s.in, shader.in, sizeof s.in[0] * s.nin) ||
-      s.in_at != shader.in_at || s.align != shader.align || s.max_i) {
-    glsl[prog].log = "inputs not float4 POSITION, float2 TEXCOORD, uint4 COLOR_V4_8U (mxglv.hlsl)";
+  if (s.max_i) {
+    glsl[prog].log = "an indexed program";
     return;
   }
+  /* libgl's three inputs (float4 POSITION, float2 TEXCOORD, uint4
+     COLOR_V4_8U: drawn as the fixed arrays, clipped here), or its own
+     (generic attributes, gl/attribs.c) */
+  int attribs = s.nin != shader.nin || memcmp(s.in, shader.in, sizeof s.in[0] * s.nin) ||
+                s.in_at != shader.in_at || s.align != shader.align;
   u32 own = (shader.code_bytes + 7) / 8, n = (s.code_bytes + 7) / 8;
   if (own + n > VU1_CODE) {
     glsl[prog].log = "code larger than VU1's micro memory";
@@ -226,6 +233,11 @@ void APIENTRY glLinkProgram(GLuint prog) {
   p->r_clip = (k = uni_find(b, "clip")) >= 0 ? b->uni[k].at : -1;
   p->r_tms = (k = uni_find(b, "tms")) >= 0 ? b->uni[k].at : -1;
   p->r_tmt = (k = uni_find(b, "tmt")) >= 0 ? b->uni[k].at : -1;
+  p->attribs = attribs;
+  p->in_adc = -1;
+  for (u32 i = 0; attribs && i < b->nin; i++)
+    if (!strcmp(b->in[i], "ADC"))
+      p->in_adc = (int)i;
   glsl[prog].p = p;
   glsl[prog].linked = 1;
   glsl[prog].log = "";
@@ -257,7 +269,7 @@ void APIENTRY glGetProgramInfoLog(GLuint prog, GLsizei size, GLsizei *len, GLcha
 }
 void APIENTRY glUseProgram(GLuint prog) {
   if (!prog) {
-    cur_prog = NULL, cur_prog_clips = 0;
+    cur_prog = NULL, cur_prog_clips = 0, cur_prog_attribs = 0;
     return;
   }
   if (!glsl_is(prog, 2) || !glsl[prog].linked) {
@@ -266,6 +278,7 @@ void APIENTRY glUseProgram(GLuint prog) {
   }
   cur_prog = glsl[prog].p;
   cur_prog_clips = cur_prog->r_clip >= 0;
+  cur_prog_attribs = cur_prog->attribs;
 }
 /* a float's index in the uniforms (the member's first), or -1 */
 GLint APIENTRY glGetUniformLocation(GLuint prog, const GLchar *name) {

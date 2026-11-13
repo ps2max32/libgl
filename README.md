@@ -9,7 +9,7 @@ frame and the screen are the PS2's own (`mxgl.h`).
 |---|---|
 | `include/GL/gl.h`, `glext.h`, `KHR/` | Mesa's and Khronos' headers (MIT licence), as they are |
 | `include/mxgl.h` | the PS2's own calls: set-up, mode, window, end of frame, screenshot, the counters; `mxglGetProcAddress`; deprecated drawing calls (each says the GL calls that do the same) |
-| `src/mxgl.c`, `src/gl/*.c` | the GL calls: state to GS registers, clipping on the EE, textures (CT32/CT16/T8, mipmaps made here) in GS memory as needed. `mxgl.c` includes its parts in `src/gl/` (one translation unit: the draws' paths inline across them): `state` (the shared state), `frame`, `vram`, `texquality`, `gsstate` (GL state as GS registers), `batch` (vertex batches, the clipper), `draw` (a draw: transform, passes, triangles), `lines`, `dlist`, `drawcalls`, `immediate`, `client`, `matrix`, `statecalls`, `teximage`, `get`, `pixels`, `misc`, `paltex`, `attrib`, `mode` (set-up and modes), `vprog`, `proc` |
+| `src/mxgl.c`, `src/gl/*.c` | the GL calls: state to GS registers, clipping on the EE, textures (CT32/CT16/T8, mipmaps made here) in GS memory as needed. `mxgl.c` includes its parts in `src/gl/` (one translation unit: the draws' paths inline across them): `state` (the shared state), `frame`, `vram`, `texquality`, `gsstate` (GL state as GS registers), `batch` (vertex batches, the clipper), `draw` (a draw: transform, passes, triangles), `lines`, `dlist`, `drawcalls`, `immediate`, `client`, `matrix`, `statecalls`, `teximage`, `get`, `pixels`, `misc`, `paltex`, `attrib`, `mode` (set-up and modes), `vprog`, `attribs` (programs with inputs of their own), `proc` |
 | `src/mxglv.hlsl` | libgl's own VU1 vertex program: transform, divide, texture matrix, ST·Q, colour (`col * cmul + cadd`, scaled) |
 | `mk/mxgl.mk` | for an app's Makefile (see its head); `MXGL_PROGS`: the app's vertex programs (`mk/vu1bin.awk` makes their binaries) |
 | `tests/glconf.c` | each feature drawn and read back (`glReadPixels`): `make -C tests run` (PCSX2), or the ELF on the PS2 |
@@ -25,6 +25,7 @@ by name (core and ARB/EXT names):
 | `GL_EXT_draw_range_elements`, `GL_EXT_multi_draw_arrays`, `GL_IBM_multimode_draw_arrays` | `glDrawRangeElements` (no index searched), `glMultiDrawArrays`, `glMultiModeDrawArraysIBM`: a model's strips and fans in one draw |
 | `GL_EXT_paletted_texture`, `GL_EXT_shared_texture_palette` | `glColorTableEXT` and `GL_COLOR_INDEX` texels; the textures whose texels are all of the shared palette are kept as its indices (T8 with one CLUT: exact, half the memory of 16 bits); an entry with alpha 0 (`GL_RGBA` table) is the transparent one: textures keyed with alpha 0 are kept so too; `GL_COLOR_INDEX` texels with the palette enabled are stored as they are, sides of powers of two from 8 up (no RGBA on the way: a game's 8-bit art loads several times faster) |
 | `GL_OES_compressed_paletted_texture` | `glCompressedTexImage2D` of 16 or 256 colours: T8 with the texture's own CLUT, its levels as given |
+| `GL_EXT_texture_lod_bias` | `glTexEnvf(GL_TEXTURE_FILTER_CONTROL, GL_TEXTURE_LOD_BIAS, levels)`: added to every draw's level (K of TEX1) |
 | `GL_SGIS_generate_mipmap`, `GL_EXT_texture_edge_clamp` | the levels are made here anyway; CLAMP_TO_EDGE is the GS's clamp |
 | `GL_PS2_vertex_program_binary` | GL 2.0's vertex shaders as VU1 programs from HLSL (`glShaderBinary` with `GL_PS2_VU1_BINARY`, `glLinkProgram`, `glUseProgram`, `glUniform*`); below |
 
@@ -39,6 +40,19 @@ NAME_vu1)`; then `glAttachShader`, `glLinkProgram`, `glUseProgram`, `glGetUnifor
   fixed arrays), else the link fails: the draws go through libgl's batches as its own do,
   culled and clipped on the EE (a cut triangle's new vertices get interpolated inputs:
   exact for a program affine in them), so the program places a vertex where `mvp` does.
+- A program with other inputs is drawn from generic attributes (`glVertexAttribPointer`,
+  `glEnableVertexAttribArray`; attribute i is the HLSL input i, an array in the input's own
+  format in memory: `int4 POSITION_V4_16` is four shorts a vertex, `uint4 COLOR_V4_8U` four
+  bytes): `glDrawArrays` copies the arrays into the frame, `glDrawElements` gathers them by 16-
+  or 32-bit indices, and VU1 does the rest. libgl does not look at these vertices: nothing is
+  culled or clipped (draw only what is inside the guard band and beyond the near plane). An
+  input `uint4 ADC_V4_8U` is libgl's: 1 for a strip's first two vertices; an index that restarts
+  the primitive (`GL_PRIMITIVE_RESTART`, `GL_PRIMITIVE_RESTART_FIXED_INDEX`) ends a strip, so a
+  model's strips are one draw from its vertices as they are stored (two frames of shorts,
+  blended by the program). `GL_TEXTURE_LOD_BIAS` gives the mipmap level's offset (libgl
+  cannot see the texture's scale on these vertices: it takes one repeat a unit). Between
+  `glLockArraysEXT` and `glUnlockArraysEXT` a surface's next passes use the same copies.
+  `tests/glattr.hlsl` is one.
 - libgl sets the uniforms `mvp`, `cscale`, `tms`, `tmt` (as in `mxglv.hlsl`); `glUniform*`
   the others (a location is a float's index). A program whose uniforms are these four and two
   `float4` more (`cmul`, `cadd`) has libgl's own data layout: switching costs no FLUSH; each

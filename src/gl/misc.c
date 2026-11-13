@@ -56,6 +56,7 @@ void APIENTRY glClipPlane(GLenum p, const GLdouble *e) {
 void APIENTRY glClipPlanef(GLenum p, const GLfloat *e) { clip_plane(p, e); }
 void APIENTRY glLockArraysEXT(GLint first, GLsizei count) {
   lk.on = 1;
+  lk_serial++;
   lk.valid = 0;
   lk.count = first + count;
 }

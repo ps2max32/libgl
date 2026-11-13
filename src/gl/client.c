@@ -29,6 +29,8 @@ static void set_cap(GLenum cap, int on) {
     break;
   /* state the GS has not, or that changes no picture here */
   case GL_FOG: gl.fog = on; break;
+  case GL_PRIMITIVE_RESTART: prim_restart = on; break;
+  case GL_PRIMITIVE_RESTART_FIXED_INDEX: prim_restart_fixed = on; break;
   case GL_STENCIL_TEST: gl.st_on = on; break;
   case GL_DITHER: case GL_LIGHTING: case GL_NORMALIZE: case GL_LINE_SMOOTH:
   case GL_POINT_SMOOTH: case GL_POLYGON_SMOOTH: case GL_COLOR_MATERIAL:

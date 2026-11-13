@@ -453,7 +453,8 @@ static s32 dl_lod_k(const struct dl_entry *e, float lpp) {
   if (!t || !t->used || t->levels < 2 || e->log2_density < -1e8f)
     return 0;
   /* texels per unit: the texture's size now (a name may get another) */
-  float k = (e->log2_density + 0.5f * ((float)t->lw + (float)t->lh + tm_log2_area()) - lpp) * 16.0f;
+  float k = (e->log2_density + 0.5f * ((float)t->lw + (float)t->lh + tm_log2_area()) - lpp + gl.lod_bias) *
+            16.0f;
   s32 ki = (s32)(k + (k < 0 ? -0.5f : 0.5f));
   return ki < -2048 ? -2048 : ki > 2047 ? 2047 : ki;
 }

@@ -70,7 +70,7 @@ const GLubyte *APIENTRY glGetString(GLenum name) {
                             "GL_EXT_multi_draw_arrays GL_IBM_multimode_draw_arrays "
                             "GL_EXT_paletted_texture GL_EXT_shared_texture_palette "
                             "GL_OES_compressed_paletted_texture GL_SGIS_generate_mipmap "
-                            "GL_EXT_texture_edge_clamp GL_SGIS_texture_edge_clamp "
+                            "GL_EXT_texture_edge_clamp GL_SGIS_texture_edge_clamp GL_EXT_texture_lod_bias "
                             "GL_ARB_vertex_buffer_object GL_PS2_vertex_program_binary";
   default: gl_error(GL_INVALID_ENUM); return (const GLubyte *)"";
   }

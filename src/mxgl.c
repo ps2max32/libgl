@@ -151,4 +151,5 @@ static int gl_w = 640, gl_h = 448;
 #include "gl/attrib.c"
 #include "gl/mode.c"
 #include "gl/vprog.c"
+#include "gl/attribs.c"
 #include "gl/proc.c"

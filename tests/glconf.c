@@ -1048,6 +1048,59 @@ int main(void) {
     CHECK_EQ(glGetError(), GL_NO_ERROR);
   }
 
+  /* a program with inputs of its own: positions of shorts (two, the draw
+     halfway between them), colours of bytes, from generic attributes */
+  frame();
+  {
+    extern const struct mxgl_vu1_binary glattr_vu1;
+    GLuint sh = glCreateShader(GL_VERTEX_SHADER), prog = glCreateProgram();
+    glShaderBinary(1, &sh, GL_PS2_VU1_BINARY, &glattr_vu1, sizeof glattr_vu1);
+    glAttachShader(prog, sh);
+    glLinkProgram(prog);
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    CHECK(ok);
+    /* a strip of a quad at x 100..200 (a) and 300..400 (b): drawn at 200..300 */
+    static const short pa[4][4] = {{100, 100, 0, 1}, {200, 100, 0, 1}, {100, 200, 0, 0}, {200, 200, 0, 0}};
+    static const short pb[4][4] = {{300, 100, 0, 1}, {400, 100, 0, 1}, {300, 200, 0, 0}, {400, 200, 0, 0}};
+    static const unsigned char col[4][4] = {{0, 255, 0, 255}, {0, 255, 0, 255}, {0, 255, 0, 255}, {0, 255, 0, 255}};
+    glUseProgram(prog);
+    glUniform4f(glGetUniformLocation(prog, "blend"), 0.5f, 0, 0, 0);
+    glVertexAttribPointer(0, 4, GL_SHORT, GL_FALSE, 0, pa);
+    glVertexAttribPointer(1, 4, GL_SHORT, GL_FALSE, 0, pb);
+    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, 0, col);
+    for (GLuint i = 0; i < 3; i++)
+      glEnableVertexAttribArray(i);
+    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    /* two strips by indices, with a restart between: two quads of the
+       vertices 0..3 and 4..7, 250 lower, and no triangle between them */
+    static const short qa[8][4] = {{100, 250, 0, 0}, {140, 250, 0, 0}, {100, 350, 0, 0}, {140, 350, 0, 0},
+                                   {260, 250, 0, 0}, {300, 250, 0, 0}, {260, 350, 0, 0}, {300, 350, 0, 0}};
+    static const unsigned char qc[8][4] = {[0 ... 7] = {255, 0, 255, 255}};
+    static const unsigned short qi[9] = {0, 1, 2, 3, 0xFFFF, 4, 5, 6, 7};
+    glUniform4f(glGetUniformLocation(prog, "blend"), 0, 0, 0, 0);
+    glVertexAttribPointer(0, 4, GL_SHORT, GL_FALSE, 0, qa);
+    glVertexAttribPointer(1, 4, GL_SHORT, GL_FALSE, 0, qa);
+    glVertexAttribPointer(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, 0, qc);
+    glEnable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+    glDrawElements(GL_TRIANGLE_STRIP, 9, GL_UNSIGNED_SHORT, qi);
+    glDisable(GL_PRIMITIVE_RESTART_FIXED_INDEX);
+    glUseProgram(0);
+    CHECK_PIX(120, 300, 0xFF00FF);
+    CHECK_PIX(280, 300, 0xFF00FF);
+    CHECK_PIX(200, 300, 0x000000);
+    /* and a draw of libgl's own after it */
+    glColor3f(1, 0, 0);
+    quad(450, 100, 550, 200, 0);
+    CHECK_PIX(250, 150, 0x00FF00);
+    CHECK_PIX(150, 150, 0x000000);
+    CHECK_PIX(350, 150, 0x000000);
+    CHECK_PIX(500, 150, 0x0000FF);
+    glDeleteProgram(prog);
+    glDeleteShader(sh);
+    CHECK_EQ(glGetError(), GL_NO_ERROR);
+  }
+
   /* mxgl_deflicker: only the display; the buffer reads back as drawn */
   frame();
   mxgl_deflicker(1);
