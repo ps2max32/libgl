@@ -116,8 +116,8 @@ static void draw_attribs(GLenum mode, GLint first, GLsizei count, GLenum itype, 
     st_cur.refused++;
     return;
   }
-  /* the arrays into the frame's arena (the positions' part), each stream on
-     a quadword, with the vertices a batch reads past the last as zeros */
+  /* the arrays into the frame's arena, each stream on a quadword, with the
+     vertices a batch reads past the last as zeros */
   u32 frame = mx_frame_number();
   int kept = ac.valid && lk.on && ac.lock == lk_serial && ac.frame == frame && ac.p == p &&
              ac.first == first && ac.count == count && ac.idx == idx;
@@ -136,17 +136,26 @@ static void draw_attribs(GLenum mode, GLint first, GLsizei count, GLenum itype, 
         n -= IDX(j) == ri;
     if (n < 3)
       return;
-    u32 total = 0;
-    for (u32 i = 0; i < s->nin; i++)
-      total += ((n + s->align) * s->in[i].bytes + 15) & ~15u;
-    if (s_at[0] + total > POS_PART) {
-      dropped_draws++;
-      return;
-    }
-    u8 *a = arena[frame_par] + s_at[0];
-    u32 used = 0;
+    /* each stream in the part of the arena with the largest share left (the
+       fixed draws' positions, texture coordinates and colours: 4, 2 and 1
+       sevenths), so these draws take from all three as those do */
+    const u32 part_at[3] = {0, POS_PART, POS_PART + ST_PART}, part_size[3] = {POS_PART, ST_PART, COL_PART};
+    u32 at0[3] = {s_at[0], s_at[1], s_at[2]};
     for (u32 i = 0; i < s->nin; i++) {
       u32 b = s->in[i].bytes, bw = (b + 3) / 4, size = ((n + s->align) * b + 15) & ~15u;
+      u32 part = 0;
+      /* by the share of it that is free (compared without dividing) */
+      for (u32 q = 1; q < 3; q++)
+        if ((u64)(part_size[q] - s_at[q]) * part_size[part] > (u64)(part_size[part] - s_at[part]) * part_size[q])
+          part = q;
+      if (s_at[part] + size > part_size[part]) {
+        /* no room: what this draw took is given back */
+        s_at[0] = at0[0], s_at[1] = at0[1], s_at[2] = at0[2];
+        ac.valid = 0;
+        dropped_draws++;
+        return;
+      }
+      u8 *a = arena[frame_par] + part_at[part] + s_at[part];
       /* the same array as an input before (a model's two frames, the same): its copy */
       int same = -1;
       for (u32 j = 0; j < i && same < 0; j++)
@@ -157,6 +166,7 @@ static void draw_attribs(GLenum mode, GLint first, GLsizei count, GLenum itype, 
         ac.ptr[i] = attr[i].ptr, ac.at[i] = ac.at[same];
         continue;
       }
+      s_at[part] += size;
       u32 *d = UCAB(a);
       u32 w = 0;
       if ((int)i == p->in_adc) {
@@ -213,9 +223,7 @@ static void draw_attribs(GLenum mode, GLint first, GLsizei count, GLenum itype, 
       for (; w < size / 4; w++)
         d[w] = 0;
       ac.ptr[i] = attr[i].ptr, ac.at[i] = a;
-      a += size, used += size;
     }
-    s_at[0] += used;
     arena_pos = s_at[0] + s_at[1] + s_at[2];
     batch_place();
     ac.p = p, ac.first = first, ac.count = count, ac.idx = idx, ac.frame = frame, ac.lock = lk_serial;

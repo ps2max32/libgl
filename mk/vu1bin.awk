@@ -4,7 +4,7 @@
 # sizes (to the next member, the last to UNI_QW), the inputs' semantics.
 BEGIN {
   up = toupper(name); pre = "VU_" up "_"
-  split("ENTRY BUF_QW UNI_QW CTX_AT CTX_QW NCTX ITEM_QW OUT_QW MAX_N ALIGN COUNTS IN_AT OUT_AT NREG REGS NIN INPUTS ROW MAX_I IDX_AT", k, " ")
+  split("ENTRY BUF_QW UNI_QW CTX_AT CTX_QW NCTX ITEM_QW OUT_QW MAX_N ALIGN COUNTS IN_AT OUT_AT NREG REGS NIN INPUTS ROW MAX_I IDX_AT SPILL_QW", k, " ")
   for (i in k) known[k[i]] = 1
   nu = 0; ni = 0
 }

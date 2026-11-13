@@ -81,14 +81,16 @@ static void env_shifts(void) {
    colour up to 2x (0x80 is 1.0). */
 void APIENTRY glTexEnvf(GLenum t, GLenum p, GLfloat v) {
   pq_flush();
-  st_serial++;
-  if (t == GL_TEXTURE_FILTER_CONTROL) { /* GL_EXT_texture_lod_bias: levels added to every draw's */
+  if (t == GL_TEXTURE_FILTER_CONTROL) {
+    /* GL_EXT_texture_lod_bias: levels added to every draw's (its K is made
+       for each draw: no state serial) */
     if (p == GL_TEXTURE_LOD_BIAS)
       gl.lod_bias = v;
     else
       gl_error(GL_INVALID_ENUM);
     return;
   }
+  st_serial++;
   GLenum *env = gl.cunit ? &gl.u1.texenv : &gl.texenv;
   int u = gl.cunit;
   switch (p) {
