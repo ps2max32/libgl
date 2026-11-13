@@ -23,7 +23,13 @@ void mxgl_init(void);
 /* the picture, after mxgl_init: a mode, with flags or-ed in
    - MXGL_SD: NTSC or PAL, the console's own (its BIOS's region)
    - MXGL_NTSC: 640 x 448, 60 Hz; MXGL_PAL: 640 x 512, 50 Hz; interlaced
-   - MXGL_1080I: 1920 x 1080 interlaced
+   - MXGL_1080I: 1920 x 1080 interlaced; MXGL_1080I50 the same at 50 Hz
+   - MXGL_480P: 640 x 480, MXGL_576P: 640 x 576, progressive (60, 50 Hz)
+   - MXGL_720P: 1280 x 720 progressive, MXGL_720P50 at 50 Hz
+   - MXGL_1080P30: 1920 x 1080 progressive at 30 Hz, drawn as 1920 x 540
+     (a full picture does not fit in GS memory), each line shown twice
+   720P50, 1080I50 and 1080P30 are not in the BIOS: the kernel's own timing
+   (mx-kernel 22 or later, <mx/crtc.h>)
    - MXGL_BEAM: beam racing (maxsdk's passes, <mx/hires.h>): one buffer of
      a field's lines (640 x 224 / 256, 1920 x 540), drawn a strip at a time
      just ahead of the beam, every field, from the frame recorded; each
@@ -41,16 +47,24 @@ void mxgl_init(void);
    Between frames (a frame begun is ended first). GS memory is filled
    again (the textures are copied in as they are drawn), and the window is
    the whole screen (mxgl_screen). Returns 0, or -1 if beam racing could
-   not be set (memory): the mode is set without it. */
-enum { MXGL_SD, MXGL_NTSC, MXGL_PAL, MXGL_1080I };
+   not be set (memory): the mode is set without it; or if the mode does not
+   run here (mxgl_mode says): the console's own NTSC or PAL is set. */
+enum { MXGL_SD, MXGL_NTSC, MXGL_PAL, MXGL_1080I, MXGL_480P, MXGL_576P, MXGL_720P, MXGL_720P50, MXGL_1080I50,
+       MXGL_1080P30 };
 #define MXGL_BEAM 0x100
 #define MXGL_RGB24 0x200
 int mxgl_set_mode(int mode);
-/* the mode set: MXGL_NTSC, MXGL_PAL or MXGL_1080I */
+/* Dithering into 16 bits: n (up to 8) DIMX values (the GS's 4 x 4 matrix,
+   offsets -4..3), used in turn: with beam racing one a field (each field
+   is drawn anew: two that complement each other give twice the shades on
+   an interlaced screen), else one a frame. n 0: the GS manual's matrix
+   for every frame, as before. */
+void mxgl_dither(const unsigned long long *dimx, int n);
+/* the mode set: MXGL_NTSC, MXGL_PAL, MXGL_1080I, ... (not MXGL_SD) */
 int mxgl_mode(void);
 /* the flags in effect: MXGL_BEAM, MXGL_RGB24 */
 int mxgl_mode_flags(void);
-/* the screen's size: 640 x 448, 640 x 512, 1920 x 1080 */
+/* the screen's size: 640 x 448, 640 x 512, 1920 x 1080, ... */
 void mxgl_screen(int *w, int *h);
 /* the window the game sees, w x h (the screen after mxgl_set_mode): its
    coordinates (viewport, scissor, 2D, glReadPixels) are mapped onto the

@@ -136,10 +136,14 @@ first, so a page in the swap file is brought in with interrupts on.
 `mxgl_init` starts in the console's TV mode: NTSC (640 x 448, 60 Hz) or PAL (640 x 512,
 50 Hz) by the BIOS's region (`mx_video_default`), interlaced, a 16-bit colour buffer
 (dithered) each of two frames and a 24-bit Z buffer. `mxgl_set_mode` changes it between
-frames (`MXGL_SD`, `MXGL_NTSC`, `MXGL_PAL`, `MXGL_1080I`, with the flags `MXGL_BEAM` and
+frames (`MXGL_SD`, `MXGL_NTSC`, `MXGL_PAL`, `MXGL_1080I`, `MXGL_1080I50`, `MXGL_1080P30`,
+`MXGL_720P`, `MXGL_720P50`, `MXGL_576P`, `MXGL_480P`, with the flags `MXGL_BEAM` and
 `MXGL_RGB24` or-ed in): the pipeline starts again, GS memory is filled again, the display
 lists are dirty, the window is the screen (`mxgl_screen`). `mxgl_mode_flags` says which
-flags are in effect.
+flags are in effect. 720p50, 1080i50 and 1080p30 are not in the BIOS: the kernel times them
+(mx-kernel 22 or later). A mode that does not run (the console or the kernel lacks it: no
+vblank) leaves the console's own NTSC or PAL set, and `mxgl_set_mode` returns -1
+(`mxgl_mode` says which).
 
 | Mode | Buffers | Screen | GS memory for textures |
 |---|---|---|---|
@@ -148,6 +152,17 @@ flags are in effect.
 | NTSC / PAL + `MXGL_BEAM` + `MXGL_RGB24` | CT24 640 x 224 / 256, 3 strips of 96 lines, Z24 in them | 640 x 448 / 512 | 3.3 MiB, + 180 KiB of 8-bit textures in the strips' top byte |
 | 1080i | 2 x CT16S 640 x 540, Z16, stretched (FRAME mode: both fields the same picture) | 1920 x 1080 | 1.9 MiB |
 | 1080i + `MXGL_BEAM` | CT16S 1920 x 540 a field, 3 strips of 192 lines, Z16 in them | 1920 x 1080 | 1.9 MiB |
+| 1080p30 + `MXGL_BEAM` | CT16S 1920 x 540, each line shown twice (1920 x 1080 does not fit) | 1920 x 1080 | 1.9 MiB |
+| 720p + `MXGL_BEAM` | CT16S 1280 x 720, strips, Z16 in them | 1280 x 720 | about 2.1 MiB |
+| 480p / 576p + `MXGL_BEAM` + `MXGL_RGB24` | CT24 640 x 480 / 576, strips, Z24 in them | 640 x 480 / 576 | about 2.8 / 2.5 MiB |
+
+Without `MXGL_BEAM` the progressive HD modes draw two smaller 16-bit buffers, stretched
+(720p: 640 x 360; 1080p30: 640 x 540; 480p / 576p: 640 x 480 / 512).
+
+16-bit colour is dithered with the GS manual's 4 x 4 matrix, or with `mxgl_dither`'s: up to
+eight DIMX values used in turn, one a field with beam racing (each field is drawn anew:
+maxsdk's `mx_hires_dither`), else one a frame. Bayer's order moved about a field at a time
+gives every pixel each offset in turn and looks like fine grain.
 
 ### Beam racing
 

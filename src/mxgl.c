@@ -165,6 +165,9 @@ static u8 ring[RING_BYTES] MX_ALIGNED(64) MX_CORE_BSS;
    3 in one block (hires_mem) while it is on */
 static u8 *arena[NARENA];
 static u8 *hires_mem;
+/* mxgl_dither's matrices */
+static u64 dither_m[8];
+static u32 dither_n, dither_frame;
 /* libgl's memory (<mx/mem.h>): pinned (the DMAC or VU0 reads it, VU0 with
    interrupts off): gl_heap its objects (textures, lists, buffers, tables),
    gl_stream the arenas and beam racing's records */
@@ -584,11 +587,15 @@ static void frame_start(void) {
   }
   e = mx_e_ad(e, MX_GS_REG_PRMODECONT, 1);
   e = mx_e_ad(e, MX_GS_REG_COLCLAMP, 1);
-  /* the dither matrix: the manual's 4 x 4, offsets -4 to 3, a whole step
-     of 5 bits (8 of 255), so every shade between two dithers. The GS then
-     keeps the top 5 bits: a write is 4 of 255 darker on average (8 bits
-     would need offsets 0 to 7; DIMX has -4 to 3) */
-  e = mx_e_ad(e, MX_GS_REG_DIMX, 0x6071243571603524ull);
+  /* the dither matrix: the manual's 4 x 4 or mxgl_dither's, offsets -4 to
+     3, a whole step of 5 bits (8 of 255), so every shade between two
+     dithers. The GS then keeps the top 5 bits: a write is 4 of 255 darker
+     on average (8 bits would need offsets 0 to 7; DIMX has -4 to 3). With
+     beam racing and mxgl_dither the passes write it, per field: none here */
+  if (beam && dither_n)
+    e = mx_e_ad(e, 0x7F, 0); /* SCE_GS_NOP */
+  else
+    e = mx_e_ad(e, MX_GS_REG_DIMX, dither_n ? dither_m[dither_frame++ % dither_n] : 0x6071243571603524ull);
   e = mx_e_ad(e, MX_GS_REG_DTHE, !rgb24); /* not defined into 32 bits */
   if (!beam)
     e = mx_rt_e_clear(e, &rt[buf], 0, (u32)(gl.clear[0] * 255), (u32)(gl.clear[1] * 255),
@@ -6587,47 +6594,81 @@ static void hires_free(void) {
   arena[2] = arena[3] = NULL;
 }
 
-/* 1080i without beam racing: 640 x 540 shown by both fields (FRAME mode),
-   stretched to 1920 x 1080 */
-static struct mx_video_mode video_1080i_frame;
+
+/* the modes: the video mode, the picture (beam racing's buffer: a field's
+   lines when interlaced), whether 32-bit colour fits with beam racing, and
+   the buffers without it (shown stretched when smaller than the picture) */
+static const struct {
+  const struct mx_video_mode *m;
+  short w, h, bw, bh;    /* the picture, beam racing's buffer */
+  short rgb24;           /* CT24 fits */
+  short fw, fh;          /* two buffers without beam racing */
+  const char *name;
+} modes[] = {
+    [MXGL_NTSC] = {&mx_video_ntsc, 640, 448, 640, 224, 1, MXGL_FB_W, 448, "NTSC"},
+    [MXGL_PAL] = {&mx_video_pal, 640, 512, 640, 256, 1, MXGL_FB_W, 512, "PAL"},
+    [MXGL_1080I] = {&mx_video_1080i, 1920, 1080, 1920, 540, 0, 640, 540, "1080i"},
+    [MXGL_480P] = {&mx_video_480p, 640, 480, 640, 480, 1, 640, 480, "480p"},
+    [MXGL_576P] = {&mx_video_576p, 640, 576, 640, 576, 1, 640, 512, "576p"},
+    [MXGL_720P] = {&mx_video_720p, 1280, 720, 1280, 720, 0, 640, 360, "720p"},
+    [MXGL_720P50] = {&mx_video_720p50, 1280, 720, 1280, 720, 0, 640, 360, "720p50"},
+    [MXGL_1080I50] = {&mx_video_1080i50, 1920, 1080, 1920, 540, 0, 640, 540, "1080i50"},
+    [MXGL_1080P30] = {&mx_video_1080p30, 1920, 1080, 1920, 540, 0, 640, 540, "1080p30"},
+};
+#define NMODES ((int)(sizeof modes / sizeof modes[0]))
+
+/* a mode's video mode for a buffer shown by both fields (interlaced FRAME
+   mode) or stretched */
+static struct mx_video_mode video_frame;
 
 static int mode_flags; /* MXGL_BEAM, MXGL_RGB24 in effect */
 
 /* the mode's picture: with beam racing if asked (and memory allows), else
    two buffers; returns 0, or -1 for beam racing not set */
 static int start_mode(int mode, int flags) {
-  int pal = mode == MXGL_PAL, hd = mode == MXGL_1080I;
+  const struct mx_video_mode *vm = modes[mode].m;
+  int sd = mode == MXGL_NTSC || mode == MXGL_PAL;
   if (flags & MXGL_BEAM) {
-    /* SD: 640 x 224 / 256 a field; 32-bit colour fits only there */
-    int ok = hd ? start_beam(&mx_video_1080i, 1920, 540, MX_GS_PSM_CT16S)
-                : start_beam(pal ? &mx_video_pal : &mx_video_ntsc, 640, pal ? 256 : 224,
-                             flags & MXGL_RGB24 ? MX_GS_PSM_CT24 : MX_GS_PSM_CT16S);
-    if (ok == 0) {
+    /* 32-bit colour where it fits (SD, 480p, 576p) */
+    u32 psm = flags & MXGL_RGB24 && modes[mode].rgb24 ? MX_GS_PSM_CT24 : MX_GS_PSM_CT16S;
+    if (start_beam(vm, modes[mode].bw, modes[mode].bh, psm) == 0) {
       mode_flags = MXGL_BEAM | (rgb24 ? MXGL_RGB24 : 0);
-      scr_w = hd ? 1920 : 640, scr_h = 2 * fb_h;
+      scr_w = modes[mode].w, scr_h = modes[mode].h;
       return 0;
     }
     mx_printf("mxgl: no beam racing (memory %p)\n", hires_mem);
   }
   hires_free();
   mode_flags = 0;
-  if (hd) {
-    video_1080i_frame = mx_video_1080i;
-    video_1080i_frame.ffmd = 1;
-    /* Z16: the room for textures as with beam racing (Z24: 1.3 MiB) */
-    start_buffers(&video_1080i_frame, 640, 540, MX_GS_PSM_Z16S);
-    scr_w = 1920, scr_h = 1080;
-  } else {
-    start_buffers(pal ? &mx_video_pal : &mx_video_ntsc, MXGL_FB_W, pal ? 512 : 448, MXGL_FB_Z);
+  int ok;
+  if (sd) {
+    ok = start_buffers(vm, modes[mode].fw, modes[mode].fh, MXGL_FB_Z) == 0;
     scr_w = fb_w, scr_h = fb_h;
+  } else {
+    video_frame = *vm;
+    if (video_frame.interlace)
+      video_frame.ffmd = 1;
+    /* Z16: room for textures */
+    ok = start_buffers(&video_frame, modes[mode].fw, modes[mode].fh, MX_GS_PSM_Z16S) == 0;
+    scr_w = modes[mode].w, scr_h = modes[mode].h;
   }
+  if (!ok)
+    return -2; /* the mode does not run here */
   return flags & MXGL_BEAM ? -1 : 0;
+}
+
+void mxgl_dither(const unsigned long long *dimx, int n) {
+  n = n < 0 ? 0 : n > 8 ? 8 : n;
+  for (int i = 0; i < n; i++)
+    dither_m[i] = dimx[i];
+  dither_n = (u32)n;
+  mx_hires_dither(dither_m, dither_n);
 }
 
 int mxgl_set_mode(int mode) {
   int flags = mode & (MXGL_BEAM | MXGL_RGB24);
   mode &= 0xFF;
-  if (mode == MXGL_SD)
+  if (mode == MXGL_SD || mode >= NMODES)
     mode = mx_video_default() == &mx_video_pal ? MXGL_PAL : MXGL_NTSC;
   if (mode == mode_set && flags == mode_want)
     return 0;
@@ -6650,10 +6691,18 @@ int mxgl_set_mode(int mode) {
     }
   }
   int r = start_mode(mode, flags);
+  if (r == -2) {
+    /* the mode does not run (on this console, or this kernel): the
+       console's own, as for MXGL_SD */
+    int sd = mx_video_default() == &mx_video_pal ? MXGL_PAL : MXGL_NTSC;
+    mx_printf("mxgl: %s does not run here; %s\n", modes[mode].name, modes[sd].name);
+    mode = sd;
+    start_mode(mode, flags);
+    r = -1;
+  }
   mode_set = mode, mode_want = flags;
   frame_par = 0;
-  mx_printf("mxgl: %s %ux%u%s%s, buffer %ux%u\n",
-            mode == MXGL_1080I ? "1080i" : mode == MXGL_PAL ? "PAL" : "NTSC", scr_w, scr_h,
+  mx_printf("mxgl: %s %ux%u%s%s, buffer %ux%u\n", modes[mode].name, scr_w, scr_h,
             beam ? ", beam racing" : "", rgb24 ? ", 24-bit colour" : "", fb_w, fb_h);
   /* the HUD's font (256 x 8) in the first page after the buffers, the
      CLUTs after it (pages of libgl's own), then the textures (the cache,
