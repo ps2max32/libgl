@@ -27,6 +27,8 @@ MXGL_OBJS  = $(OUT)/mxgl/mxgl.o $(MXGL_VU1) $(patsubst %,$(OUT)/mxgl/%_vu1.o,$(M
 # "mxglc.i"
 VSM_FLAGS += -I$(MXGL_DIR)/src
 VSM_DIRS  += $(MXGL_VSM_DIR)
+# MXGL_MAX_TEXTURES: the number of texture names (2048 by default: about 500 KB
+# of static memory; a program with a few textures can do with less)
 # MXGL_ARENA_BYTES: the size of each frame arena (512 KB by default; two,
 # four with beam racing); MXGL_REC_BYTES: beam racing's record of a frame's
 # stream (256 KB by default, four of them; a quarter of each is the
@@ -35,6 +37,7 @@ MXGL_DEFS  := $(if $(MXGL_ARENA_BYTES),-DMXGL_ARENA_BYTES=$(MXGL_ARENA_BYTES)) \
               $(if $(MXGL_REC_BYTES),-DMXGL_REC_BYTES=$(MXGL_REC_BYTES)) \
               $(if $(filter 1,$(MXGL_VU1CLIP)),-DMXGL_VU1CLIP=1) \
               $(if $(MXGL_MAX_TEXTURE),-DMXGL_MAX_TEXTURE=$(MXGL_MAX_TEXTURE)) \
+              $(if $(MXGL_MAX_TEXTURES),-DMXGL_MAX_TEXTURES=$(MXGL_MAX_TEXTURES)) \
               $(if $(MXGL_FB_W),-DMXGL_FB_W=$(MXGL_FB_W)) \
               $(if $(filter 1,$(MXGL_FB_Z16)),-DMXGL_FB_Z=MX_GS_PSM_Z16S) \
               $(if $(MXGL_STATS_WINDOW),-DMXGL_STATS_WINDOW=$(MXGL_STATS_WINDOW))

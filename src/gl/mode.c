@@ -205,6 +205,70 @@ int mxgl_set_mode(int mode) {
   return r;
 }
 
+/* mxgl_suspend, mxgl_resume: the memory the frames need given back while
+   the program draws nothing (a shell waiting beside a game) */
+static int suspended = -1, suspended_flags;
+
+void mxgl_suspend(void) {
+  if (suspended >= 0 || mode_set < 0)
+    return;
+  pq_flush();
+  if (in_frame)
+    mxgl_end_frame();
+  u32 t0 = mx_count();
+  while (!beam && mx_gs.shown != mx_gs.frames && mx_count() - t0 < MX_EE_HZ)
+    ;
+  mx_frame_stop();
+  /* no frame reads anything now: what was freed goes, the lists and their
+     pool, the arenas and beam racing's memory, the transform's cache */
+  for (int k = 0; k < NDEFER; k++) {
+    for (int i = 0; i < ndeferred[k]; i++)
+      gl_free(deferred[k][i]);
+    ndeferred[k] = 0;
+  }
+  for (GLuint id = 1; id < DL_MAX; id++)
+    dlists[id].first = NULL, dlists[id].end = NULL, dlists[id].used = 0;
+  dl_nused = 0;
+  dl_pool_reset();
+  for (u32 i = 0; i < DL_NCHUNK; i++) {
+    if (dl_chunk[i])
+      gl_free(dl_chunk[i]);
+    dl_chunk[i] = NULL;
+  }
+  hires_free();
+  for (int i = 0; i < 2; i++) {
+    mx_heap_free(gl_stream, arena[i]);
+    arena[i] = NULL;
+  }
+  if (vp_ram)
+    gl_free(vp_ram), gl_free(vo_ram);
+  vp_ram = NULL, vo_ram = NULL, v_cache_n = 0;
+  lk.valid = 0;
+  suspended = mode_set, suspended_flags = mode_want;
+  mode_set = -1;
+}
+
+int mxgl_resume(void) {
+  if (suspended < 0)
+    return 0;
+  for (int i = 0; i < 2; i++) {
+    arena[i] = mx_heap_alloc(gl_stream, ARENA_BYTES, 64);
+    if (arena[i])
+      mx_dcache_invalidate(arena[i], ARENA_BYTES);
+  }
+  if (!arena[0] || !arena[1]) {
+    mx_printf("mxgl: no memory for the arenas (2 x %u KB)\n", ARENA_BYTES / 1024);
+    for (int i = 0; i < 2; i++) {
+      mx_heap_free(gl_stream, arena[i]);
+      arena[i] = NULL;
+    }
+    return -1;
+  }
+  int mode = suspended | suspended_flags;
+  suspended = -1;
+  return mxgl_set_mode(mode);
+}
+
 int mxgl_mode_flags(void) { return mode_flags; }
 
 int mxgl_mode(void) { return mode_set; }

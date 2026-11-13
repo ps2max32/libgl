@@ -115,6 +115,12 @@ the one pool as needed and give them back when freed (there is no core heap to s
   once while the pager brings them in: a later frame uploads it whole. Brightness textures
   (lightmaps) and textures of fewer than 3 levels stay pinned whole.
 
+libgl's static tables are about 740 KB, 500 KB of them the texture names' (2048):
+`MXGL_MAX_TEXTURES` in the app's Makefile sets another number (64: 240 KB in all).
+`mxgl_suspend` gives back what the frames need (the arenas, beam racing's records, the display
+lists and their pool) while a program draws nothing, as a shell beside a game; `mxgl_resume`
+takes it again and sets the mode that was set. The textures stay unless deleted first.
+
 `mxgl_texture_quality` leaves the top levels out (1 or 2) of textures drawn with MIPMAP
 filtering, or picks them by itself (`MXGL_TEX_AUTO`), with two controls apart:
 

@@ -60,6 +60,18 @@ int mxgl_set_mode(int mode);
    an interlaced screen), else one a frame. n 0: the GS manual's matrix
    for every frame, as before. */
 void mxgl_dither(const unsigned long long *dimx, int n);
+/* While the program draws nothing for a time (a shell waiting beside a
+   game): mxgl_suspend ends the frame begun, stops the pipeline and gives
+   back the memory the frames need: the arenas, beam racing's records, the
+   display lists' draws (their names stay: make the lists again) and their pool. The
+   textures stay (their names, parameters and texels in main memory);
+   glDeleteTextures before it gives their memory back too. No GL call may
+   draw until mxgl_resume, which takes the memory again and sets the mode
+   that was set (the pipeline starts again, GS memory is filled again as
+   after mxgl_set_mode). Returns mxgl_set_mode's value, or -1 without
+   memory for the arenas (still suspended: mxgl_resume again later). */
+void mxgl_suspend(void);
+int mxgl_resume(void);
 /* the mode set: MXGL_NTSC, MXGL_PAL, MXGL_1080I, ... (not MXGL_SD) */
 int mxgl_mode(void);
 /* the flags in effect: MXGL_BEAM, MXGL_RGB24 */

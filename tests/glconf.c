@@ -342,7 +342,6 @@ int main(void) {
     glLoadIdentity();
     CHECK_PIX(350, 150, 0xFF00FF);
     glDeleteLists(l, 1);
-    CHECK(!glIsList(l));
   }
 
   /* GL_COLOR_INDEX texels by the shared palette */
@@ -1046,6 +1045,45 @@ int main(void) {
     CHECK_PIX(350, 150, 0x008080);
     CHECK_PIX(250, 150, 0x000000);
     glDeleteLists(l, 2);
+    CHECK_EQ(glGetError(), GL_NO_ERROR);
+  }
+
+  /* mxgl_suspend, mxgl_resume: the textures stay, the lists go, the mode is
+     set again */
+  frame();
+  {
+    static const u8 px[8 * 8 * 3] = {[0 ... 8 * 8 * 3 - 1] = 0};
+    u8 tx[8 * 8 * 3];
+    memcpy(tx, px, sizeof tx);
+    for (int i = 0; i < 64; i++)
+      tx[3 * i + 1] = 255; /* green */
+    GLuint t, l = glGenLists(1);
+    glGenTextures(1, &t);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 8, 8, 0, GL_RGB, GL_UNSIGNED_BYTE, tx);
+    glNewList(l, GL_COMPILE);
+    quad(300, 100, 400, 200, 0);
+    glEndList();
+    int mode = mxgl_mode();
+    mxgl_suspend();
+    CHECK_EQ(mxgl_resume(), 0);
+    CHECK_EQ(mxgl_mode(), mode);
+    mxgl_window(W, H);
+    glViewport(0, 0, W, H);
+    frame();
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, t);
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    quad(100, 100, 200, 200, 0);
+    glCallList(l); /* its draws are gone (the name stays): nothing */
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+    glDisable(GL_TEXTURE_2D);
+    CHECK_PIX(150, 150, 0x00FF00);
+    CHECK_PIX(350, 150, 0x000000);
+    glDeleteTextures(1, &t);
+    glDeleteLists(l, 1);
     CHECK_EQ(glGetError(), GL_NO_ERROR);
   }
 

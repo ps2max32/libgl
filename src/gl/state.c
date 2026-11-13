@@ -122,7 +122,14 @@ int mxgl_show_stats = 0;
 
 /* ---- textures ---------------------------------------------------------------- */
 
+/* the texture names (glGenTextures gives 1 .. MAX_TEX - 1): a program with
+   few textures takes less static memory (MXGL_MAX_TEXTURES in mk/mxgl.mk;
+   a struct tex is about 200 bytes) */
+#ifdef MXGL_MAX_TEXTURES
+#define MAX_TEX (MXGL_MAX_TEXTURES)
+#else
 #define MAX_TEX 2048
+#endif
 /* A texture and its MIPMAP levels, down to 8 x 8 (bilinear filters are
    wrong below; also whole quadwords for IMAGE), MX_TEX_LEVELS at most. The
    engine sends the levels (glTexImage2D level n); levels has those that
@@ -175,7 +182,7 @@ struct tex {
 static struct tex texs[MAX_TEX];
 /* brightness copies of colour textures, made when a draw multiplies with
    the destination (tex_twin) */
-#define MAX_TWIN 512 /* a lightmap page has 3 with mxgl_color_light */
+#define MAX_TWIN (MAX_TEX / 4 > 8 ? MAX_TEX / 4 : 8) /* a lightmap page has 3 with mxgl_color_light */
 enum { TWIN_ENV_A = 4, TWIN_ENV_B = 5, NTWIN = 6 };
 static struct tex twins[MAX_TWIN];
 static void tex_drop_twin(struct tex *t);
