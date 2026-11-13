@@ -1,8 +1,7 @@
-# .github/workflows/ps2.yml of ps2max32/libgl.
-# Builds tests/glconf.elf from the checkout (MXGL: not the image's copy)
-# against the image's maxsdk.
-# images.yml in ps2max32/docker only moves its libgl pin to commits where
-# this passed.
+# .github/workflows/ps2.yml of ps2max32/libgl (template: ci/libgl.yml of ps2max32/docker).
+# Builds with the commits its ps2max.deps names (LLVM, maxsdk, ...), through
+# the reusable build of ps2max32/docker: tests/glconf.elf from the checkout
+# (MXGL) against the maxsdk of its ps2max.deps.
 name: ps2
 
 on:
@@ -11,14 +10,9 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    runs-on: ubuntu-26.04
-    container: ghcr.io/ps2max32/ps2max:latest
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build
-        run: make -C tests -j$(nproc) MXGL=$PWD OUT=$PWD/out
-      - uses: actions/upload-artifact@v7
-        with:
-          name: libgl-${{ github.sha }}
-          path: out/glconf.elf
+  ps2:
+    uses: ps2max32/docker/.github/workflows/build.yml@main
+    with:
+      build: make -C tests -j$(nproc) MXGL=$PWD OUT=$PWD/out
+      artifacts: out/glconf.elf
+      release: false
