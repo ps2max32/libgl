@@ -2458,8 +2458,10 @@ static inline __attribute__((always_inline)) void put_vertex(const struct vsrc *
   if (s->has_z) {
     o_put_pos(o_n, x, MXGL_W(adc));
   } else {
-    float *d = o_pos[o_n];
-    d[0] = x[0], d[1] = x[1], d[2] = 0, d[3] = adc ? 1.0f : 0.0f;
+    /* w as o_put_pos has it: a vertex that closes a triangle in the reverse
+       order (adc 2) closes one */
+    const float xy0[3] = {x[0], x[1], 0};
+    o_put_pos(o_n, xy0, MXGL_W(adc));
   }
   if (s->tb) {
     o_put_st(o_n, s->tb + v * s->ts);
@@ -3434,13 +3436,21 @@ static void dl_record(const u32 *idx, int nidx, int nverts) {
 #endif
               dl_last_vstride == gl.vstride && dl_last_idx == idx && dl_last_nidx == nidx &&
               dl_last_nverts == nverts;
+  u32 ntri, n = dl_strips(idx, nidx, nverts, seq, trs, &ntri);
+  /* and the same positions: the arrays may hold other vertices by now (the
+     immediate mode's are one buffer) */
+  share = share && n == dl_last->n && ntri == dl_last->ntri;
+  for (u32 o = 0; share && o < n; o++) {
+    const float *x = (const float *)((const u8 *)gl.vptr + (seq[o] & 0x7FFFFFFFu) * gl.vstride);
+    const float *q = dl_last->pos[o];
+    share = x[0] == q[0] && x[1] == q[1] && (gl.vsize > 2 ? x[2] : 0) == q[2];
+  }
   struct dl_entry *e = dl_take(sizeof *e);
   u16 *tri = share ? dl_last->tri : dl_take(ntri_max * 6);
   if (!e || !tri) {
     dl_failed = 1;
     return;
   }
-  u32 ntri, n = dl_strips(idx, nidx, nverts, seq, trs, &ntri);
   if (!share)
     memcpy(tri, trs, ntri * 6);
   float(*pos)[4] = share ? dl_last->pos : dl_take((n + pad) * 16);
@@ -3695,9 +3705,9 @@ void mxgl_DeleteAllLists(void) {
 }
 
 /* K: log2(texels a pixel at w = 1) = log2(texels per unit) - log2(pixels
-   per unit at w = 1, from the projection: lpp) */
+   per unit at w = 1, from the projection: lpp), for the entry's texture */
 static s32 dl_lod_k(const struct dl_entry *e, float lpp) {
-  struct tex *t = gl.tex2d && gl.bound && gl.bound < MAX_TEX ? &texs[gl.bound] : NULL;
+  struct tex *t = e->st.tex2d && e->st.bound && e->st.bound < MAX_TEX ? &texs[e->st.bound] : NULL;
   if (!t || !t->used || t->levels < 2 || e->log2_density < -1e8f)
     return 0;
   /* texels per unit: the texture's size now (a name may get another) */
@@ -3708,157 +3718,273 @@ static s32 dl_lod_k(const struct dl_entry *e, float lpp) {
 
 static u32 *idx_room(int n);
 
-void APIENTRY glCallList(GLuint id) {
-  pq_flush();
-  if (!id || id >= DL_MAX || !dlists[id].used)
+/* The matrix of the calls and the planes (plane_d, the user clip plane last)
+   as rows: plane k of p = M v is dl_pl[k] . v. Made again when the matrices,
+   the viewport, the depth range or the clip plane change (they bump
+   mat_serial). dl_lpp: log2 of pixels per unit at w = 1. */
+static float dl_m[16], dl_lpp;
+static v4f dl_pl[7], dl_pl_abs[7];
+static u32 dl_mser;
+static void dl_matrix(void) {
+  zn = zmax * (1 - gl.dn);
+  zf = zmax * (1 - gl.df);
+  if (dl_mser == mat_serial)
     return;
-  dl_called_frame = mx_gs.frames;
+  dl_mser = mat_serial;
+  /* without the polygon offset: an entry with it is drawn as any draw */
+  int po = gl.poffset;
+  gl.poffset = 0;
+  make_mvp(dl_m);
+  gl.poffset = po;
+  const float *pr = gl.pr[gl.pr_top];
+  float sx = pr[0] * (float)gl.vp[2] * 0.5f * fb_w / gl_w, sy = pr[5] * (float)gl.vp[3] * 0.5f * fb_h / gl_h;
+  float a = sx * sy;
+  dl_lpp = 0.5f * fast_log2(a < 0 ? -a : a);
+  for (int c = 0; c < 4; c++) {
+    const float *col = dl_m + 4 * c;
+    dl_pl[0][c] = col[0] - GB_LO * col[3];
+    dl_pl[1][c] = GB_HI * col[3] - col[0];
+    dl_pl[2][c] = col[1] - GB_LO * col[3];
+    dl_pl[3][c] = GB_HI * col[3] - col[1];
+    dl_pl[4][c] = zn * col[3] - col[2];
+    dl_pl[5][c] = col[2] - zf * col[3];
+    dl_pl[6][c] = ucp[0] * col[0] + ucp[1] * col[1] + ucp[2] * col[2] + ucp[3] * col[3];
+  }
+  for (int k = 0; k < 7; k++)
+    for (int c = 0; c < 4; c++)
+      dl_pl_abs[k][c] = c < 3 ? (dl_pl[k][c] < 0 ? -dl_pl[k][c] : dl_pl[k][c]) : 0;
+}
+
+/* The entries drawn one after the other with the same state are a run: one
+   set of registers and one VU1 context (uniforms, GIF tag) for all, then a
+   CALL of each entry's chain (each chain's first batch takes the context
+   again). K of TEX1 is the run's first entry's while the next ones' is
+   within DL_K_TOL (an eighth of a level). */
+#define DL_RUN 128
+#define DL_K_TOL 2
+static struct {
+  const struct mx_chain *ch[DL_RUN];
+  u32 n, prim;
+  int cl; /* a channel a pass (mxgl_color_light) */
+  /* the run's state, for the next entry's: valid while the registers are as
+     it left them */
+  struct dl_state st;
+  s32 k;
+  u32 serial, gen;
+  int ok;
+} dl_run;
+static float dl_uni[MXGL_UNI_QW][4] MX_ALIGNED(16) = {
+    [VU_MXGLV_CMUL] = {1, 1, 1, 1}}; /* the colour as it is */
+
+static void dl_run_send(void) {
+  if (!dl_run.n)
+    return;
+  u32 c0 = mx_count();
+  flush_out(); /* a batch of entries drawn as any draw comes first */
+  /* libgl's own program: a list's chain calls it (the entry is in its
+     batches); the colours are the recorded ones */
+  const struct mx_shader *sh = vprog_use(NULL);
+  for (int pass = 0; pass < (dl_run.cl ? 3 : 1); pass++) {
+    if (pass)
+      cl_regs(pass);
+    mx_frame_shader_call(sh, dl_run.prim, dl_uni, dl_run.ch[0]);
+    for (u32 i = 1; i < dl_run.n; i++)
+      mx_frame_call(dl_run.ch[i]);
+  }
+  if (dl_run.cl)
+    cl_regs(0);
+  gs_drew = 1;
+  st_cur.draws++;
+  st_cur.c_call += mx_count() - c0;
+  dl_run.n = 0;
+}
+
+/* an entry of a list being called, with the matrices of now */
+static void dl_draw_entry(const struct dl_entry *e, int nplanes) {
+  u32 c0 = mx_count();
+  /* the bounds against each plane: the centre's distance, and how far
+     the box reaches along the plane's normal */
+  u32 oand = 0, oor = 0;
+  for (int k = 0; k < nplanes; k++) {
+    v4f dc = dl_pl[k] * e->center, rr = dl_pl_abs[k] * e->half;
+    float d = dc[0] + dc[1] + dc[2] + dc[3], r = rr[0] + rr[1] + rr[2];
+    if (d + r < 0)
+      oand = 1;
+    if (d - r < 0)
+      oor = 1;
+  }
+  if (oand)
+    return;
+  if (oor || e->st.poffset) {
+    /* across a plane: as any draw */
+    dl_run_send();
+    dl_run.ok = 0;
+    dl_set_state(&e->st);
+    const float *vp = gl.vptr, *tp = gl.tptr;
+    const u8 *cp = gl.cptr;
+    int vs = gl.vsize, vst = gl.vstride, tst = gl.tstride, cst = gl.cstride;
+    int va = gl.va, ta = gl.ta, ca = gl.ca;
+    gl.vptr = &e->pos[0][0], gl.vsize = 3, gl.vstride = 16, gl.va = 1;
+    gl.tptr = &e->st2[0][0], gl.tstride = 8, gl.ta = 1;
+    gl.cptr = &e->col[0][0], gl.cstride = 4, gl.ca = 1;
+    u32 *ix = idx_room((int)(3 * e->ntri));
+    for (u32 i = 0; i < 3 * e->ntri; i++)
+      ix[i] = e->tri[i];
+    draw_tris_(ix, (int)(3 * e->ntri), (int)e->n);
+    gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
+    gl.vsize = vs, gl.vstride = vst, gl.tstride = tst, gl.cstride = cst;
+    gl.va = va, gl.ta = ta, gl.ca = ca;
+    return;
+  }
+  if (e->planar && e->st.cull && e->st.cullface != GL_FRONT_AND_BACK && !vu1_clips()) {
+    /* one plane, one facing: the first triangle's on the screen (culled()) */
+    v4f mc[4];
+    memcpy(mc, dl_m, 64);
+    v4f a = xform(mc, e->pos[0][0], e->pos[0][1], e->pos[0][2]);
+    v4f b = xform(mc, e->pos[1][0], e->pos[1][1], e->pos[1][2]);
+    v4f c = xform(mc, e->pos[2][0], e->pos[2][1], e->pos[2][2]);
+    float det = a[0] * (b[1] * c[3] - b[3] * c[1]) - a[1] * (b[0] * c[3] - b[3] * c[0]) +
+                a[3] * (b[0] * c[1] - b[1] * c[0]);
+    int front = det < 0;
+    if (e->st.cullface == GL_FRONT ? front : !front)
+      return;
+  } else if (e->st.cull && e->st.cullface == GL_FRONT_AND_BACK) {
+    return;
+  }
+  u32 c1 = mx_count();
+  st_cur.c_bounds += c1 - c0;
+  s32 k = dl_lod_k(e, dl_lpp);
+  /* the same state as the run's, nothing written since: the registers are
+     right, and the entry joins it */
+  s32 dk = k - dl_run.k;
+  if (!(dl_run.ok && dl_run.n < DL_RUN && gs_serial == dl_run.serial && vram_gen == dl_run.gen &&
+        dk >= -DL_K_TOL && dk <= DL_K_TOL && !memcmp(&dl_run.st, &e->st, sizeof dl_run.st))) {
+    dl_run_send();
+    dl_run.ok = 0;
+    dl_set_state(&e->st);
+    if (set_state(&dl_run.prim, dl_uni[VU_MXGLV_CSCALE], k) < 0)
+      return;
+    dl_run.prim &= ~(1u << MX_GS_PRIM_FGE_SHIFT); /* libgl's own program: no F */
+    dl_run.cl = cl_batch;
+    dl_run.st = e->st, dl_run.k = k, dl_run.gen = vram_gen, dl_run.serial = gs_serial;
+    dl_run.ok = 1;
+    memcpy(dl_uni[VU_MXGLV_MVP], dl_m, 64);
+    tm_uniforms(dl_uni[VU_MXGLV_TMS], dl_uni[VU_MXGLV_TMT]);
+  }
+  /* its bounds' nearest point: the finest level its texture is sampled at
+     (the texture is the run's: gl.bound) */
+  if (tex_bias_auto) {
+    const float *m = dl_m;
+    float wc = m[3] * e->center[0] + m[7] * e->center[1] + m[11] * e->center[2] + m[15];
+    float wr = fabsf(m[3]) * e->half[0] + fabsf(m[7]) * e->half[1] + fabsf(m[11]) * e->half[2];
+    tex_need_note(k, wc - wr);
+  }
+  dl_run.ch[dl_run.n++] = &e->ch;
+  st_cur.c_state += mx_count() - c1;
+  st_cur.lists++;
+  st_cur.tris += e->ntri;
+  st_cur.verts += e->n;
+}
+
+/* A list of passes over one surface: the first draws it with depth writes
+   and no blending, the others go over its pixels (the same vertices, depth
+   EQUAL or LEQUAL, no depth writes). Such lists called together may be
+   drawn pass by pass, all first passes before all second ones: every pixel
+   ends up as the nearest surface's passes in order, as when each list is
+   drawn whole. */
+static int dl_is_passes(const struct dl_entry *e) {
+  if (!e || !e->st.dtest || !e->st.dmask || e->st.blend || e->st.poffset)
+    return 0;
+  for (const struct dl_entry *p = e->next; p; p = p->next)
+    if (p->pos != e->pos || p->st.dmask || !p->st.dtest ||
+        (p->st.dfunc != GL_EQUAL && p->st.dfunc != GL_LEQUAL) || p->st.poffset)
+      return 0;
+  return 1;
+}
+
+/* glCallList, glCallLists: the lists ids[0 .. n - 1] */
+#define DL_CALL_MAX 256
+static void dl_call(const GLuint *ids, int n) {
+  pq_flush();
   if (dl_compiling) {
     gl_error(GL_INVALID_OPERATION); /* lists in lists: not recorded */
     return;
   }
   u32 t0 = mx_count();
+  dl_called_frame = mx_gs.frames;
   frame_start();
   flush_out();
-  /* the matrix of the calls, made again when the matrices, the viewport or
-     the depth range change; lpp: log2 of pixels per unit at w = 1 */
-  static float m[16], lpp, key[16 + 16 + 6 + 5];
-  /* the planes (plane_d, the user clip plane last) as rows: plane k of
-     p = M v is pl[k] . v */
-  static v4f pl[7], pl_abs[7];
-  float nk[16 + 16 + 6 + 5];
-  memcpy(nk, gl.mv[gl.mv_top], 64);
-  memcpy(nk + 16, gl.pr[gl.pr_top], 64);
-  nk[32] = (float)gl.vp[0], nk[33] = (float)gl.vp[1], nk[34] = (float)gl.vp[2];
-  nk[35] = (float)gl.vp[3], nk[36] = gl.dn, nk[37] = gl.df;
-  nk[38] = (float)gl.ucp_on;
-  memcpy(nk + 39, gl.ucp_eye, 16);
+  dl_matrix();
   const int nplanes = gl.ucp_on ? 7 : 6;
-  if (memcmp(nk, key, sizeof key)) {
-    memcpy(key, nk, sizeof key);
-    /* without the polygon offset: an entry with it is drawn as any draw */
-    int po = gl.poffset;
-    gl.poffset = 0;
-    make_mvp(m);
-    gl.poffset = po;
-    const float *pr = gl.pr[gl.pr_top];
-    float sx = pr[0] * (float)gl.vp[2] * 0.5f * fb_w / gl_w, sy = pr[5] * (float)gl.vp[3] * 0.5f * fb_h / gl_h;
-    float a = sx * sy;
-    lpp = 0.5f * fast_log2(a < 0 ? -a : a);
-    zn = zmax * (1 - gl.dn);
-    zf = zmax * (1 - gl.df);
-    for (int c = 0; c < 4; c++) {
-      const float *col = m + 4 * c;
-      pl[0][c] = col[0] - GB_LO * col[3];
-      pl[1][c] = GB_HI * col[3] - col[0];
-      pl[2][c] = col[1] - GB_LO * col[3];
-      pl[3][c] = GB_HI * col[3] - col[1];
-      pl[4][c] = zn * col[3] - col[2];
-      pl[5][c] = col[2] - zf * col[3];
-      pl[6][c] = ucp[0] * col[0] + ucp[1] * col[1] + ucp[2] * col[2] + ucp[3] * col[3];
-    }
-    for (int k = 0; k < 7; k++)
-      for (int c = 0; c < 4; c++)
-        pl_abs[k][c] = c < 3 ? (pl[k][c] < 0 ? -pl[k][c] : pl[k][c]) : 0;
-  }
-  zn = zmax * (1 - gl.dn);
-  zf = zmax * (1 - gl.df);
   struct dl_state keep;
   dl_get_state(&keep);
-  for (struct dl_entry *e = dlists[id].first; e; e = e->next) {
-    u32 c0 = mx_count();
-    /* the bounds against each plane: the centre's distance, and how far
-       the box reaches along the plane's normal */
-    u32 oand = 0, oor = 0;
-    for (int k = 0; k < nplanes; k++) {
-      v4f dc = pl[k] * e->center, rr = pl_abs[k] * e->half;
-      float d = dc[0] + dc[1] + dc[2] + dc[3], r = rr[0] + rr[1] + rr[2];
-      if (d + r < 0)
-        oand = 1;
-      if (d - r < 0)
-        oor = 1;
+  const struct dl_state *end = &keep;
+  dl_run.ok = 0;
+  while (n > 0) {
+    const struct dl_entry *cur[DL_CALL_MAX];
+    int m = 0, passes = 1;
+    for (; m < DL_CALL_MAX && m < n; m++) {
+      GLuint id = ids[m];
+      cur[m] = id && id < DL_MAX && dlists[id].used ? dlists[id].first : NULL;
+      if (cur[m]) {
+        passes = passes && dl_is_passes(cur[m]);
+        /* the list's state calls had their effect */
+        if (dlists[id].end)
+          end = dlists[id].end;
+      }
     }
-    if (oand)
-      continue;
-    dl_set_state(&e->st);
-    if (oor || e->st.poffset) {
-      /* across a plane: as any draw */
-      const float *vp = gl.vptr, *tp = gl.tptr;
-      const u8 *cp = gl.cptr;
-      int vs = gl.vsize, vst = gl.vstride, tst = gl.tstride, cst = gl.cstride;
-      int va = gl.va, ta = gl.ta, ca = gl.ca;
-      gl.vptr = &e->pos[0][0], gl.vsize = 3, gl.vstride = 16, gl.va = 1;
-      gl.tptr = &e->st2[0][0], gl.tstride = 8, gl.ta = 1;
-      gl.cptr = &e->col[0][0], gl.cstride = 4, gl.ca = 1;
-      u32 *ix = idx_room((int)(3 * e->ntri));
-      for (u32 i = 0; i < 3 * e->ntri; i++)
-        ix[i] = e->tri[i];
-      draw_tris_(ix, (int)(3 * e->ntri), (int)e->n);
-      gl.vptr = vp, gl.tptr = tp, gl.cptr = cp;
-      gl.vsize = vs, gl.vstride = vst, gl.tstride = tst, gl.cstride = cst;
-      gl.va = va, gl.ta = ta, gl.ca = ca;
-      continue;
+    if (passes && m > 1) {
+      for (int left = 1; left;) {
+        left = 0;
+        for (int i = 0; i < m; i++)
+          if (cur[i]) {
+            dl_draw_entry(cur[i], nplanes);
+            cur[i] = cur[i]->next;
+            left |= cur[i] != NULL;
+          }
+      }
+    } else {
+      for (int i = 0; i < m; i++)
+        for (const struct dl_entry *e = cur[i]; e; e = e->next)
+          dl_draw_entry(e, nplanes);
     }
-    if (e->planar && gl.cull) {
-      v4f mc[4];
-      memcpy(mc, m, 64);
-      v4f p0 = xform(mc, e->pos[0][0], e->pos[0][1], e->pos[0][2]);
-      v4f p1 = xform(mc, e->pos[1][0], e->pos[1][1], e->pos[1][2]);
-      v4f p2 = xform(mc, e->pos[2][0], e->pos[2][1], e->pos[2][2]);
-      if (culled((float *)&p0, (float *)&p1, (float *)&p2))
-        continue;
-    }
-    static u32 prim;
-    static float uni[MXGL_UNI_QW][4] MX_ALIGNED(16) = {
-        [VU_MXGLV_CMUL] = {1, 1, 1, 1}}; /* the colour as it is */
-    static struct dl_state last_st;
-    static s32 last_k;
-    static u32 last_serial, last_gen;
-    u32 c1 = mx_count();
-    st_cur.c_bounds += c1 - c0;
-    s32 k = dl_lod_k(e, lpp);
-    /* its bounds' nearest point: the finest level its texture is sampled at */
-    if (tex_bias_auto) {
-      float wc = m[3] * e->center[0] + m[7] * e->center[1] + m[11] * e->center[2] + m[15];
-      float wr = fabsf(m[3]) * e->half[0] + fabsf(m[7]) * e->half[1] + fabsf(m[11]) * e->half[2];
-      tex_need_note(k, wc - wr);
-    }
-    /* the same state as the call before, nothing written since: the
-       registers are right */
-    if (!(gs_serial == last_serial && vram_gen == last_gen && k == last_k &&
-          !memcmp(&last_st, &e->st, sizeof last_st))) {
-      if (set_state(&prim, uni[VU_MXGLV_CSCALE], k) < 0)
-        continue;
-      last_st = e->st, last_k = k, last_gen = vram_gen, last_serial = gs_serial;
-      prim &= ~(1u << MX_GS_PRIM_FGE_SHIFT); /* libgl's own program: no F */
-    }
-    memcpy(uni[VU_MXGLV_MVP], m, 64);
-    tm_uniforms(uni[VU_MXGLV_TMS], uni[VU_MXGLV_TMT]);
-    u32 c2 = mx_count();
-    st_cur.c_state += c2 - c1;
-    flush_out();
-    /* libgl's own program: a list's chain calls it (the entry is in its
-       batches); the colours are the recorded ones */
-    const struct mx_shader *sh = vprog_use(NULL);
-    const void *pu = uni;
-    mx_frame_shader_call(sh, prim, pu, &e->ch);
-    if (cl_batch) { /* a channel a pass (mxgl_color_light) */
-      cl_regs(1);
-      mx_frame_shader_call(sh, prim, pu, &e->ch);
-      cl_regs(2);
-      mx_frame_shader_call(sh, prim, pu, &e->ch);
-      cl_regs(0);
-    }
-    gs_drew = 1;
-    st_cur.c_call += mx_count() - c2;
-    st_cur.draws++;
-    st_cur.lists++;
-    st_cur.tris += e->ntri;
-    st_cur.verts += e->n;
+    ids += m, n -= m;
   }
-  /* the list's state calls had their effect */
-  dl_set_state(dlists[id].end ? dlists[id].end : &keep);
+  dl_run_send();
+  dl_run.ok = 0;
+  dl_set_state(end);
   st_cur.gl_cycles += mx_count() - t0;
+}
+
+void APIENTRY glCallList(GLuint id) { dl_call(&id, 1); }
+
+static GLuint dl_base;
+void APIENTRY glListBase(GLuint base) { dl_base = base; }
+/* The lists are drawn in order; lists that are passes over a surface each
+   (dl_is_passes) pass by pass, so the lists of surfaces with one material
+   take one set of registers a pass instead of one a list. */
+void APIENTRY glCallLists(GLsizei n, GLenum type, const GLvoid *lists) {
+  if (n < 0) {
+    gl_error(GL_INVALID_VALUE);
+    return;
+  }
+  GLuint ids[DL_CALL_MAX];
+  for (GLsizei at = 0; at < n;) {
+    int k = 0;
+    for (; k < DL_CALL_MAX && at < n; k++, at++) {
+      GLuint v;
+      switch (type) {
+      case GL_UNSIGNED_BYTE: v = ((const GLubyte *)lists)[at]; break;
+      case GL_BYTE: v = (GLuint)((const GLbyte *)lists)[at]; break;
+      case GL_UNSIGNED_SHORT: v = ((const GLushort *)lists)[at]; break;
+      case GL_SHORT: v = (GLuint)((const GLshort *)lists)[at]; break;
+      case GL_UNSIGNED_INT: case GL_INT: v = ((const GLuint *)lists)[at]; break;
+      default: gl_error(GL_INVALID_ENUM); return;
+      }
+      ids[k] = dl_base + v;
+    }
+    dl_call(ids, k);
+  }
 }
 void mxgl_CallList(int id) { glCallList((GLuint)id); }
 
@@ -4752,8 +4878,8 @@ static void set_cap(GLenum cap, int on) {
     break;
   /* state the GS has not, or that changes no picture here */
   case GL_FOG: gl.fog = on; break;
-  case GL_DITHER: case GL_LIGHTING: case GL_NORMALIZE: case GL_LINE_SMOOTH:
   case GL_STENCIL_TEST: gl.st_on = on; break;
+  case GL_DITHER: case GL_LIGHTING: case GL_NORMALIZE: case GL_LINE_SMOOTH:
   case GL_POINT_SMOOTH: case GL_POLYGON_SMOOTH: case GL_COLOR_MATERIAL:
   case GL_TEXTURE_GEN_S: case GL_TEXTURE_GEN_T: case GL_POLYGON_OFFSET_LINE:
   case GL_POLYGON_OFFSET_POINT: case GL_TEXTURE_1D: case GL_LIGHT0:
@@ -7271,6 +7397,7 @@ static const struct {
     {"glBufferSubData", (void (*)(void))glBufferSubData},
     {"glBufferSubDataARB", (void (*)(void))glBufferSubDataARB},
     {"glCallList", (void (*)(void))glCallList},
+    {"glCallLists", (void (*)(void))glCallLists},
     {"glClear", (void (*)(void))glClear},
     {"glClearColor", (void (*)(void))glClearColor},
     {"glClearDepth", (void (*)(void))glClearDepth},
@@ -7352,6 +7479,7 @@ static const struct {
     {"glIsTexture", (void (*)(void))glIsTexture},
     {"glLineWidth", (void (*)(void))glLineWidth},
     {"glLinkProgram", (void (*)(void))glLinkProgram},
+    {"glListBase", (void (*)(void))glListBase},
     {"glLoadIdentity", (void (*)(void))glLoadIdentity},
     {"glLoadMatrixd", (void (*)(void))glLoadMatrixd},
     {"glLoadMatrixf", (void (*)(void))glLoadMatrixf},

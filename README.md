@@ -55,8 +55,12 @@ perspective, and it has 8 bits. The eye distance is the vertex's w, so it needs 
 projection (w is 1 under `glOrtho`: one value for all). Display lists, lines and points, and a
 game's own vertex programs are drawn without fog.
 
-Display lists (`glNewList` .. `glCallList`) hold their draws as DMA chains the frame calls,
-with the matrices of the call; `glReadPixels` reads colour and depth (the stream drawn first:
+Display lists (`glNewList` .. `glCallList`, `glCallLists`, `glListBase`) hold their draws as DMA
+chains the frame calls, with the matrices of the call. The draws called one after the other with
+the same state share one set of GS registers and one VU1 context; `glCallLists` of lists that are
+each the passes over one surface (the first with depth writes and no blending, the others over the
+same vertices with depth EQUAL or LEQUAL and no depth writes) draws them pass by pass, so the
+surfaces of one material take one state a pass (Quake 3's world: 940 draws a frame became 210); `glReadPixels` reads colour and depth (the stream drawn first:
 slow), and so does `glCopyTexSubImage2D` (into the bound texture); `glGetTexImage` gives level 0; `glFrontFace`; `glClipPlane` (one plane), `glPolygonOffset` (a Z bias), `glColorMask` (FBMSK), the
 texture matrix (on VU1), lines and points (on the EE) are there.
 

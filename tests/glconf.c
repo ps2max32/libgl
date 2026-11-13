@@ -996,5 +996,58 @@ int main(void) {
     CHECK_EQ(glGetError(), GL_NO_ERROR);
   }
 
+  /* 2-component positions: a quad as two triangles, the second joined to the
+     first's strip in the reverse order; and as a strip of a multi-draw */
+  frame();
+  {
+    static const float v[8][2] = {{100, 100}, {200, 100}, {100, 200}, {200, 200},
+                                  {300, 100}, {400, 100}, {300, 200}, {400, 200}};
+    static const unsigned short ix[6] = {0, 2, 1, 1, 2, 3};
+    static const GLenum mode[1] = {GL_TRIANGLE_STRIP};
+    static const GLint first[1] = {4};
+    static const GLsizei count[1] = {4};
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_TEXTURE_COORD_ARRAY);
+    glDisableClientState(GL_COLOR_ARRAY);
+    glVertexPointer(2, GL_FLOAT, 0, v);
+    glColor3f(0, 1, 1);
+    glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, ix);
+    glMultiModeDrawArraysIBM(mode, first, count, 1, sizeof(GLenum));
+    CHECK_PIX(120, 120, 0xFFFF00);
+    CHECK_PIX(180, 180, 0xFFFF00);
+    CHECK_PIX(320, 120, 0xFFFF00);
+    CHECK_PIX(380, 180, 0xFFFF00);
+    glDisableClientState(GL_VERTEX_ARRAY);
+  }
+
+  /* glCallLists: two lists of two passes each (a colour, then a product over its
+     pixels with depth EQUAL), drawn pass by pass; and glListBase */
+  frame();
+  {
+    GLuint l = glGenLists(2);
+    for (int k = 0; k < 2; k++) {
+      glNewList(l + (GLuint)k, GL_COMPILE);
+      glEnable(GL_DEPTH_TEST), glDepthMask(1), glDepthFunc(GL_LEQUAL), glDisable(GL_BLEND);
+      glColor3f(1, 1, k ? 0.0f : 1.0f);
+      quad(100 + 200 * k, 100, 200 + 200 * k, 200, 0);
+      glEnable(GL_BLEND), glBlendFunc(GL_ZERO, GL_ONE_MINUS_SRC_ALPHA), glDepthMask(0);
+      glColor4f(0, 0, 0, 0.5f);
+      quad(100 + 200 * k, 100, 200 + 200 * k, 200, 0);
+      glEndList();
+    }
+    glListBase(l);
+    static const GLubyte ids[2] = {0, 1};
+    glCallLists(2, GL_UNSIGNED_BYTE, ids);
+    glListBase(0);
+    CHECK(glIsEnabled(GL_BLEND)); /* the last list's state */
+    glDisable(GL_BLEND), glDisable(GL_DEPTH_TEST), glDepthMask(1);
+    CHECK_PIX(150, 150, 0x808080);
+    CHECK_PIX(350, 150, 0x008080);
+    CHECK_PIX(250, 150, 0x000000);
+    glDeleteLists(l, 2);
+    CHECK_EQ(glGetError(), GL_NO_ERROR);
+  }
+
   return t_done("glconf");
 }
