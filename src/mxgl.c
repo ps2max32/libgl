@@ -166,7 +166,7 @@ static u8 ring[RING_BYTES] MX_ALIGNED(64) MX_CORE_BSS;
 static u8 *arena[NARENA];
 static u8 *hires_mem;
 /* mxgl_dither's matrices */
-static u64 dither_m[8];
+static u64 dither_m[16];
 static u32 dither_n, dither_frame;
 /* libgl's memory (<mx/mem.h>): pinned (the DMAC or VU0 reads it, VU0 with
    interrupts off): gl_heap its objects (textures, lists, buffers, tables),
@@ -6658,7 +6658,7 @@ static int start_mode(int mode, int flags) {
 }
 
 void mxgl_dither(const unsigned long long *dimx, int n) {
-  n = n < 0 ? 0 : n > 8 ? 8 : n;
+  n = n < 0 ? 0 : n > 16 ? 16 : n;
   for (int i = 0; i < n; i++)
     dither_m[i] = dimx[i];
   dither_n = (u32)n;

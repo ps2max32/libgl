@@ -54,7 +54,7 @@ enum { MXGL_SD, MXGL_NTSC, MXGL_PAL, MXGL_1080I, MXGL_480P, MXGL_576P, MXGL_720P
 #define MXGL_BEAM 0x100
 #define MXGL_RGB24 0x200
 int mxgl_set_mode(int mode);
-/* Dithering into 16 bits: n (up to 8) DIMX values (the GS's 4 x 4 matrix,
+/* Dithering into 16 bits: n (up to 16) DIMX values (the GS's 4 x 4 matrix,
    offsets -4..3), used in turn: with beam racing one a field (each field
    is drawn anew: two that complement each other give twice the shades on
    an interlaced screen), else one a frame. n 0: the GS manual's matrix
