@@ -13,8 +13,7 @@ static int mode_want;     /* the flags asked for with it */
    buffers hold every line of the picture (FIELD mode: a field shows every
    other line). Read circuit 1 shows the buffer a line lower than circuit 2
    and the PCRTC blends them 1:1 (PMODE's ALP 0x80), so each line shown is
-   the mean of two drawn lines (the screen's last line with the line after
-   the buffer, as maxsdk's MX_SMOOTH_DOWN). Off: circuit 2 alone. */
+   the mean of two drawn lines. Off: circuit 2 alone. */
 static int deflicker, deflicker_fits;
 static void deflicker_set(void) {
   int on = deflicker && deflicker_fits && !beam;
@@ -22,8 +21,19 @@ static void deflicker_set(void) {
     struct mx_display *d = &disp[j];
     d->c[0] = d->c[1];
     d->c[0].on = (u8)on;
-    if (on)
-      d->c[0].dby++;
+    if (on && d->c[0].h > 1) {
+      /* a line shorter: the line after the buffer's last is not its own (the
+         screen's last line is then circuit 2's alone). At the same place on
+         the screen: the magnification of the whole buffer, and the lines
+         the centring of the shorter rectangle moves it by taken off
+         (mx_display_regs: centred, on an even line) */
+      u32 mv = mx_circuit_magv(&mx_video, &d->c[1]);
+      d->c[0].magv = mv, d->c[0].magh = mx_circuit_magh(&mx_video, &d->c[1]);
+      s32 full = (((s32)mx_video.lines - (s32)(d->c[1].h * mv)) / 2) & ~1;
+      d->c[0].dby++, d->c[0].h--;
+      s32 less = (((s32)mx_video.lines - (s32)(d->c[0].h * mv)) / 2) & ~1;
+      d->c[0].dy += full - less;
+    }
     d->mmod = 1;
     d->amod = (u8)!on;
     d->alp = on ? 0x80 : 0;
