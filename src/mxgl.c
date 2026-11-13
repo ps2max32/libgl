@@ -2357,6 +2357,7 @@ static u32 vu0_xform_run(const u8 *src, int stride, int n, float (*vp)[4], u8 *v
       "addiu %[and], $zero, 0x3F\n\t"
       "move %[or], $zero\n"
       "1:\n\t"
+      "pref 0, 128(%[src])\n\t"
       "ldl $8, 7(%[src])\n\t"
       "ldr $8, 0(%[src])\n\t"
       "lw $9, 8(%[src])\n\t"
