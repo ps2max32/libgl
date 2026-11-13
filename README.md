@@ -9,7 +9,7 @@ frame and the screen are the PS2's own (`mxgl.h`).
 |---|---|
 | `include/GL/gl.h`, `glext.h`, `KHR/` | Mesa's and Khronos' headers (MIT licence), as they are |
 | `include/mxgl.h` | the PS2's own calls: set-up, mode, window, end of frame, screenshot, the counters; `mxglGetProcAddress`; deprecated drawing calls (each says the GL calls that do the same) |
-| `src/mxgl.c` | the GL calls: state to GS registers, clipping on the EE, textures (CT32/CT16/T8, mipmaps made here) in GS memory as needed |
+| `src/mxgl.c`, `src/gl/*.c` | the GL calls: state to GS registers, clipping on the EE, textures (CT32/CT16/T8, mipmaps made here) in GS memory as needed. `mxgl.c` includes its parts in `src/gl/` (one translation unit: the draws' paths inline across them): `state` (the shared state), `frame`, `vram`, `texquality`, `gsstate` (GL state as GS registers), `batch` (vertex batches, the clipper), `draw` (a draw: transform, passes, triangles), `lines`, `dlist`, `drawcalls`, `immediate`, `client`, `matrix`, `statecalls`, `teximage`, `get`, `pixels`, `misc`, `paltex`, `attrib`, `mode` (set-up and modes), `vprog`, `proc` |
 | `src/mxglv.hlsl` | libgl's own VU1 vertex program: transform, divide, texture matrix, ST·Q, colour (`col * cmul + cadd`, scaled) |
 | `mk/mxgl.mk` | for an app's Makefile (see its head); `MXGL_PROGS`: the app's vertex programs (`mk/vu1bin.awk` makes their binaries) |
 | `tests/glconf.c` | each feature drawn and read back (`glReadPixels`): `make -C tests run` (PCSX2), or the ELF on the PS2 |

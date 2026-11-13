@@ -44,7 +44,8 @@ MXGL_DEFS  := $(if $(MXGL_ARENA_BYTES),-DMXGL_ARENA_BYTES=$(MXGL_ARENA_BYTES)) \
 MXGL_CFLAGS = -I$(MXGL_DIR)/src $(MXGL_DEFS) -mvu0 -ffast-math -fapprox-func -cl-single-precision-constant -MMD -I$(MXGL_INC) \
               -nostdlibinc -isystem $(or $(PICOLIBC),$(PS2MAX)/build/libs/picolibc/install)/include
 
-$(OUT)/mxgl/mxgl.o: $(MXGL_DIR)/src/mxgl.c $(MXGL_INC)/mxgl.h $(OUT)/hlsl/mxglv.h \
+# mxgl.c includes its parts (src/gl/*.c): one translation unit
+$(OUT)/mxgl/mxgl.o: $(MXGL_DIR)/src/mxgl.c $(wildcard $(MXGL_DIR)/src/gl/*.c) $(MXGL_INC)/mxgl.h $(OUT)/hlsl/mxglv.h \
                     $(OUT)/hlsl/mxglvf.h $(OUT)/hlsl/mxglve.h
 	@mkdir -p $(dir $@)
 	$(CC) $(filter-out -ffreestanding,$(CFLAGS)) $(MXGL_CFLAGS) -c $< -o $@
