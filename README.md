@@ -165,10 +165,10 @@ first, so a page in the swap file is brought in with interrupts on.
 50 Hz) by the BIOS's region (`mx_video_default`), interlaced, a 16-bit colour buffer
 (dithered) each of two frames and a 24-bit Z buffer. `mxgl_set_mode` changes it between
 frames (`MXGL_SD`, `MXGL_NTSC`, `MXGL_PAL`, `MXGL_1080I`, `MXGL_1080I50`, `MXGL_1080P30`,
-`MXGL_720P`, `MXGL_720P50`, `MXGL_576P`, `MXGL_480P`, with the flags `MXGL_BEAM` and
+`MXGL_1080P25`, `MXGL_720P`, `MXGL_720P50`, `MXGL_576P`, `MXGL_480P`, with the flags `MXGL_BEAM` and
 `MXGL_RGB24` or-ed in): the pipeline starts again, GS memory is filled again, the display
 lists are dirty, the window is the screen (`mxgl_screen`). `mxgl_mode_flags` says which
-flags are in effect. 720p50, 1080i50 and 1080p30 are not in the BIOS: the kernel times them
+flags are in effect. 720p50, 1080i50, 1080p30 and 1080p25 are not in the BIOS: the kernel times them
 (mx-kernel 22 or later). A mode that does not run (the console or the kernel lacks it: no
 vblank) leaves the console's own NTSC or PAL set, and `mxgl_set_mode` returns -1
 (`mxgl_mode` says which).

@@ -27,8 +27,9 @@ void mxgl_init(void);
    - MXGL_480P: 640 x 480, MXGL_576P: 640 x 576, progressive (60, 50 Hz)
    - MXGL_720P: 1280 x 720 progressive, MXGL_720P50 at 50 Hz
    - MXGL_1080P30: 1920 x 1080 progressive at 30 Hz, drawn as 1920 x 540
-     (a full picture does not fit in GS memory), each line shown twice
-   720P50, 1080I50 and 1080P30 are not in the BIOS: the kernel's own timing
+     (a full picture does not fit in GS memory), each line shown twice;
+     MXGL_1080P25 the same at 25 Hz
+   720P50, 1080I50, 1080P30 and 1080P25 are not in the BIOS: the kernel's own timing
    (mx-kernel 22 or later, <mx/crtc.h>)
    - MXGL_BEAM: beam racing (maxsdk's passes, <mx/hires.h>): one buffer of
      a field's lines (640 x 224 / 256, 1920 x 540), drawn a strip at a time
@@ -50,7 +51,7 @@ void mxgl_init(void);
    not be set (memory): the mode is set without it; or if the mode does not
    run here (mxgl_mode says): the console's own NTSC or PAL is set. */
 enum { MXGL_SD, MXGL_NTSC, MXGL_PAL, MXGL_1080I, MXGL_480P, MXGL_576P, MXGL_720P, MXGL_720P50, MXGL_1080I50,
-       MXGL_1080P30 };
+       MXGL_1080P30, MXGL_1080P25 };
 #define MXGL_BEAM 0x100
 #define MXGL_RGB24 0x200
 int mxgl_set_mode(int mode);
