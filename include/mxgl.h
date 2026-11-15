@@ -239,4 +239,22 @@ void mxgl_TexBrightness(void);
 /* glTexEnvf(GL_TEXTURE_ENV, GL_RGB_SCALE, 1 << s) on texture unit 0 */
 void mxgl_ColorShift(int s);
 
+
+/* A renderer of the game's own beside libgl (gl/native.c): it writes its VU1
+   batches into the frame stream itself between mxgl_native_begin (libgl's
+   batches drawn first) and mxgl_native_end (libgl sets its program, layout
+   and registers again). mxgl_native_state: the GS registers of the current
+   GL state (texture placed and uploaded as for a draw; with beam racing
+   both contexts), the PRIM of its triangles and the colour scale (0x80 is
+   1.0); the count, -1 when it cannot be drawn. mxgl_native_matrix: object
+   to GS coordinates times w; z: the near and far planes' z, the guard band. */
+void mxgl_native_begin(void);
+void mxgl_native_end(void);
+int mxgl_native_state(unsigned *reg, unsigned long long *val, int max, unsigned *prim, float *cscale,
+                      int lod_k);
+void mxgl_native_matrix(float *out, float *z);
+/* the K (1/16) of TEX1 for the bound texture on triangles whose texture
+   coordinates cover 2^l2 times their area */
+int mxgl_native_lod(float l2);
+
 #endif
