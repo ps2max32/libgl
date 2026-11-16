@@ -353,20 +353,9 @@ void mxgl_end_frame(void) {
   in_frame = 0;
 }
 
-/* mxgl_native_state: the register writes are kept for the caller, not sent */
-static int nat_capture, nat_n, nat_max;
-static unsigned *nat_reg;
-static unsigned long long *nat_val;
-
 /* register writes after a FLUSH (the VU1 batches before are drawn first) */
 static void write_regs(const u32 *reg, const u64 *val, int n) {
   gs_serial++;
-  if (nat_capture) {
-    for (int i = 0; i < n; i++)
-      if (nat_n < nat_max)
-        nat_reg[nat_n] = reg[i], nat_val[nat_n++] = val[i];
-    return;
-  }
   if (!n)
     return;
   /* the triangles gathered so far are drawn with the registers before */
@@ -382,13 +371,7 @@ static void write_regs(const u32 *reg, const u64 *val, int n) {
     reg = reg2, val = val2, n *= 2;
   }
   u64 *c = mx_frame_reserve((u32)n + 2);
-  /* MXGL_STATE_FLUSHE: wait for the VU1 program's end only; the GIF sends its
-     last XGKICK (PATH1, the higher priority) before this DIRECT */
-#ifdef MXGL_STATE_FLUSHE
-  c = mx_e_cnt(c, (u32)n + 1, GS_DREW ? mx_vif_flushe() : mx_vif_nop(), mx_vif_direct((u32)n + 1));
-#else
   c = mx_e_cnt(c, (u32)n + 1, GS_DREW ? mx_vif_flush() : mx_vif_nop(), mx_vif_direct((u32)n + 1));
-#endif
   gs_drew = 0;
   c = mx_e_ad_tag(c, (u32)n, 1);
   for (int i = 0; i < n; i++)
