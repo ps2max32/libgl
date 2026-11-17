@@ -79,7 +79,7 @@ static void texflush(void) {
    black texels are all transparent: a font) */
 enum { CLUT_2X, CLUT_1X, CLUT_INV, CLUT_GREY, CLUT_ENV, CLUT_GREYK, NCLUT };
 static u32 clut_cbp;
-static u32 clut[NCLUT][256] MX_ALIGNED(64) MX_CORE_BSS; /* sent to the GS */
+static u32 clut[NCLUT][256] MX_ALIGNED(64) MX_FAST_BSS; /* sent to the GS */
 
 /* the game's palette as a CLUT (mxgl_Palette), after the brightness CLUTs */
 static u32 clut_pal[256] MX_ALIGNED(64);

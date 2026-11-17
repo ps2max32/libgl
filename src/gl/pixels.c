@@ -7,7 +7,7 @@
    and GL_DEPTH_COMPONENT (GL_FLOAT, GL_UNSIGNED_INT, _SHORT, _BYTE), in the
    window's coordinates (mxgl_window), lines GL_PACK_ALIGNMENT apart.
    Not in 1080i (the passes own the buffer): zeros. */
-static u32 rp_line[1920] MX_ALIGNED(64) MX_CORE_BSS; /* the GS's download writes it */
+static u32 rp_line[1920] MX_ALIGNED(64) MX_FAST_BSS; /* the GS's download writes it */
 void APIENTRY glReadPixels(GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum t,
                            GLvoid *px) {
   int depth = f == GL_DEPTH_COMPONENT;

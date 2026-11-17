@@ -19,7 +19,7 @@ static u32 ws_far[3];             /* the last frame's mipped textures by need (0
 
 #define RING_BYTES (64 * 1024) /* the stream's slots (chain mode) */
 /* the frame chain's ring (DMA): core also when libgl is VM (mx OS plan 4b) */
-static u8 ring[RING_BYTES] MX_ALIGNED(64) MX_CORE_BSS;
+static u8 ring[RING_BYTES] MX_ALIGNED(64) MX_FAST_BSS;
 /* the batches' vertices of a frame (Quake: up to ~230 KB); a game may set
    another size (MXGL_ARENA_BYTES: Descent 3 takes 256 KB) */
 #ifdef MXGL_ARENA_BYTES

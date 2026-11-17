@@ -19,7 +19,7 @@ static struct {
 } imm;
 
 #define IMM_SMALL 1024
-static struct imm_v imm_small[IMM_SMALL] MX_ALIGNED(64) MX_CORE_BSS; /* VU0 reads it */
+static struct imm_v imm_small[IMM_SMALL] MX_ALIGNED(64) MX_FAST_BSS; /* VU0 reads it */
 
 void APIENTRY glBegin(GLenum mode) {
   imm.mode = mode;
