@@ -143,7 +143,9 @@ static void dl_set_state(const struct dl_state *s) {
    (on the PS2, models came out torn and the program crashed); at most
    XFORM_RUN vertices at a time, so the beam racing pass timer is not held up. */
 #define XFORM_RUN 64
-static u32 vu0_xform_run(const u8 *src, int stride, int n, float (*vp)[4], u8 *vo,
+/* in the core's interrupt part (maxsdk's MX_IRQ_FN): it runs with
+   interrupts off, where no page may be brought in */
+MX_IRQ_FN __attribute__((noinline)) static u32 vu0_xform_run(const u8 *src, int stride, int n, float (*vp)[4], u8 *vo,
                          const float *mats, u32 *oor) {
   u32 oand, o_or;
   int was = mx_di();
@@ -454,7 +456,7 @@ static struct {
    again when the matrices may have changed */
 static float m[16] MX_ALIGNED(16);
 static u32 m_serial;
-static float mats[32] MX_ALIGNED(16);
+static float mats[32] MX_ALIGNED(16) MX_IRQ_BSS; /* read with interrupts off (vu0_xform_run) */
 static int mats_ok;
 static void update_matrix(void) {
   /* the matrix, made again when the matrices may have changed */
