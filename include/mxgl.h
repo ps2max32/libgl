@@ -21,7 +21,11 @@
    back when freed. The game's own arrays may be virtual memory. */
 void mxgl_init(void);
 /* the picture, after mxgl_init: a mode, with flags or-ed in
-   - MXGL_SD: NTSC or PAL, the console's own (its BIOS's region)
+   - MXGL_SD: under MXOS (libmxk, kernel version 31) the system's mode, the
+     shell's video.mode; standalone NTSC or PAL, the console's own (its
+     BIOS's region). Under MXOS a mode by name is set only where the
+     program may take it (video.scale native and the mode in video.allowed),
+     else the system's mode: a game asks MXGL_SD unless its user chose one
    - MXGL_NTSC: 640 x 448, 60 Hz; MXGL_PAL: 640 x 512, 50 Hz; interlaced
    - MXGL_1080I: 1920 x 1080 interlaced; MXGL_1080I50 the same at 50 Hz
    - MXGL_480P: 640 x 480, MXGL_576P: 640 x 576, progressive (60, 50 Hz)
@@ -56,6 +60,9 @@ enum { MXGL_SD, MXGL_NTSC, MXGL_PAL, MXGL_1080I, MXGL_480P, MXGL_576P, MXGL_720P
        MXGL_1080P30, MXGL_1080P25, MXGL_1080P24, MXGL_240P, MXGL_288P };
 #define MXGL_BEAM 0x100
 #define MXGL_RGB24 0x200
+/* the mode as asked, not checked against the system's settings (the shell,
+   which makes them) */
+#define MXGL_EXACT 0x400
 int mxgl_set_mode(int mode);
 /* Dithering into 16 bits: n (up to 16) DIMX values (the GS's 4 x 4 matrix,
    offsets -4..3), used in turn: with beam racing one a field (each field
@@ -90,6 +97,14 @@ int mxgl_resume(void);
 int mxgl_suspended(void);
 /* the mode set: MXGL_NTSC, MXGL_PAL, MXGL_1080I, ... (not MXGL_SD) */
 int mxgl_mode(void);
+/* the mode's frames a second (interlaced: fields): 60, 50, 30, 25 or 24 */
+int mxgl_hz(void);
+/* 1 if the picture is 16:9 on the TV: the 720 and 1080 line modes, and the
+   others when the system's video.aspect is 16:9 (anamorphic: the same pixels
+   across a wide screen) */
+int mxgl_wide(void);
+/* the mode's name: "NTSC", "PAL", "480p", "1080i", "720p50", ... */
+const char *mxgl_mode_name(void);
 /* the flags in effect: MXGL_BEAM, MXGL_RGB24 */
 int mxgl_mode_flags(void);
 /* the screen's size: 640 x 448, 640 x 512, 1920 x 1080, ... */

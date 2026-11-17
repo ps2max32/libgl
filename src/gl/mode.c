@@ -175,11 +175,48 @@ void mxgl_dither(const unsigned long long *dimx, int n) {
   mx_hires_dither(dither_m, dither_n);
 }
 
+/* The system's video settings (<mx/screen.h>, MXOS kernel version 31): under
+   the kernel (libmxk) MXGL_SD is video.mode, and a mode asked for by name is
+   used only where the program may take it (video.scale native and the mode
+   in video.allowed), else video.mode too; with MXGL_EXACT as asked (the
+   shell).
+   Standalone (libmx): MXGL_SD is the console's region's, a mode by name is
+   used as asked. */
+#include <mx/kernel.h>
+#include <mx/screen.h>
+#pragma weak mx__kernel
+static const u8 screen_of[] = {
+    [MXGL_NTSC] = MX_SCREEN_480I,     [MXGL_PAL] = MX_SCREEN_576I,       [MXGL_1080I] = MX_SCREEN_1080I,
+    [MXGL_480P] = MX_SCREEN_480P,     [MXGL_576P] = MX_SCREEN_576P,      [MXGL_720P] = MX_SCREEN_720P,
+    [MXGL_720P50] = MX_SCREEN_720P50, [MXGL_1080I50] = MX_SCREEN_1080I50, [MXGL_1080P30] = MX_SCREEN_1080P30,
+    [MXGL_1080P25] = MX_SCREEN_1080P25, [MXGL_1080P24] = MX_SCREEN_1080P24, [MXGL_240P] = MX_SCREEN_240P,
+    [MXGL_288P] = MX_SCREEN_288P,
+};
+static int system_wide; /* video.aspect 16:9 (the 240-576 line modes) */
+
+static int under_kernel(void) { return &mx__kernel && mx__kernel; }
+
+static int mode_for(int mode) {
+  int sd = mx_video_default() == &mx_video_pal ? MXGL_PAL : MXGL_NTSC;
+  if (mode >= NMODES)
+    mode = MXGL_SD;
+  if (!under_kernel())
+    return mode == MXGL_SD ? sd : mode;
+  struct mx_screen_conf c;
+  mx_screen_conf(&c);
+  system_wide = c.wide;
+  int sys = sd;
+  for (int i = 1; i < NMODES; i++)
+    if (screen_of[i] == c.mode)
+      sys = i;
+  if (mode == MXGL_SD)
+    return sys;
+  return mx_screen_modes(&c) >> screen_of[mode] & 1 ? mode : sys;
+}
+
 int mxgl_set_mode(int mode) {
   int flags = mode & (MXGL_BEAM | MXGL_RGB24);
-  mode &= 0xFF;
-  if (mode == MXGL_SD || mode >= NMODES)
-    mode = mx_video_default() == &mx_video_pal ? MXGL_PAL : MXGL_NTSC;
+  mode = mode & MXGL_EXACT && (mode & 0xFF) != MXGL_SD && (mode & 0xFF) < NMODES ? mode & 0xFF : mode_for(mode & 0xFF);
   if (mode == mode_set && flags == mode_want)
     return 0;
   if (mode_set >= 0) {
@@ -318,6 +355,12 @@ int mxgl_resume(void) {
 int mxgl_mode_flags(void) { return mode_flags; }
 
 int mxgl_mode(void) { return mode_set; }
+
+int mxgl_hz(void) { return mode_set > 0 ? modes[mode_set].m->hz : 60; }
+
+int mxgl_wide(void) { return mode_set > 0 && (modes[mode_set].w >= 1280 || system_wide); }
+
+const char *mxgl_mode_name(void) { return mode_set > 0 ? modes[mode_set].name : ""; }
 
 
 
